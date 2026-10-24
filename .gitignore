@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+# pytest 的临时目录：本机 tempfile 回落到项目根时会生成 pytest-of-<user>/
+pytest-of-*/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+*.log
+
+# 本地配置与密钥（示例配置除外）
+.env
+.env.*
+!.env.example
+
+# 真实试卷仅在本地保存；仓库保留 catalog.json
+data/papers/**/*.pdf
+
+# 本地学习、架构决策、任务记录与协作约定不进入公开仓库
+/docs/
+/AGENTS.md
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

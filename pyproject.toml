@@ -1,0 +1,27 @@
+[project]
+name = "hhu-exam-review"
+version = "0.1.0"
+description = "河海大学考试复习助手后端"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "langchain-openai>=1.7,<2.0",
+    "langgraph>=1.2,<2.0",
+    "openai>=3.37,<4.0",
+    "pydantic>=2.9,<3.0",
+    "python-dotenv>=1.2,<2.0",
+    "uvicorn[standard]>=0.32,<1.0",
+]
+
+# 仅用于本地验证，不进入运行时依赖：pytest 组织用例；httpx 用于模型请求的
+# Mock 传输测试；httpx2 是 starlette 1.9 的 TestClient 现在使用的传输库（它不再推荐 httpx）。
+[dependency-groups]
+dev = [
+    "httpx>=0.28,<1.0",
+    "pytest>=8.3,<9.0",
+    "httpx2>=2.16,<3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
