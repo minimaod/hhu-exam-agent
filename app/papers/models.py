@@ -11,8 +11,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-# 目录里能出现的考试类型；页面分别显示为“期中”“期末”。
-ExamType = Literal["midterm", "final"]
+# 目录里能出现的考试类型；页面分别显示为“期中”“期末”“其他”。
+# “转专业”不是类型，而是课程/科目；转专业试卷的类型记为 other。
+ExamType = Literal["midterm", "final", "other"]
 
 
 class PaperRecord(BaseModel):

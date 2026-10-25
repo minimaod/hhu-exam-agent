@@ -28,6 +28,7 @@ ErrorCode = Literal[
     "MODEL_RESPONSE_INVALID",
     "CATALOG_UNAVAILABLE",
     "QUERY_FAILED",
+    "TUTORING_FAILED",
 ]
 
 ProgressStage = Literal["understanding", "retrieving"]

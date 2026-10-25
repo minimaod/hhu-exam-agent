@@ -9,7 +9,20 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.papers.courses import detect_course
 from tests.support import sample_record, write_catalog
+
+
+def test_detect_course_from_free_text() -> None:
+    assert detect_course("我要复习转专业考试") == "转专业"
+    assert detect_course("我要复习高数") == "高等数学"
+    assert detect_course("找线代期末试卷") == "几何与线性代数"
+    assert detect_course("我要复习C语言") == "C语言程序设计"
+    assert detect_course("我要复习马原") == "马克思主义基本原理"
+    # 没提课程、或同时提了两门课时不猜，交给调度模型澄清。
+    assert detect_course("给我期末试卷") is None
+    assert detect_course("高数和物理的卷子") is None
+    assert detect_course("") is None
 
 
 def test_real_catalog_returns_all_papers(real_client: TestClient) -> None:
@@ -17,7 +30,7 @@ def test_real_catalog_returns_all_papers(real_client: TestClient) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["total"] == 88
+    assert payload["total"] == 162
     items = payload["items"]
     ids = [item["id"] for item in items]
     assert len(ids) == len(set(ids))
@@ -25,20 +38,34 @@ def test_real_catalog_returns_all_papers(real_client: TestClient) -> None:
     # 最近学年在前；同一学年内有日期的按日期降序，空日期在该学年末尾。
     assert ids[:5] == [
         "prob-2025-2026-midterm",
+        "transfer-automation-2025",
         "math-aii-20250625-final",
         "math-bi-20250116-final",
-        "geo-2024-2025-s1-final",
-        "phys-2024-2025-s2-midterm-ai",
+        "transfer-english-2024",
     ]
-    assert ids[-1] == "cv-2003-2004-s2-final-b"
+    # 学年未标注的记录（马原题库、无年份的转专业资料）排在最后。
+    assert ids[-11:] == [
+        "marx-set-01",
+        "marx-set-02",
+        "marx-set-03",
+        "marx-set-04",
+        "marx-set-05",
+        "marx-set-06",
+        "marx-set-07",
+        "marx-set-08",
+        "marx-set-09",
+        "marx-set-10",
+        "transfer-english-sources",
+    ]
 
-    years = [int(item["academic_year"][:4]) for item in items]
+    dated_items = [item for item in items if item["academic_year"][:4].isdigit()]
+    years = [int(item["academic_year"][:4]) for item in dated_items]
     assert years == sorted(years, reverse=True)
 
     for year in set(years):
         group = [
             item
-            for item in items
+            for item in dated_items
             if int(item["academic_year"][:4]) == year
         ]
         dated = [item["exam_date"] for item in group if item["exam_date"]]
@@ -141,8 +168,97 @@ def test_physics_aliases_match_physics_papers(
 ) -> None:
     payload = real_client.get("/api/papers", params={"course": keyword}).json()
 
-    assert payload["total"] == 12
+    assert payload["total"] == 13
     assert all(item["course"] == "大学物理" for item in payload["items"])
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["中国近现代史纲要", "中国近代史纲要", "近代史", "史纲"],
+)
+def test_history_aliases_match_history_papers(
+    real_client: TestClient, keyword: str
+) -> None:
+    payload = real_client.get("/api/papers", params={"course": keyword}).json()
+
+    assert payload["total"] == 11
+    assert all(item["course"] == "中国近现代史纲要" for item in payload["items"])
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["大学英语", "英语", "大学英语I", "大学英语II"],
+)
+def test_english_aliases_match_english_papers(
+    real_client: TestClient, keyword: str
+) -> None:
+    payload = real_client.get("/api/papers", params={"course": keyword}).json()
+
+    assert payload["total"] == 5
+    assert all(item["course"] == "大学英语" for item in payload["items"])
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["思想道德与法治", "思想道德修养与法律基础", "思修"],
+)
+def test_ethics_aliases_match_ethics_papers(
+    real_client: TestClient, keyword: str
+) -> None:
+    payload = real_client.get("/api/papers", params={"course": keyword}).json()
+
+    assert payload["total"] == 7
+    assert all(item["course"] == "思想道德与法治" for item in payload["items"])
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["马克思主义基本原理", "马克思主义基本原理概论", "马原"],
+)
+def test_marx_aliases_match_marx_papers(
+    real_client: TestClient, keyword: str
+) -> None:
+    payload = real_client.get("/api/papers", params={"course": keyword}).json()
+
+    assert payload["total"] == 11
+    assert all(item["course"] == "马克思主义基本原理" for item in payload["items"])
+
+
+@pytest.mark.parametrize("keyword", ["转专业", "转专业考试"])
+def test_transfer_aliases_match_transfer_papers(
+    real_client: TestClient, keyword: str
+) -> None:
+    payload = real_client.get("/api/papers", params={"course": keyword}).json()
+
+    assert payload["total"] == 10
+    assert all(item["course"] == "转专业" for item in payload["items"])
+    assert all(item["exam_type"] == "other" for item in payload["items"])
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["C语言", "C语言程序设计", "C程序设计", "C"],
+)
+def test_c_aliases_match_c_papers(
+    real_client: TestClient, keyword: str
+) -> None:
+    payload = real_client.get("/api/papers", params={"course": keyword}).json()
+
+    assert payload["total"] == 9
+    assert all(item["course"] == "C语言程序设计" for item in payload["items"])
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["Python", "Python语言", "Python程序设计", "Python语言程序设计"],
+)
+def test_python_aliases_match_python_papers(
+    real_client: TestClient, keyword: str
+) -> None:
+    payload = real_client.get("/api/papers", params={"course": keyword}).json()
+
+    assert payload["total"] == 20
+    assert all(item["course"] == "Python语言程序设计" for item in payload["items"])
 
 
 def test_new_subjects_exam_type_counts(real_client: TestClient) -> None:
@@ -157,7 +273,17 @@ def test_new_subjects_exam_type_counts(real_client: TestClient) -> None:
     assert total("复变函数与积分变换", "final") == 11
     assert total("离散数学", "final") == 5
     assert total("大学物理", "midterm") == 6
-    assert total("大学物理", "final") == 6
+    assert total("大学物理", "final") == 7
+    assert total("C语言程序设计", "midterm") == 5
+    assert total("C语言程序设计", "final") == 4
+    assert total("Python语言程序设计", "midterm") == 10
+    assert total("Python语言程序设计", "final") == 10
+    assert total("中国近现代史纲要", "final") == 11
+    assert total("大学英语", "midterm") == 1
+    assert total("大学英语", "final") == 4
+    assert total("思想道德与法治", "final") == 7
+    assert total("马克思主义基本原理", "final") == 11
+    assert total("转专业", "other") == 10
 
 
 @pytest.mark.parametrize(
@@ -204,11 +330,15 @@ def test_unknown_course_returns_empty_list(real_client: TestClient) -> None:
 def test_exam_type_filters_are_exclusive(real_client: TestClient) -> None:
     midterm = real_client.get("/api/papers", params={"exam_type": "midterm"}).json()
     final = real_client.get("/api/papers", params={"exam_type": "final"}).json()
+    other = real_client.get("/api/papers", params={"exam_type": "other"}).json()
 
-    assert midterm["total"] == 25
-    assert final["total"] == 63
+    assert midterm["total"] == 41
+    assert final["total"] == 111
+    assert other["total"] == 10
     assert all(item["exam_type"] == "midterm" for item in midterm["items"])
     assert all(item["exam_type"] == "final" for item in final["items"])
+    assert all(item["exam_type"] == "other" for item in other["items"])
+    assert all(item["course"] == "转专业" for item in other["items"])
     assert "math-bi-20221107-midterm" in [item["id"] for item in midterm["items"]]
     assert "math-bi-20250116-final" in [item["id"] for item in final["items"]]
 
@@ -235,7 +365,7 @@ def test_family_and_exam_type_combined(real_client: TestClient) -> None:
 def test_blank_exam_type_means_all(real_client: TestClient) -> None:
     payload = real_client.get("/api/papers", params={"exam_type": "   "}).json()
 
-    assert payload["total"] == 88
+    assert payload["total"] == 162
 
 
 def test_invalid_exam_type_returns_422(real_client: TestClient) -> None:

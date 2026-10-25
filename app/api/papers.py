@@ -15,11 +15,11 @@ from app.papers.service import PaperService, get_paper_service
 
 router = APIRouter(tags=["papers"])
 
-VALID_EXAM_TYPES: frozenset[str] = frozenset({"midterm", "final"})
+VALID_EXAM_TYPES: frozenset[str] = frozenset({"midterm", "final", "other"})
 
 
 def normalize_exam_type(raw: str | None) -> ExamType | None:
-    """省略或空白表示“全部类型”；其余只接受 midterm / final，否则 422。"""
+    """省略或空白表示“全部类型”；其余只接受 midterm / final / other，否则 422。"""
 
     if raw is None:
         return None
@@ -31,7 +31,7 @@ def normalize_exam_type(raw: str | None) -> ExamType | None:
     if text not in VALID_EXAM_TYPES:
         raise HTTPException(
             status_code=422,
-            detail="exam_type 只接受 midterm 或 final；省略该参数表示全部类型。",
+            detail="exam_type 只接受 midterm、final 或 other；省略该参数表示全部类型。",
         )
 
     return cast(ExamType, text)
@@ -46,7 +46,7 @@ def read_papers(
     ] = None,
     exam_type: Annotated[
         str | None,
-        Query(description="midterm 或 final；省略或为空表示全部类型"),
+        Query(description="midterm、final 或 other；省略或为空表示全部类型"),
     ] = None,
 ) -> PaperListResponse:
     """返回已登记试卷；没有命中时返回空列表，目录故障时返回 503。"""

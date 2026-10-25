@@ -14,6 +14,7 @@ const EXAM_TYPE_OPTIONS: { value: ExamTypeFilter; label: string }[] = [
   { value: "all", label: "全部类型" },
   { value: "midterm", label: "期中" },
   { value: "final", label: "期末" },
+  { value: "other", label: "其他" },
 ];
 
 /**

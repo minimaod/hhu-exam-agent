@@ -790,5 +790,671 @@
     "exam_type": "midterm",
     "exam_date": null,
     "file_path": "大学物理/2024-2025学年第二学期《大学物理AI》期中试卷.pdf"
+  },
+  {
+    "id": "c-2018-2019-s1-midterm",
+    "title": "2018-2019学年第一学期《C语言程序设计》期中试卷及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2018-2019",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "C语言/2018-2019学年第一学期《C语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "c-2019-2020-s1-midterm",
+    "title": "2019-2020学年第一学期《C语言程序设计》期中试卷及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2019-2020",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "C语言/2019-2020学年第一学期《C语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "c-2020-2021-s1-midterm",
+    "title": "2020-2021学年第一学期《C语言程序设计》期中试卷及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2020-2021",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "C语言/2020-2021学年第一学期《C语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "c-2020-2021-s2-final",
+    "title": "2020-2021学年第二学期《C语言程序设计》期末试卷（A卷）及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "C语言/2020-2021学年第二学期《C语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "c-2021-2022-s1-midterm",
+    "title": "2021-2022学年第一学期《C语言程序设计》期中试卷及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2021-2022",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "C语言/2021-2022学年第一学期《C语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "c-2021-2022-s2-final",
+    "title": "2021-2022学年第二学期《C语言程序设计》期末试卷（A卷）及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2021-2022",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "C语言/2021-2022学年第二学期《C语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "c-2022-2023-s1-midterm",
+    "title": "2022-2023学年第一学期《C语言程序设计》期中试卷及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2022-2023",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "C语言/2022-2023学年第一学期《C语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "c-2022-2023-s2-final",
+    "title": "2022-2023学年第二学期《C语言程序设计》期末试卷（A卷）",
+    "course": "C语言程序设计",
+    "academic_year": "2022-2023",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "C语言/2022-2023学年第二学期《C语言程序设计》期末试卷（A卷）.pdf"
+  },
+  {
+    "id": "c-2023-2024-s1-final",
+    "title": "2023-2024学年第一学期《C语言程序设计》期末试卷（A卷）及答案",
+    "course": "C语言程序设计",
+    "academic_year": "2023-2024",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "C语言/2023-2024学年第一学期《C语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2020-2021-s1-midterm",
+    "title": "2020-2021学年第一学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2020-2021",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2020-2021学年第一学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2020-2021-s1-final",
+    "title": "2020-2021学年第一学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2020-2021学年第一学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2020-2021-s2-midterm",
+    "title": "2020-2021学年第二学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2020-2021",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2020-2021学年第二学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2020-2021-s2-final",
+    "title": "2020-2021学年第二学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2020-2021学年第二学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2021-2022-s1-midterm",
+    "title": "2021-2022学年第一学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2021-2022",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2021-2022学年第一学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2021-2022-s1-final",
+    "title": "2021-2022学年第一学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2021-2022",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2021-2022学年第一学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2021-2022-s2-midterm",
+    "title": "2021-2022学年第二学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2021-2022",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2021-2022学年第二学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2021-2022-s2-final",
+    "title": "2021-2022学年第二学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2021-2022",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2021-2022学年第二学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2022-2023-s1-midterm",
+    "title": "2022-2023学年第一学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2022-2023",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2022-2023学年第一学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2022-2023-s1-final",
+    "title": "2022-2023学年第一学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2022-2023",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2022-2023学年第一学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2022-2023-s2-midterm",
+    "title": "2022-2023学年第二学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2022-2023",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2022-2023学年第二学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2022-2023-s2-final",
+    "title": "2022-2023学年第二学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2022-2023",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2022-2023学年第二学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2023-2024-s1-midterm",
+    "title": "2023-2024学年第一学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2023-2024",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2023-2024学年第一学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2023-2024-s1-final",
+    "title": "2023-2024学年第一学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2023-2024",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2023-2024学年第一学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2023-2024-s2-midterm",
+    "title": "2023-2024学年第二学期《Python语言程序设计》期中试卷",
+    "course": "Python语言程序设计",
+    "academic_year": "2023-2024",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2023-2024学年第二学期《Python语言程序设计》期中试卷.pdf"
+  },
+  {
+    "id": "py-2023-2024-s2-final",
+    "title": "2023-2024学年第二学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2023-2024",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2023-2024学年第二学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2024-2025-s1-midterm",
+    "title": "2024-2025学年第一学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2024-2025",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2024-2025学年第一学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2024-2025-s1-final",
+    "title": "2024-2025学年第一学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2024-2025",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2024-2025学年第一学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "py-2024-2025-s2-midterm",
+    "title": "2024-2025学年第二学期《Python语言程序设计》期中试卷及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2024-2025",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "Python/2024-2025学年第二学期《Python语言程序设计》期中试卷及答案.pdf"
+  },
+  {
+    "id": "py-2024-2025-s2-final",
+    "title": "2024-2025学年第二学期《Python语言程序设计》期末试卷（A卷）及答案",
+    "course": "Python语言程序设计",
+    "academic_year": "2024-2025",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "Python/2024-2025学年第二学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+  },
+  {
+    "id": "hist-2016-2017-s1-final-a",
+    "title": "2016-2017学年第一学期《中国近现代史纲要》期末试卷（A卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2016-2017",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2016-2017学年第一学期《中国近现代史纲要》期末试卷（A卷）.pdf"
+  },
+  {
+    "id": "hist-2016-2017-s1-final-c",
+    "title": "2016-2017学年第一学期《中国近现代史纲要》期末试卷（C卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2016-2017",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2016-2017学年第一学期《中国近现代史纲要》期末试卷（C卷）.pdf"
+  },
+  {
+    "id": "hist-2016-2017-s2-final-a",
+    "title": "2016-2017学年第二学期《中国近现代史纲要》期末试卷（A卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2016-2017",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2016-2017学年第二学期《中国近现代史纲要》期末试卷（A卷）.pdf"
+  },
+  {
+    "id": "hist-2017-2018-s1-final-a",
+    "title": "2017-2018学年第一学期《中国近现代史纲要》期末试卷（A卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2017-2018",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2017-2018学年第一学期《中国近现代史纲要》期末试卷（A卷）.pdf"
+  },
+  {
+    "id": "hist-2018-2019-s1-final-b",
+    "title": "2018-2019学年第一学期《中国近现代史纲要》期末试卷及答案（B卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2018-2019",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2018-2019学年第一学期《中国近现代史纲要》期末试卷及答案（B卷）.pdf"
+  },
+  {
+    "id": "hist-2018-2019-s1-final-c",
+    "title": "2018-2019学年第一学期《中国近现代史纲要》期末试卷（C卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2018-2019",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2018-2019学年第一学期《中国近现代史纲要》期末试卷（C卷）.pdf"
+  },
+  {
+    "id": "hist-2019-2020-s1-final-a",
+    "title": "2019-2020学年第一学期《中国近现代史纲要》期末试卷（A卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2019-2020",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2019-2020学年第一学期《中国近现代史纲要》期末试卷（A卷）.pdf"
+  },
+  {
+    "id": "hist-2019-2020-s1-final-b",
+    "title": "2019-2020学年第一学期《中国近现代史纲要》期末试卷（B卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2019-2020",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2019-2020学年第一学期《中国近现代史纲要》期末试卷（B卷）.pdf"
+  },
+  {
+    "id": "hist-2020-2021-s1-final-a1",
+    "title": "2020-2021学年第一学期《中国近现代史纲要》期末试卷（A卷）版本1",
+    "course": "中国近现代史纲要",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2020-2021学年第一学期《中国近现代史纲要》期末试卷（A卷-版本1）.pdf"
+  },
+  {
+    "id": "hist-2020-2021-s1-final-a2",
+    "title": "2020-2021学年第一学期《中国近现代史纲要》期末试卷（A卷）版本2",
+    "course": "中国近现代史纲要",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2020-2021学年第一学期《中国近现代史纲要》期末试卷（A卷-版本2）.pdf"
+  },
+  {
+    "id": "hist-2020-2021-s1-final-b",
+    "title": "2020-2021学年第一学期《中国近现代史纲要》期末试卷（B卷）",
+    "course": "中国近现代史纲要",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "中国近代史/2020-2021学年第一学期《中国近现代史纲要》期末试卷（B卷）.pdf"
+  },
+  {
+    "id": "eng-2020-2021-s2-final-a",
+    "title": "2020-2021学年第二学期《大学英语》期末试卷及答案（A卷）",
+    "course": "大学英语",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "大学英语/2020-2021学年第二学期《大学英语》期末试卷及答案（A卷）.pdf"
+  },
+  {
+    "id": "eng-2022-2023-s1-final-i-a",
+    "title": "2022-2023学年第一学期《大学英语I》期末试卷及答案（A卷）",
+    "course": "大学英语",
+    "academic_year": "2022-2023",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "大学英语/2022-2023学年第一学期《大学英语I》期末试卷及答案（A卷）.pdf"
+  },
+  {
+    "id": "eng-2022-2023-s2-final-ii",
+    "title": "2022-2023学年第二学期《大学英语II》期末试卷及答案",
+    "course": "大学英语",
+    "academic_year": "2022-2023",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "大学英语/2022-2023学年第二学期《大学英语II》期末试卷及答案.pdf"
+  },
+  {
+    "id": "eng-2023-2024-s2-midterm-ii",
+    "title": "2023-2024学年第二学期《大学英语II》期中试卷及答案",
+    "course": "大学英语",
+    "academic_year": "2023-2024",
+    "exam_type": "midterm",
+    "exam_date": null,
+    "file_path": "大学英语/2023-2024学年第二学期《大学英语II》期中试卷及答案.pdf"
+  },
+  {
+    "id": "eng-2023-2024-s2-final-ii",
+    "title": "2023-2024学年第二学期《大学英语II》期末试卷",
+    "course": "大学英语",
+    "academic_year": "2023-2024",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "大学英语/2023-2024学年第二学期《大学英语II》期末试卷.pdf"
+  },
+  {
+    "id": "ethics-2017-2018-s2-final-b",
+    "title": "2017-2018学年第二学期《思想道德与法治》期末试卷及答案（B卷）",
+    "course": "思想道德与法治",
+    "academic_year": "2017-2018",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "思想道德与法治/2017-2018学年第二学期《思想道德与法治》期末试卷及答案（B卷）.pdf"
+  },
+  {
+    "id": "ethics-2018-2019-s1-final-b",
+    "title": "2018-2019学年第一学期《思想道德与法治》期末试卷及答案（B卷）",
+    "course": "思想道德与法治",
+    "academic_year": "2018-2019",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "思想道德与法治/2018-2019学年第一学期《思想道德与法治》期末试卷及答案（B卷）.pdf"
+  },
+  {
+    "id": "ethics-2019-2020-s1-final-c",
+    "title": "2019-2020学年第一学期《思想道德与法治》期末试卷（C卷）",
+    "course": "思想道德与法治",
+    "academic_year": "2019-2020",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "思想道德与法治/2019-2020学年第一学期《思想道德与法治》期末试卷（C卷）.pdf"
+  },
+  {
+    "id": "ethics-2019-2020-s2-final-a",
+    "title": "2019-2020学年第二学期《思想道德与法治》期末试卷及答案（A卷）",
+    "course": "思想道德与法治",
+    "academic_year": "2019-2020",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "思想道德与法治/2019-2020学年第二学期《思想道德与法治》期末试卷及答案（A卷）.pdf"
+  },
+  {
+    "id": "ethics-2020-2021-s2-final-a",
+    "title": "2020-2021学年第二学期《思想道德与法治》期末试卷及答案（A卷）",
+    "course": "思想道德与法治",
+    "academic_year": "2020-2021",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "思想道德与法治/2020-2021学年第二学期《思想道德与法治》期末试卷及答案（A卷）.pdf"
+  },
+  {
+    "id": "ethics-2022-2023-s1-final",
+    "title": "2022-2023学年第一学期《思想道德与法治》期末试卷",
+    "course": "思想道德与法治",
+    "academic_year": "2022-2023",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "思想道德与法治/2022-2023学年第一学期《思想道德与法治》期末试卷.pdf"
+  },
+  {
+    "id": "ethics-2023-2024-s1-final",
+    "title": "2023-2024学年第一学期《思想道德与法治》期末试卷",
+    "course": "思想道德与法治",
+    "academic_year": "2023-2024",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "思想道德与法治/2023-2024学年第一学期《思想道德与法治》期末试卷.pdf"
+  },
+  {
+    "id": "marx-2023-2024-s1-final-a",
+    "title": "2023-2024学年第一学期《马克思主义基本原理》期末试卷（A卷）",
+    "course": "马克思主义基本原理",
+    "academic_year": "2023-2024",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/2023-2024学年第一学期《马克思主义基本原理》期末试卷（A卷）.pdf"
+  },
+  {
+    "id": "marx-set-01",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第01套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第01套）.pdf"
+  },
+  {
+    "id": "marx-set-02",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第02套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第02套）.pdf"
+  },
+  {
+    "id": "marx-set-03",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第03套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第03套）.pdf"
+  },
+  {
+    "id": "marx-set-04",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第04套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第04套）.pdf"
+  },
+  {
+    "id": "marx-set-05",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第05套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第05套）.pdf"
+  },
+  {
+    "id": "marx-set-06",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第06套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第06套）.pdf"
+  },
+  {
+    "id": "marx-set-07",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第07套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第07套）.pdf"
+  },
+  {
+    "id": "marx-set-08",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第08套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第08套）.pdf"
+  },
+  {
+    "id": "marx-set-09",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第09套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第09套）.pdf"
+  },
+  {
+    "id": "marx-set-10",
+    "title": "《马克思主义基本原理概论》期末试卷及答案（第10套）",
+    "course": "马克思主义基本原理",
+    "academic_year": "未标注",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "马原/《马克思主义基本原理概论》期末试卷及答案（第10套）.pdf"
+  },
+  {
+    "id": "phys-2021-2022-s1-final-aii",
+    "title": "2021-2022学年第一学期《大学物理AII》期末试卷",
+    "course": "大学物理",
+    "academic_year": "2021-2022",
+    "exam_type": "final",
+    "exam_date": null,
+    "file_path": "大学物理/2021-2022学年第一学期《大学物理AII》期末试卷.pdf"
+  },
+  {
+    "id": "transfer-math-2019-2022-compilation",
+    "title": "2019-2022级河海大学转专业《高等数学（上册）》真题精选及答案",
+    "course": "转专业",
+    "academic_year": "2019-2022",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2019-2022级河海大学转专业《高等数学（上册）》真题精选及答案.pdf"
+  },
+  {
+    "id": "transfer-math-2019-b",
+    "title": "2019年河海大学转专业《高等数学B（工科）》试卷",
+    "course": "转专业",
+    "academic_year": "2019",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2019年河海大学转专业《高等数学B（工科）》试卷.pdf"
+  },
+  {
+    "id": "transfer-english-2021",
+    "title": "2021年河海大学转专业《大学英语》试卷",
+    "course": "转专业",
+    "academic_year": "2021",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2021年河海大学转专业《大学英语》试卷.pdf"
+  },
+  {
+    "id": "transfer-math-2021-b",
+    "title": "2021年河海大学转专业《高等数学B（工科）》试卷",
+    "course": "转专业",
+    "academic_year": "2021",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2021年河海大学转专业《高等数学B（工科）》试卷.pdf"
+  },
+  {
+    "id": "transfer-chinese-2022",
+    "title": "2022年河海大学转专业《大学语文》试卷（回忆版）",
+    "course": "转专业",
+    "academic_year": "2022",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2022年河海大学转专业《大学语文》试卷（回忆版）.pdf"
+  },
+  {
+    "id": "transfer-cs-interview-2024",
+    "title": "2024年河海大学转专业《专业综合测试（计算机与软件学院）》面试真题汇总",
+    "course": "转专业",
+    "academic_year": "2024",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2024年河海大学转专业《专业综合测试（计算机与软件学院）》面试真题汇总.pdf"
+  },
+  {
+    "id": "transfer-english-2024",
+    "title": "2024年河海大学转专业《大学英语》试卷（回忆版）",
+    "course": "转专业",
+    "academic_year": "2024",
+    "exam_type": "other",
+    "exam_date": "2024-04-13",
+    "file_path": "转专业/2024年河海大学转专业《大学英语》试卷（回忆版）.pdf"
+  },
+  {
+    "id": "transfer-math-2024",
+    "title": "2024年河海大学转专业《高等数学》试卷（回忆版）",
+    "course": "转专业",
+    "academic_year": "2024",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2024年河海大学转专业《高等数学》试卷（回忆版）.pdf"
+  },
+  {
+    "id": "transfer-automation-2025",
+    "title": "2025年河海大学转专业《专业综合测试（自动化）》试卷（回忆版）",
+    "course": "转专业",
+    "academic_year": "2025",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/2025年河海大学转专业《专业综合测试（自动化）》试卷（回忆版）.pdf"
+  },
+  {
+    "id": "transfer-english-sources",
+    "title": "河海大学转专业《大学英语》真题题源截图（选词填空与阅读）",
+    "course": "转专业",
+    "academic_year": "未标注",
+    "exam_type": "other",
+    "exam_date": null,
+    "file_path": "转专业/河海大学转专业《大学英语》真题题源截图（选词填空与阅读）.pdf"
   }
 ]

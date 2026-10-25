@@ -40,6 +40,33 @@ REAL_DM_DIR = REAL_PAPERS_ROOT / "离散数学试卷"
 REAL_DM_2022_FINAL = REAL_DM_DIR / "2022-2023学年第一学期《离散数学》期末试卷.pdf"
 REAL_PHYS_DIR = REAL_PAPERS_ROOT / "大学物理"
 REAL_PHYS_2024_MID = REAL_PHYS_DIR / "2024-2025学年第二学期《大学物理AI》期中试卷.pdf"
+REAL_C_DIR = REAL_PAPERS_ROOT / "C语言"
+REAL_C_2022_FINAL = REAL_C_DIR / "2022-2023学年第二学期《C语言程序设计》期末试卷（A卷）.pdf"
+REAL_PY_DIR = REAL_PAPERS_ROOT / "Python"
+REAL_PY_2024_FINAL = REAL_PY_DIR / "2024-2025学年第二学期《Python语言程序设计》期末试卷（A卷）及答案.pdf"
+REAL_HIST_DIR = REAL_PAPERS_ROOT / "中国近代史"
+REAL_HIST_2016_FINAL_A = (
+    REAL_HIST_DIR / "2016-2017学年第一学期《中国近现代史纲要》期末试卷（A卷）.pdf"
+)
+REAL_ENG_DIR = REAL_PAPERS_ROOT / "大学英语"
+REAL_ENG_2024_MID = (
+    REAL_ENG_DIR / "2023-2024学年第二学期《大学英语II》期中试卷及答案.pdf"
+)
+REAL_ETHICS_DIR = REAL_PAPERS_ROOT / "思想道德与法治"
+REAL_ETHICS_2020_FINAL_A = (
+    REAL_ETHICS_DIR / "2019-2020学年第二学期《思想道德与法治》期末试卷及答案（A卷）.pdf"
+)
+REAL_MARX_DIR = REAL_PAPERS_ROOT / "马原"
+REAL_MARX_2023_FINAL = (
+    REAL_MARX_DIR / "2023-2024学年第一学期《马克思主义基本原理》期末试卷（A卷）.pdf"
+)
+REAL_TRANSFER_DIR = REAL_PAPERS_ROOT / "转专业"
+REAL_TRANSFER_MATH_2021 = (
+    REAL_TRANSFER_DIR / "2021年河海大学转专业《高等数学B（工科）》试卷.pdf"
+)
+REAL_PHYS_2021_FINAL = (
+    REAL_PHYS_DIR / "2021-2022学年第一学期《大学物理AII》期末试卷.pdf"
+)
 
 _GENERIC_READ = 0x80000000
 _OPEN_EXISTING = 3

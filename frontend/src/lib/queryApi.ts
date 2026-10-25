@@ -80,7 +80,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isExamType(value: unknown): value is ExamType {
-  return value === "midterm" || value === "final";
+  return value === "midterm" || value === "final" || value === "other";
 }
 
 function isProgressStage(value: unknown): value is ProgressStage {
@@ -118,7 +118,7 @@ function isFilters(value: unknown): value is QueryFilters {
   );
 }
 
-function isResultEvent(value: unknown): value is ResultEvent {
+export function isResultEvent(value: unknown): value is ResultEvent {
   if (!isRecord(value) || value.type !== "result") {
     return false;
   }

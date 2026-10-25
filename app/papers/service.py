@@ -37,6 +37,12 @@ class PaperService:
         items = [self._to_item(record) for record in records]
         return PaperListResponse(items=items, total=len(items))
 
+    def get_paper(self, paper_id: str) -> PaperItem | None:
+        """按登记 ID 取对外条目；仅供来源校验，不检查 PDF 是否存在。"""
+
+        record = self._repository.get_paper(paper_id)
+        return None if record is None else self._to_item(record)
+
     def get_download(self, paper_id: str) -> DownloadTarget:
         """把已登记 ID 换成可安全读取的 PDF 路径。
 

@@ -20,6 +20,9 @@ frontend/dist/
 # 真实试卷仅在本地保存；仓库保留 catalog.json
 data/papers/**/*.pdf
 
+# 本地学习数据：会话 SQLite 及其附属文件（-wal/-shm）不进入仓库
+data/local/
+
 # 本地学习、架构决策、任务记录与协作约定不进入公开仓库
 /docs/
 /AGENTS.md
@@ -29,3 +32,8 @@ data/papers/**/*.pdf
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地验证与工具产生的临时目录
+tmp*/
+.tmp*/
+.dsh/

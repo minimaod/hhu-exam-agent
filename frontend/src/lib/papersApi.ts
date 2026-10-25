@@ -6,7 +6,7 @@
  * 以后换成 SSE 或加入自然语言查询时，页面代码不需要跟着改。
  */
 
-export type ExamType = "midterm" | "final";
+export type ExamType = "midterm" | "final" | "other";
 
 /** 筛选用的类型值：all 表示不按类型过滤。 */
 export type ExamTypeFilter = ExamType | "all";
@@ -45,7 +45,7 @@ export class PapersApiError extends Error {
 }
 
 function isExamType(value: unknown): value is ExamType {
-  return value === "midterm" || value === "final";
+  return value === "midterm" || value === "final" || value === "other";
 }
 
 export function isPaperItem(value: unknown): value is PaperItem {
@@ -212,7 +212,8 @@ export async function downloadPaper(item: PaperItem): Promise<void> {
     anchor.click();
     anchor.remove();
   } finally {
-    // 延迟回收：部分浏览器在点击后立刻 revoke 会导致保存失败。
-    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    // 延迟回收：下载较大时浏览器尚未读取完 blob，过早 revoke 会取消下载。
+    // 这里保留一分钟，足够本地 PDF 完成写盘。
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
   }
 }

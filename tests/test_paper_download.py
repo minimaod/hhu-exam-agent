@@ -14,15 +14,23 @@ from fastapi.testclient import TestClient
 from tests.support import (
     REAL_A2_FINAL,
     REAL_B1_2021_MIDTERM,
+    REAL_C_2022_FINAL,
     REAL_CV_2021_MID,
     REAL_DM_2022_FINAL,
+    REAL_ENG_2024_MID,
+    REAL_ETHICS_2020_FINAL_A,
     REAL_FINAL,
     REAL_GEO_2024_FINAL,
+    REAL_HIST_2016_FINAL_A,
+    REAL_MARX_2023_FINAL,
     REAL_MIDTERM,
+    REAL_PHYS_2021_FINAL,
     REAL_PHYS_2024_MID,
     REAL_PROB_2018_ENG,
     REAL_PROB_2021_FINAL,
     REAL_PROB_2021_MID,
+    REAL_PY_2024_FINAL,
+    REAL_TRANSFER_MATH_2021,
     REAL_UP_2014_MIDTERM,
     exclusive_file_lock,
     sample_record,
@@ -46,6 +54,14 @@ from tests.support import (
         ("cv-2021-2022-s2-midterm", REAL_CV_2021_MID),
         ("dm-2022-2023-s1-final", REAL_DM_2022_FINAL),
         ("phys-2024-2025-s2-midterm-ai", REAL_PHYS_2024_MID),
+        ("c-2022-2023-s2-final", REAL_C_2022_FINAL),
+        ("py-2024-2025-s2-final", REAL_PY_2024_FINAL),
+        ("hist-2016-2017-s1-final-a", REAL_HIST_2016_FINAL_A),
+        ("eng-2023-2024-s2-midterm-ii", REAL_ENG_2024_MID),
+        ("ethics-2019-2020-s2-final-a", REAL_ETHICS_2020_FINAL_A),
+        ("marx-2023-2024-s1-final-a", REAL_MARX_2023_FINAL),
+        ("transfer-math-2021-b", REAL_TRANSFER_MATH_2021),
+        ("phys-2021-2022-s1-final-aii", REAL_PHYS_2021_FINAL),
     ],
 )
 def test_download_matches_original_bytes(
@@ -76,6 +92,14 @@ def test_download_matches_original_bytes(
         ("cv-2021-2022-s2-midterm", REAL_CV_2021_MID),
         ("dm-2022-2023-s1-final", REAL_DM_2022_FINAL),
         ("phys-2024-2025-s2-midterm-ai", REAL_PHYS_2024_MID),
+        ("c-2022-2023-s2-final", REAL_C_2022_FINAL),
+        ("py-2024-2025-s2-final", REAL_PY_2024_FINAL),
+        ("hist-2016-2017-s1-final-a", REAL_HIST_2016_FINAL_A),
+        ("eng-2023-2024-s2-midterm-ii", REAL_ENG_2024_MID),
+        ("ethics-2019-2020-s2-final-a", REAL_ETHICS_2020_FINAL_A),
+        ("marx-2023-2024-s1-final-a", REAL_MARX_2023_FINAL),
+        ("transfer-math-2021-b", REAL_TRANSFER_MATH_2021),
+        ("phys-2021-2022-s1-final-aii", REAL_PHYS_2021_FINAL),
     ],
 )
 def test_download_keeps_chinese_filename(
@@ -102,7 +126,7 @@ def test_download_url_from_list_is_usable(real_client: TestClient) -> None:
 def test_every_registered_paper_downloads(real_client: TestClient) -> None:
     items = real_client.get("/api/papers").json()["items"]
 
-    assert len(items) == 88
+    assert len(items) == 162
     for item in items:
         response = real_client.get(item["download_url"])
         assert response.status_code == 200, item["id"]

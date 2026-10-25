@@ -29,7 +29,7 @@ _CLARIFY_MESSAGES = {
 }
 
 _UNSUPPORTED_MESSAGES = {
-    "unsupported_constraint": "当前只支持按课程和期中/期末查询试卷，暂不支持年份、学年等筛选条件。",
+    "unsupported_constraint": "当前只支持按课程和期中/期末/其他查询试卷，暂不支持年份、学年等筛选条件。",
     "out_of_scope": "当前支持查询试卷和下载原文件；复习计划、题型分析等功能尚未实现。",
 }
 
@@ -44,6 +44,8 @@ def _exam_label(exam_type: ExamType | None) -> str:
         return "期中试卷"
     if exam_type == "final":
         return "期末试卷"
+    if exam_type == "other":
+        return "其他类型试卷"
     return "试卷"
 
 

@@ -8,10 +8,8 @@ SSE 只是传输方式；业务完成以最后一条 result/error 为准。这�
 """
 
 import asyncio
-import json
 import logging
 from collections.abc import AsyncIterator
-from contextlib import suppress
 
 from fastapi import Request
 
@@ -27,10 +25,10 @@ from app.querying.models import (
     Understander,
 )
 from app.querying.workflow import build_workflow
+from app.sse import encode_sse_event
+from app.streaming import SENTINEL, stream_events
 
 TOTAL_TIMEOUT_SECONDS = 45.0
-DISCONNECT_POLL_SECONDS = 0.2
-SENTINEL = None
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -45,10 +43,9 @@ _TIMEOUT_MESSAGE = "查询超时，请重试。"
 
 
 def encode_event(event: QueryEvent) -> str:
-    """一条事件一个 data 帧；JSON 使用 UTF-8 原文，中文不转义。"""
+    """一条事件一个 data 帧；编码规则在 app/sse.py。"""
 
-    payload = event.model_dump(mode="json")
-    return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    return encode_sse_event(event)
 
 
 class QueryService:
@@ -59,50 +56,31 @@ class QueryService:
         self._papers = papers
 
     async def stream(self, query: str, request: Request) -> AsyncIterator[str]:
-        queue: asyncio.Queue[QueryEvent | None] = asyncio.Queue()
-        worker = asyncio.create_task(self._produce(query, queue))
-        getter = asyncio.create_task(queue.get())
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + TOTAL_TIMEOUT_SECONDS
+        """旧 /api/query 使用的 SSE 字符串流；业务逻辑在 events() 中。"""
 
-        try:
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    yield encode_event(ErrorEvent(code="QUERY_FAILED", message=_TIMEOUT_MESSAGE))
-                    return
+        async for event in self.events(query, request):
+            yield encode_event(event)
 
-                done, _ = await asyncio.wait(
-                    {getter},
-                    timeout=min(DISCONNECT_POLL_SECONDS, remaining),
-                )
+    async def events(self, query: str, request: Request) -> AsyncIterator[QueryEvent]:
+        """产出类型明确的一次查询事件，供不同接口共同消费。
 
-                if getter not in done:
-                    if await request.is_disconnected():
-                        return
-                    continue
+        业务完成以最后一条 result 或 error 为准；客户端断开时直接结束，
+        不产生终止事件。
+        """
 
-                event = getter.result()
-                if event is SENTINEL:
-                    return
-
-                yield encode_event(event)
-                if isinstance(event, (ResultEvent, ErrorEvent)):
-                    return
-
-                getter = asyncio.create_task(queue.get())
-        finally:
-            getter.cancel()
-            worker.cancel()
-            with suppress(asyncio.CancelledError):
-                await getter
-            with suppress(asyncio.CancelledError):
-                await worker
+        async for event in stream_events(
+            lambda queue: self._produce(query, queue),
+            request,
+            timeout=TOTAL_TIMEOUT_SECONDS,
+            timeout_event=ErrorEvent(code="QUERY_FAILED", message=_TIMEOUT_MESSAGE),
+            is_terminal=lambda item: isinstance(item, (ResultEvent, ErrorEvent)),
+        ):
+            yield event
 
     async def _produce(
         self,
         query: str,
-        queue: "asyncio.Queue[QueryEvent | None]",
+        queue: "asyncio.Queue[object]",
     ) -> None:
         async def emit(stage: ProgressStage, message: str) -> None:
             # 闭包只暴露“发一条进度”的能力，不把队列交给工作流节点。
