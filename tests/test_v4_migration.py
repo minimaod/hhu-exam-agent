@@ -144,7 +144,7 @@ def test_v3_database_backfills_first_attempt(tmp_path: Path) -> None:
     ConversationRepository(path).initialize()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         row = connection.execute(
             "SELECT * FROM exercise_attempts WHERE exercise_id = 'ex-v3'"
         ).fetchone()

@@ -59,13 +59,13 @@ def build_v2(path: Path, *, version: int = 2) -> None:
         connection.close()
 
 
-def test_empty_database_initializes_to_v4(tmp_path: Path) -> None:
+def test_empty_database_initializes_to_current(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
     repo = ConversationRepository(path)
     repo.initialize()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         tables = {
             row[0]
             for row in connection.execute(
@@ -79,7 +79,7 @@ def test_empty_database_initializes_to_v4(tmp_path: Path) -> None:
     assert "exercise_attempt_attachments" in tables
 
 
-def test_v2_database_migrates_to_v4_successfully(tmp_path: Path) -> None:
+def test_v2_database_migrates_to_current(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
     build_v2(path)
 
@@ -87,7 +87,7 @@ def test_v2_database_migrates_to_v4_successfully(tmp_path: Path) -> None:
     repo.initialize()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         cols = [
             row[1]
             for row in connection.execute("PRAGMA table_info(conversation_turns)")

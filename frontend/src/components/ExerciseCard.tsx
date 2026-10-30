@@ -281,6 +281,14 @@ export default function ExerciseCard({
           <span className="rounded-full border border-indigo-300 bg-indigo-50 px-2.5 py-0.5 text-[11px] font-medium text-indigo-700">
             AI 生成类似题
           </span>
+          {exercise.source_question && (
+            <span
+              title={exercise.source_question.paper_title ?? exercise.source_question.paper_id}
+              className="max-w-full truncate rounded-full border border-river/30 bg-river/10 px-2.5 py-0.5 text-[11px] font-medium text-river"
+            >
+              根据真题生成：第 {exercise.source_question.number_label ?? "?"} 题
+            </span>
+          )}
           {exercise.knowledge_point && (
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] font-medium text-slate-600">
               考点：{exercise.knowledge_point}

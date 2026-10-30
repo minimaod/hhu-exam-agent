@@ -16,6 +16,7 @@ import {
   listConversations,
   revealExerciseSolution,
   streamTurn,
+  type TurnMessageDeltaEvent,
   type TurnProgressEvent,
 } from "./conversationsApi.ts";
 
@@ -568,4 +569,81 @@ test("主动查看参考解答接口调用并返回解答", async (t) => {
     `/api/conversations/${CONVERSATION.id}/exercises/ex-123/reveal`,
   );
   assert.equal(calls[0].init?.method, "POST");
+});
+
+test("正文片段按 seq 顺序回调，乱序或重复立即失败", async (t) => {
+  const deltas: TurnMessageDeltaEvent[] = [];
+  installFetch(
+    t,
+    sseBody([
+      envelope({ type: "progress", stage: "composing_reply", message: "正在组织回复" }),
+      envelope({ type: "message_delta", seq: 1, delta: "已经确认科目。" }),
+      envelope({ type: "message_delta", seq: 2, delta: "我先找两份试卷。" }),
+      envelope({
+        type: "result",
+        kind: "dynamic",
+        assistant_message: "已经确认科目。我先找两份试卷。",
+      }),
+    ]),
+  );
+
+  const event = await streamTurn({
+    conversationId: CONVERSATION.id,
+    requestId: REQUEST_ID,
+    query: "我要复习高数",
+    onMessageDelta: (item) => deltas.push(item),
+  });
+
+  assert.deepEqual(
+    deltas.map((item) => item.seq),
+    [1, 2],
+  );
+  assert.equal(deltas.map((item) => item.delta).join(""), "已经确认科目。我先找两份试卷。");
+  assert.equal(event.type, "result");
+
+  // 重复/跳号的片段视为损坏的流，调用方必须丢弃临时正文。
+  installFetch(
+    t,
+    sseBody([
+      envelope({ type: "message_delta", seq: 1, delta: "第一段" }),
+      envelope({ type: "message_delta", seq: 3, delta: "跳号" }),
+      envelope({ type: "result", kind: "dynamic", assistant_message: "第一段跳号" }),
+    ]),
+  );
+
+  await assert.rejects(
+    streamTurn({
+      conversationId: CONVERSATION.id,
+      requestId: REQUEST_ID,
+      query: "我要复习高数",
+      onMessageDelta: () => {},
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConversationsApiError);
+      assert.equal(error.code, "STREAM_INCOMPLETE");
+      return true;
+    },
+  );
+});
+
+test("正文片段格式不合法时按契约错误处理", async (t) => {
+  for (const payload of [
+    { type: "message_delta", seq: 0, delta: "零号" },
+    { type: "message_delta", seq: 1, delta: "" },
+    { type: "message_delta", delta: "缺 seq" },
+  ]) {
+    installFetch(t, sseBody([envelope(payload), envelope({ type: "result", kind: "dynamic" })]));
+    await assert.rejects(
+      streamTurn({
+        conversationId: CONVERSATION.id,
+        requestId: REQUEST_ID,
+        query: "我要复习高数",
+        onMessageDelta: () => {},
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof ConversationsApiError);
+        return true;
+      },
+    );
+  }
 });

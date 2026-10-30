@@ -21,6 +21,11 @@ export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 export type BusinessStatus = "succeeded" | "partial" | "failed" | "needs_input";
 type BusinessOutcome = { business_status?: BusinessStatus | null; retryable?: boolean; retry_hint?: string | null };
 
+/** 正文完整性与业务完成分开：失败/截断时业务操作仍然可能已经成功。 */
+export type ReplyStatus = "complete" | "truncated" | "failed";
+
+type ReplyOutcome = { reply_status?: ReplyStatus | null; reply_retryable?: boolean };
+
 export function turnBusinessStatus(turn: ConversationTurn): BusinessStatus | null {
   if (turn.status === "running") return null;
   if (turn.business_status) return turn.business_status;
@@ -45,8 +50,12 @@ export type TurnKind =
   | "exercise"
   // 仅用于读取 F006 修复前的历史轮次；新响应统一为 exercise。
   | "exercise_answer"
-  | "reveal_solution";
-export type TurnErrorCode = QueryErrorCode | "STORAGE_UNAVAILABLE" | "TUTORING_FAILED" | "BUSINESS_REJECTED";
+  | "reveal_solution"
+  | "select_question"
+  | "explain_question"
+  | "view_question_answer";
+export type TurnErrorCode = QueryErrorCode | "STORAGE_UNAVAILABLE" | "TUTORING_FAILED" | "BUSINESS_REJECTED"
+  | "QUESTION_SEARCH_FAILED" | "QUESTION_BANK_UNAVAILABLE";
 export type TurnStage =
   | "dispatching"
   | "scheduling"
@@ -59,6 +68,9 @@ export type TurnStage =
   | "answering"
   | "recording"
   | "updating_record"
+  | "searching_questions"
+  | "viewing_question"
+  | "composing_reply"
   | "saving";
 
 export type SourceType = "none" | "student_text" | "registered_paper";
@@ -228,6 +240,7 @@ export type ExerciseView = {
   statement_text: string;
   knowledge_point?: string | null;
   reference_solution_text?: string | null;
+  source_question?: ExerciseSourceView | null;
   student_answer_text?: string | null;
   student_solution_text?: string | null;
   status: ExerciseStatus;
@@ -239,6 +252,102 @@ export type ExerciseView = {
   created_at: string;
   updated_at: string;
 };
+
+export type QuestionOption = { label: string; text: string };
+export type QuestionAsset = {
+  asset_id: string;
+  page?: number | null;
+  description?: string | null;
+  url: string;
+};
+export type QuestionSource = {
+  paper_id: string;
+  paper_title?: string | null;
+  exam_type?: string | null;
+  academic_year?: string | null;
+  question_number: string;
+  download_url?: string | null;
+  may_show_answer: boolean;
+};
+export type QuestionAnswerAvailability = {
+  state: "original" | "missing" | "pending_review" | "conflict";
+  available: boolean;
+};
+export type QuestionCodeBlock = {
+  block_id?: string | null;
+  method?: number | null;
+  method_label?: string | null;
+  column?: number | null;
+  kind?: string | null;
+  name?: string | null;
+  text: string;
+  page?: number | null;
+  pages: number[];
+  depends_on: string[];
+};
+export type QuestionCodeAnnotation = {
+  role?: string | null;
+  text: string;
+  page?: number | null;
+};
+export type QuestionIndependentSolution = {
+  author?: string | null;
+  text: string;
+  note?: string | null;
+};
+export type QuestionCard = {
+  question_id: string;
+  build_id: string;
+  selection_id?: string | null;
+  source_request_id?: string | null;
+  question_type: "choice" | "fill" | "code";
+  number_label: string;
+  statement: string;
+  content_sha256: string;
+  options: QuestionOption[];
+  code_lines: string[];
+  blank_marks: string[];
+  formulas: { text: string; page?: number | null }[];
+  assets: QuestionAsset[];
+  pages: { statement: number[]; answer: number[] };
+  knowledge_points: { slug: string; name: string; status?: string }[];
+  answer: QuestionAnswerAvailability;
+  review: { status: string; approved: boolean; stale: boolean };
+  source: QuestionSource;
+  selected?: boolean;
+  answer_revealed?: boolean;
+  answer_revealed_at?: string | null;
+  source_url?: string | null;
+  source_views?: { kind: "statement" | "answer"; page: number; viewed_at: string; may_show_answer: boolean }[];
+  content_issues: string[];
+  answer_url?: string | null;
+  answer_detail?: { state: string; text: string; note?: string | null } | null;
+  reference_code?: string | null;
+  reference_code_pages?: number[];
+  code_blocks?: QuestionCodeBlock[];
+  code_annotations?: QuestionCodeAnnotation[];
+  code_examples?: string[];
+  independent_solutions?: QuestionIndependentSolution[];
+};
+export type ExerciseSourceView = {
+  question_id: string;
+  paper_id: string;
+  paper_title?: string | null;
+  number_label?: string | null;
+  question_type?: string | null;
+  build_id: string;
+  source_version: string;
+  content_sha256: string;
+};
+export type QuestionResultStatus =
+  | "ok"
+  | "missing_answer"
+  | "no_match"
+  | "unreviewed"
+  | "bank_not_built"
+  | "bank_unavailable"
+  | "source_changed"
+  | "source_pruned";
 
 export type ActionResultItem = {
   action: string;
@@ -266,7 +375,8 @@ export type RecordRef = {
   problem_version: number;
 };
 
-export type ConversationTurn = BusinessOutcome & {
+export type ConversationTurn = BusinessOutcome &
+  ReplyOutcome & {
   request_id: string;
   seq: number;
   kind: TurnKind;
@@ -280,6 +390,10 @@ export type ConversationTurn = BusinessOutcome & {
   assistant_message?: string | null;
   suggestions?: SuggestionItem[] | null;
   exercise_id?: string | null;
+  question_results?: QuestionCard[] | null;
+  question_result_status?: QuestionResultStatus | null;
+  question_result_message?: string | null;
+  question?: QuestionCard | null;
   error: TurnError | null;
   started_at: string;
   finished_at: string | null;
@@ -290,6 +404,7 @@ export type ConversationDetail = {
   turns: ConversationTurn[];
   active_problem: ProblemView | null;
   active_exercise?: ExerciseView | null;
+  active_question?: QuestionCard | null;
   context?: ConversationContextView | null;
   record: RecordRef | null;
 };
@@ -302,7 +417,29 @@ export type TurnProgressEvent = {
   message: string;
 };
 
-export type TurnResultEvent = BusinessOutcome & {
+/**
+ * F008：模型实际流式生成的正文片段。
+ *
+ * 只代表“正在生成”，不代表业务成功；必须等到 result 才算本轮完成。
+ * seq 在同一 (conversation_id, request_id) 内从 1 开始严格递增。
+ */
+export type TurnMessageDeltaEvent = {
+  type: "message_delta";
+  conversation_id: string;
+  request_id: string;
+  seq: number;
+  delta: string;
+};
+
+export type RegeneratedReply = {
+  request_id: string;
+  assistant_message: string;
+  reply_status: ReplyStatus | null;
+  reply_retryable: boolean;
+};
+
+export type TurnResultEvent = BusinessOutcome &
+  ReplyOutcome & {
   type: "result";
   conversation_id: string;
   request_id: string;
@@ -315,6 +452,10 @@ export type TurnResultEvent = BusinessOutcome & {
   assistant_message?: string | null;
   suggestions?: SuggestionItem[] | null;
   exercise_id?: string | null;
+  question_results?: QuestionCard[] | null;
+  question_result_status?: QuestionResultStatus | null;
+  question_result_message?: string | null;
+  question?: QuestionCard | null;
 };
 
 export type TurnErrorEvent = {
@@ -325,7 +466,11 @@ export type TurnErrorEvent = {
   message: string;
 };
 
-export type TurnEvent = TurnProgressEvent | TurnResultEvent | TurnErrorEvent;
+export type TurnEvent =
+  | TurnProgressEvent
+  | TurnMessageDeltaEvent
+  | TurnResultEvent
+  | TurnErrorEvent;
 
 export type StreamTurnOptions = {
   conversationId: string;
@@ -341,8 +486,12 @@ export type StreamTurnOptions = {
   startNew?: boolean;
   retryOf?: string;
   attemptKind?: "supplement" | "correction";
+  questionId?: string;
+  questionSourceTurn?: string;
+  questionAction?: "exercise" | "record";
   signal?: AbortSignal;
   onProgress?: (event: TurnProgressEvent) => void;
+  onMessageDelta?: (event: TurnMessageDeltaEvent) => void;
 };
 
 export class ConversationsApiError extends Error {
@@ -408,7 +557,10 @@ function isTurnKind(value: unknown): value is TurnKind {
     value === "dynamic" ||
     value === "exercise" ||
     value === "exercise_answer" ||
-    value === "reveal_solution"
+    value === "reveal_solution" ||
+    value === "select_question" ||
+    value === "explain_question" ||
+    value === "view_question_answer"
   );
 }
 
@@ -690,6 +842,40 @@ export function isTutoringResult(value: unknown): value is TutoringResult {
   }
 }
 
+function isQuestionCard(value: unknown): value is QuestionCard {
+  return (
+    isRecord(value) &&
+    typeof value.question_id === "string" &&
+    typeof value.build_id === "string" &&
+    (value.question_type === "choice" || value.question_type === "fill" || value.question_type === "code") &&
+    typeof value.number_label === "string" &&
+    typeof value.statement === "string" &&
+    Array.isArray(value.options) &&
+    value.options.every((item) => isRecord(item) && typeof item.label === "string" && typeof item.text === "string") &&
+    Array.isArray(value.assets) &&
+    isRecord(value.pages) &&
+    Array.isArray(value.pages.statement) &&
+    Array.isArray(value.pages.answer) &&
+    isRecord(value.answer) &&
+    isRecord(value.review) &&
+    isRecord(value.source) &&
+    typeof value.source.paper_id === "string"
+  );
+}
+
+function isQuestionResultStatus(value: unknown): value is QuestionResultStatus {
+  return (
+    value === "ok" ||
+    value === "missing_answer" ||
+    value === "no_match" ||
+    value === "unreviewed" ||
+    value === "bank_not_built" ||
+    value === "bank_unavailable" ||
+    value === "source_changed" ||
+    value === "source_pruned"
+  );
+}
+
 function isConversationTurn(value: unknown): value is ConversationTurn {
   if (!isRecord(value) || !isBusinessOutcome(value)) return false;
   if (!isRecord(value)) {
@@ -767,6 +953,36 @@ function isConversationTurn(value: unknown): value is ConversationTurn {
   ) {
     return false;
   }
+  if (
+      !(
+        value.question_results === undefined ||
+        value.question_results === null ||
+        (Array.isArray(value.question_results) && value.question_results.every(isQuestionCard))
+      )
+    ) {
+      return false;
+    }
+  if (!(value.question === undefined || value.question === null || isQuestionCard(value.question))) {
+    return false;
+  }
+  if (
+    !(
+      value.question_result_status === undefined ||
+      value.question_result_status === null ||
+      isQuestionResultStatus(value.question_result_status)
+    )
+  ) {
+    return false;
+  }
+  if (
+    !(
+      value.question_result_message === undefined ||
+      value.question_result_message === null ||
+      typeof value.question_result_message === "string"
+    )
+  ) {
+    return false;
+  }
   if (value.status === "completed") {
     if (value.kind === "query") {
       return (
@@ -782,6 +998,15 @@ function isConversationTurn(value: unknown): value is ConversationTurn {
     if (value.kind === "reveal_solution") {
       return error === null && exercise != null && value.finished_at !== null;
     }
+    if (value.kind === "select_question") {
+      return error === null && value.finished_at !== null && value.question != null;
+    }
+    if (value.kind === "explain_question") {
+      return error === null && value.finished_at !== null && (tutoring != null || value.question != null);
+    }
+    if (value.kind === "view_question_answer") {
+      return error === null && value.finished_at !== null && value.question != null;
+    }
     if (value.kind === "dynamic") {
       return (
         error === null &&
@@ -789,6 +1014,8 @@ function isConversationTurn(value: unknown): value is ConversationTurn {
         (result !== null ||
           tutoring !== null ||
           exercise != null ||
+          value.question != null ||
+          (Array.isArray(value.question_results) && value.question_results.length > 0) ||
           Boolean(value.assistant_message) ||
           (Array.isArray(composite) && composite.length > 0))
       );
@@ -835,6 +1062,9 @@ function isConversationDetail(value: unknown): value is ConversationDetail {
     Array.isArray(value.turns) &&
     value.turns.every(isConversationTurn) &&
     (value.active_problem === null || isProblemView(value.active_problem)) &&
+    (value.active_question === undefined ||
+      value.active_question === null ||
+      isQuestionCard(value.active_question)) &&
     (value.active_exercise === undefined ||
       value.active_exercise === null ||
       isExerciseView(value.active_exercise)) &&
@@ -871,6 +1101,9 @@ function isTurnStage(value: unknown): value is TurnStage {
     value === "answering" ||
     value === "recording" ||
     value === "updating_record" ||
+    value === "searching_questions" ||
+    value === "viewing_question" ||
+    value === "composing_reply" ||
     value === "saving"
   );
 }
@@ -886,6 +1119,8 @@ function isTurnErrorCode(value: unknown): value is TurnErrorCode {
     value === "QUERY_FAILED" ||
     value === "TUTORING_FAILED" ||
     value === "BUSINESS_REJECTED" ||
+    value === "QUESTION_SEARCH_FAILED" ||
+    value === "QUESTION_BANK_UNAVAILABLE" ||
     value === "STORAGE_UNAVAILABLE"
   );
 }
@@ -1012,6 +1247,10 @@ export async function getConversation(
   return payload;
 }
 
+export function isReplyStatus(value: unknown): value is ReplyStatus {
+  return value === "complete" || value === "truncated" || value === "failed";
+}
+
 export function parseTurnEvent(
   raw: string,
   conversationId: string,
@@ -1047,6 +1286,26 @@ export function parseTurnEvent(
     };
   }
 
+  if (payload.type === "message_delta") {
+    const seq = payload.seq;
+    if (
+      typeof seq !== "number" ||
+      !Number.isInteger(seq) ||
+      seq < 1 ||
+      typeof payload.delta !== "string" ||
+      payload.delta.length === 0
+    ) {
+      throw new ConversationsApiError("后端返回的正文片段格式不符合约定。");
+    }
+    return {
+      type: "message_delta",
+      conversation_id: conversationId,
+      request_id: requestId,
+      seq,
+      delta: payload.delta,
+    };
+  }
+
   if (payload.type === "error") {
     if (!isTurnErrorCode(payload.code) || typeof payload.message !== "string") {
       throw new ConversationsApiError("后端返回的错误事件格式不符合约定。");
@@ -1066,13 +1325,52 @@ export function parseTurnEvent(
   const kind: TurnKind =
     payload.kind === "exercise_answer" ? "exercise" : payload.kind;
   if (!isBusinessOutcome(payload)) throw new ConversationsApiError("后端返回的业务状态格式不符合约定。");
-  const outcome: BusinessOutcome = {
+  const outcome: BusinessOutcome & ReplyOutcome = {
     business_status: payload.business_status as BusinessStatus | null | undefined,
     retryable: payload.retryable as boolean | undefined,
     retry_hint: payload.retry_hint as string | null | undefined,
+    reply_status: isReplyStatus(payload.reply_status)
+      ? payload.reply_status
+      : payload.reply_status === null || payload.reply_status === undefined
+        ? null
+        : (() => {
+            throw new ConversationsApiError("后端返回的正文状态格式不符合约定。");
+          })(),
+    reply_retryable:
+      payload.reply_retryable === undefined ? false : Boolean(payload.reply_retryable),
   };
   const result = payload.result;
   const tutoring = payload.tutoring;
+  const question = payload.question;
+  const questionResults = payload.question_results;
+  const questionStatus = payload.question_result_status;
+  const questionMessage = payload.question_result_message;
+  if (!(question === null || question === undefined || isQuestionCard(question))) {
+    throw new ConversationsApiError("后端返回的真题格式不符合约定。");
+  }
+  if (
+    !(
+      questionResults === null ||
+      questionResults === undefined ||
+      (Array.isArray(questionResults) && questionResults.every(isQuestionCard))
+    )
+  ) {
+    throw new ConversationsApiError("后端返回的真题列表格式不符合约定。");
+  }
+  if (
+    !(
+      questionStatus === null ||
+      questionStatus === undefined ||
+      isQuestionResultStatus(questionStatus)
+    ) ||
+    !(
+      questionMessage === null ||
+      questionMessage === undefined ||
+      typeof questionMessage === "string"
+    )
+  ) {
+    throw new ConversationsApiError("后端返回的真题状态格式不符合约定。");
+  }
   if (!(result === null || result === undefined || isResultEvent(result))) {
     throw new ConversationsApiError("后端返回的查询结果格式不符合约定。");
   }
@@ -1090,6 +1388,27 @@ export function parseTurnEvent(
       kind,
       result,
       tutoring: null,
+      ...outcome,
+    };
+  }
+  if (kind === "select_question" || kind === "explain_question" || kind === "view_question_answer") {
+    if (!question) {
+      throw new ConversationsApiError("真题轮次缺少题目结果。");
+    }
+    if (kind === "explain_question" && !tutoring) {
+      throw new ConversationsApiError("真题讲解轮次缺少讲解结果。");
+    }
+    return {
+      type: "result",
+      conversation_id: conversationId,
+      request_id: requestId,
+      kind,
+      result: null,
+      tutoring: tutoring ?? null,
+      question: question ?? null,
+      question_results: questionResults ?? null,
+      question_result_status: questionStatus ?? null,
+      question_result_message: questionMessage ?? null,
       ...outcome,
     };
   }
@@ -1170,6 +1489,10 @@ export function parseTurnEvent(
       assistant_message: assistantMessage ?? null,
       suggestions: suggestions ?? null,
       exercise_id: exerciseId ?? null,
+      question: question ?? null,
+      question_results: questionResults ?? null,
+      question_result_status: questionStatus ?? null,
+      question_result_message: questionMessage ?? null,
       ...outcome,
     };
   }
@@ -1183,6 +1506,8 @@ export function parseTurnEvent(
     kind,
     result: null,
     tutoring,
+    question: question ?? null,
+    question_results: questionResults ?? null,
     ...outcome,
   };
 }
@@ -1200,7 +1525,13 @@ export async function streamTurn(
   if (text.length > MAX_QUERY_LENGTH) {
     throw new ConversationsApiError(`本轮文字最长为 ${MAX_QUERY_LENGTH} 个字符。`);
   }
+  const isQuestionTurn = options.kind === "select_question"
+    || options.kind === "explain_question"
+    || options.kind === "view_question_answer";
+  const hasQuestionTarget = Boolean(options.questionId && options.questionSourceTurn);
   if (!text && !(options.attachments ?? []).length && !options.retryOf &&
+      !(isQuestionTurn && hasQuestionTarget) &&
+      !(options.questionAction && hasQuestionTarget) &&
       !((options.kind === "exercise" || options.kind === "exercise_answer") &&
         (options.studentAnswer?.trim() || options.solutionText?.trim()))) {
     throw new ConversationsApiError("请输入文字或添加图片。");
@@ -1237,6 +1568,15 @@ export async function streamTurn(
   if (options.attemptKind) {
     body.attempt_kind = options.attemptKind;
   }
+  if (options.questionId) {
+    body.question_id = options.questionId;
+  }
+  if (options.questionSourceTurn) {
+    body.question_source_turn = options.questionSourceTurn;
+  }
+  if (options.questionAction) {
+    body.question_action = options.questionAction;
+  }
   if (options.retryOf) {
     Object.keys(body).forEach((key) => { if (key !== "request_id") delete body[key]; });
     body.retry_of = options.retryOf;
@@ -1272,6 +1612,9 @@ export async function streamTurn(
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8");
   const parser = createSseParser();
+  // 正文片段必须严格从 1 开始连续递增；乱序或重复都按流错误处理，
+  // 由调用方丢弃临时正文，避免把别人的或残缺的文本显示成完整回复。
+  let expectedDeltaSeq = 0;
 
   const consume = (payloads: string[]): TurnResultEvent | null => {
     for (const payload of payloads) {
@@ -1282,6 +1625,16 @@ export async function streamTurn(
       );
       if (event.type === "progress") {
         options.onProgress?.(event);
+        continue;
+      }
+      if (event.type === "message_delta") {
+        if (event.seq !== expectedDeltaSeq + 1) {
+          throw new ConversationsApiError("后端返回的正文片段顺序不符合约定。", {
+            code: "STREAM_INCOMPLETE",
+          });
+        }
+        expectedDeltaSeq = event.seq;
+        options.onMessageDelta?.(event);
         continue;
       }
       if (event.type === "error") {
@@ -1341,6 +1694,51 @@ export async function streamTurn(
       // 连接可能已经关闭，无需再处理。
     }
   }
+}
+
+/**
+ * 只重新生成某一轮的正文；后端的工具操作不会重跑，因此不会重复保存或重复生成。
+ */
+export async function regenerateTurnReply(
+  conversationId: string,
+  requestId: string,
+  signal?: AbortSignal,
+): Promise<RegeneratedReply> {
+  let response: Response;
+  try {
+    response = await fetch(
+      `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(requestId)}/reply`,
+      {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        signal,
+      },
+    );
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    throw new ConversationsApiError("无法连接到后端服务，请确认后端正在运行。");
+  }
+
+  await ensureOk(response);
+  const payload = await readJson(response, "回复");
+  if (
+    !isRecord(payload) ||
+    typeof payload.request_id !== "string" ||
+    typeof payload.assistant_message !== "string" ||
+    payload.assistant_message.length === 0 ||
+    !(payload.reply_status === null || isReplyStatus(payload.reply_status))
+  ) {
+    throw new ConversationsApiError("后端返回的回复格式不符合约定。");
+  }
+  return {
+    request_id: payload.request_id,
+    assistant_message: payload.assistant_message,
+    reply_status: (payload.reply_status as ReplyStatus | null) ?? null,
+    reply_retryable: Boolean(payload.reply_retryable),
+  };
 }
 
 export async function revealExerciseSolution(

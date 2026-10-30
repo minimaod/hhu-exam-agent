@@ -3,11 +3,13 @@ import type {
   ConversationTurn as StoredTurn,
   ExerciseAttemptView,
   ProblemView,
+  QuestionCard,
   SuggestionItem,
 } from "../lib/conversationsApi";
 import ExerciseCard from "./ExerciseCard";
 import ExerciseAttemptReceipt from "./ExerciseAttemptReceipt";
 import ProblemCard from "./ProblemCard";
+import QuestionCardView, { QuestionResultList, type QuestionAction } from "./QuestionCard";
 import QueryResult from "./QueryResult";
 import SourceBadge from "./SourceBadge";
 import { turnBusinessStatus } from "../lib/conversationsApi";
@@ -28,6 +30,9 @@ type ConversationTurnProps = {
   downloads?: DownloadStates;
   onDownload: (paper: PaperItem) => void;
   onRetry: (turn: StoredTurn) => void;
+  /** 只重做正文：业务操作已经成功，不能重跑。 */
+  onRegenerateReply?: (turn: StoredTurn) => void;
+  regeneratingReply?: boolean;
   exerciseDrafts?: Record<string, { answer: string; solution: string }>;
   onExerciseDraftChange?: (exerciseId: string, draft: { answer: string; solution: string }) => void;
   onFeedback: (problem: ProblemView) => void;
@@ -45,6 +50,14 @@ type ConversationTurnProps = {
   ) => void;
   onRevealExerciseSolution?: (exerciseId: string) => void;
   onSuggestionClick?: (turn: StoredTurn, suggestion: SuggestionItem) => void;
+  onQuestionAction?: (
+    action: QuestionAction,
+    question: import("../lib/conversationsApi").QuestionCard,
+    answer?: string,
+  ) => void;
+  questionOwners?: ReadonlyMap<string, string>;
+  questionSnapshots?: ReadonlyMap<string, QuestionCard>;
+  onJumpToQuestion?: (key: string) => void;
   onJumpToExercise?: (exerciseId: string) => void;
   onCorrectExercise?: (exerciseId: string) => void;
   /** 这一轮是否为当前最新一轮；旧轮次的建议已经失效，不再展示。 */
@@ -94,6 +107,15 @@ function bubbleFallback(turn: StoredTurn): string {
   if (turn.kind === "reveal_solution") {
     return "（查看参考解答）";
   }
+  if (turn.kind === "select_question") {
+    return "（选择真题）";
+  }
+  if (turn.kind === "explain_question") {
+    return "（讲解真题）";
+  }
+  if (turn.kind === "view_question_answer") {
+    return "（查看真题答案）";
+  }
   return "（图片题目）";
 }
 
@@ -139,6 +161,8 @@ export default function ConversationTurn({
   downloads,
   onDownload,
   onRetry,
+  onRegenerateReply,
+  regeneratingReply = false,
   onFeedback,
   onRecord,
   onCorrect,
@@ -149,6 +173,10 @@ export default function ConversationTurn({
   onSubmitExerciseAnswer,
   onRevealExerciseSolution,
   onSuggestionClick,
+  onQuestionAction,
+  questionOwners,
+  questionSnapshots,
+  onJumpToQuestion,
   onJumpToExercise,
   onCorrectExercise,
   isLatestTurn = true,
@@ -173,6 +201,12 @@ export default function ConversationTurn({
   const resultMessage =
     turn.result && "message" in turn.result ? turn.result.message : null;
   const compositeItems = turn.composite_results ?? [];
+  const replyNotice =
+    turn.reply_status === "truncated"
+      ? "这段回复生成时被截断，不是完整内容；上面的操作已经完成并保存。"
+      : turn.reply_status === "failed"
+        ? "回复没有生成成功，上面显示的是系统说明；业务操作已经完成并保存。"
+        : null;
   const { shown: narrativeParts } = dedupeTexts([turn.assistant_message]);
   const assistantText = narrativeParts[0] ?? "";
   // 优先级：自然语言叙事 → 查询结果消息 → 动作结果消息。
@@ -200,6 +234,25 @@ export default function ConversationTurn({
     exerciseRole === "reference" &&
     (turn.kind === "exercise" || turn.kind === "exercise_answer");
   const userText = turn.query.trim() || bubbleFallback(turn);
+  // 一次查题可同时返回候选和选中对象；同一版本只保留一张，选中快照优先。
+  const questionKey = (card: NonNullable<StoredTurn["question"]>) =>
+    `${card.question_id}:${card.build_id}:${card.content_sha256}`;
+  const questionRows = new Map((turn.question_results ?? []).map((card) => [questionKey(card), card]));
+  const selectedInResults = Boolean(turn.question && questionRows.has(questionKey(turn.question)));
+  if (turn.question && selectedInResults) questionRows.set(questionKey(turn.question), turn.question);
+  const references = new Map<string, QuestionCard>();
+  const presentCard = (card: QuestionCard): QuestionCard | null => {
+    const key = questionKey(card);
+    const owner = questionOwners?.get(key);
+    const snapshot = questionSnapshots?.get(key);
+    if (owner && owner !== turn.request_id) {
+      references.set(key, snapshot ?? card);
+      return null;
+    }
+    return snapshot ? { ...card, ...snapshot, source_request_id: card.source_request_id ?? snapshot.source_request_id } : card;
+  };
+  const shownQuestions = Array.from(questionRows.values()).map(presentCard).filter((card): card is QuestionCard => card !== null);
+  const standaloneQuestion = turn.question && !selectedInResults ? presentCard(turn.question) : null;
 
   return (
     <li className="space-y-3">
@@ -244,6 +297,23 @@ export default function ConversationTurn({
             </p>
           )}
 
+          {/* 正文完整性单独提示：业务操作可能已经成功，只是这段话说得不完整 */}
+          {replyNotice && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-6 text-amber-900">
+              <span>{replyNotice}</span>
+              {turn.reply_retryable === true && onRegenerateReply && (
+                <button
+                  type="button"
+                  disabled={busy || regeneratingReply}
+                  onClick={() => onRegenerateReply(turn)}
+                  className="ml-2 rounded-lg border border-amber-300 bg-white px-2 py-0.5 text-[11px] font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                >
+                  {regeneratingReply ? "正在重写…" : "重新生成回复"}
+                </button>
+              )}
+            </div>
+          )}
+
           {/* 复合操作执行结果反馈：内部动作名转成中文，重复消息折叠为状态 */}
           {compositeRows.length > 0 && (
             <div className="space-y-1.5">
@@ -278,6 +348,33 @@ export default function ConversationTurn({
               onDownload={onDownload}
             />
           )}
+
+          {/* 真题候选：只显示已审核题目的公开字段，答案需另行开放 */}
+          {hasSavedResults && shownQuestions.length > 0 && (
+            <QuestionResultList
+              cards={shownQuestions}
+              status={turn.question_result_status}
+              message={turn.question_result_message}
+              busy={busy}
+              onAction={onQuestionAction}
+            />
+          )}
+
+          {hasSavedResults && standaloneQuestion && (
+            <QuestionCardView
+              card={standaloneQuestion}
+              busy={busy}
+              onAction={onQuestionAction}
+            />
+          )}
+          {hasSavedResults && Array.from(references, ([key, card]) => (
+            <div key={key} className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600"
+              data-question-reference={key}>
+              <span>沿用第 {card.number_label} 题 · {({ choice: "选择题", fill: "填空题", code: "编程题" })[card.question_type]}</span>
+              {card.answer_revealed ? <span>答案已查看</span> : null}
+              <button type="button" className="text-river underline" onClick={() => onJumpToQuestion?.(key)}>查看题目主卡</button>
+            </div>
+          ))}
 
           {/* 练习：一张题目主卡 + 每次作答的紧凑回执，避免两张相同大卡片 */}
           {exercise && exerciseRole === "attempt" && exerciseAttempt && (
@@ -327,6 +424,10 @@ export default function ConversationTurn({
             tutoring?.kind === "explanation" && (
               <ProblemCard
                 result={tutoring}
+                showStatement={!turn.question}
+                // 正文已经完整讲过一遍时，卡片默认收起，避免同一段讲解出现两次。
+                // 这里用保存的完整正文判断，而不是页面上被拆句后的片段。
+                compact={(turn.assistant_message ?? "").length > 120}
                 busy={busy}
                 onFeedback={onFeedback}
                 onRecord={onRecord}

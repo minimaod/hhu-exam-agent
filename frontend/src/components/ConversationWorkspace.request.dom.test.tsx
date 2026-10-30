@@ -30,8 +30,31 @@ function fixture(overrides: Partial<ExerciseView> = {}): ConversationDetail {
   };
 }
 
-async function open(options: { fail?: boolean; status?: string; retryable?: boolean; detailFailOnReads?: number[]; exerciseOverrides?: Partial<ExerciseView>; awaitForm?: boolean } = {}) {
+async function open(options: { fail?: boolean; status?: string; retryable?: boolean; detailFailOnReads?: number[]; exerciseOverrides?: Partial<ExerciseView>; awaitForm?: boolean; withClarification?: boolean } = {}) {
   const detail = fixture(options.exerciseOverrides);
+  if (options.withClarification) {
+    // F008 移除输入模式按钮后，“补充”只剩历史卡片上的明确对象操作；
+    // 这里补一条“题目需补充”的辅导轮次，让“补充当前题”按钮真实出现。
+    detail.turns.push({
+      request_id: "55555555-5555-4555-8555-555555555555",
+      seq: 0,
+      kind: "problem",
+      query: "讲讲这道题",
+      status: "completed",
+      result: null,
+      tutoring: {
+        kind: "needs_clarification",
+        problem: { ...detail.active_problem!, status: "awaiting_supplement", clarity: "unclear" },
+        questions: ["第 2 步的系数是多少？"],
+        unclear_points: ["系数被遮挡"],
+      },
+      exercise: null,
+      evaluation: null,
+      error: null,
+      started_at: date,
+      finished_at: date,
+    });
+  }
   const other = fixture();
   other.conversation = { ...other.conversation, id: bid, title: "请求链路 B" };
   other.turns = [{ ...other.turns[0], exercise: { ...other.active_exercise!, id: "other-exercise", conversation_id: bid } }];
@@ -100,11 +123,11 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
   });
   test.each(["failed", "partial"])("%s 结果保留草稿，重试只引用原轮次", async (status) => {
     const state = await open({ status, retryable: true });
-    fireEvent.change(screen.getByPlaceholderText("围绕当前题目继续追问"), { target: { value: "保存并出题" } });
+    fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "保存并出题" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     const button = await screen.findByRole("button", { name: "重试未完成步骤" });
     expect(screen.getByText(status === "failed" ? "未完成" : "部分完成")).toBeTruthy();
-    expect((screen.getByPlaceholderText("围绕当前题目继续追问") as HTMLTextAreaElement).value).toBe("保存并出题");
+    expect((screen.getByPlaceholderText(/围绕当前题目继续追问/) as HTMLTextAreaElement).value).toBe("保存并出题");
     fireEvent.click(button);
     await waitFor(() => expect(state.requests).toHaveLength(2));
     expect(Object.keys(state.requests[1]).sort()).toEqual(["request_id", "retry_of"]);
@@ -113,7 +136,7 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
 
   test("业务拒绝没有直接重试按钮", async () => {
     await open({ status: "failed", retryable: false });
-    fireEvent.change(screen.getByPlaceholderText("围绕当前题目继续追问"), { target: { value: "重交完整评价" } });
+    fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "重交完整评价" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     await screen.findByText("未完成");
     expect(screen.queryByRole("button", { name: "重试未完成步骤" })).toBeNull();
@@ -137,22 +160,22 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
     const state = await open();
     fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "旧答案" } });
     fireEvent.change(screen.getByPlaceholderText("我的解题过程；也可以添加解法图片"), { target: { value: "旧过程" } });
-    fireEvent.change(screen.getByPlaceholderText("围绕当前题目继续追问"), { target: { value: "再来一道类似题" } });
+    fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "再来一道类似题" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(state.requests).toHaveLength(1));
     expect(state.requests[0]).toMatchObject({ kind: "auto", query: "再来一道类似题" });
     expect(state.requests[0]).not.toHaveProperty("solution_text");
     expect(state.requests[0]).not.toHaveProperty("student_answer");
-    await waitFor(() => expect((screen.getByPlaceholderText("围绕当前题目继续追问") as HTMLTextAreaElement).value).toBe(""));
+    await waitFor(() => expect((screen.getByPlaceholderText(/围绕当前题目继续追问/) as HTMLTextAreaElement).value).toBe(""));
     expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("旧答案");
   });
 
   test("显式补充携带字段和目标；409 明显、持续可见且保留草稿", async () => {
-    const state = await open({ fail: true });
-    fireEvent.click(screen.getByRole("button", { name: "补充" }));
+    const state = await open({ fail: true, withClarification: true });
+    fireEvent.click(screen.getByRole("button", { name: "补充当前题" }));
     fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "旧答案" } });
     fireEvent.change(screen.getByPlaceholderText("我的解题过程；也可以添加解法图片"), { target: { value: "补充过程" } });
-    fireEvent.change(screen.getByPlaceholderText("补充模糊的符号、条件，或换一张更清楚的图片"), { target: { value: "补充信息" } });
+    fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "补充信息" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("当前题目已经讲解过");
@@ -162,7 +185,7 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
     expect(screen.getByRole("alert").textContent).toContain("当前题目已经讲解过");
     expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("旧答案");
     fireEvent.click(screen.getByRole("button", { name: "切回普通聊天" }));
-    expect(screen.getByPlaceholderText("围绕当前题目继续追问")).toBeTruthy();
+    expect(screen.getByPlaceholderText(/围绕当前题目继续追问/)).toBeTruthy();
   });
 
   test("订正提交携带 attempt_kind=correction 且旧尝试仍在卡片里", async () => {
@@ -208,21 +231,124 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
   });
 
   test("409 后详情读取失败，告警与草稿仍保留，恢复记录后可继续", async () => {
-    const state = await open({ fail: true, detailFailOnReads: [2] });
-    fireEvent.click(screen.getByRole("button", { name: "补充" }));
+    const state = await open({ fail: true, detailFailOnReads: [2], withClarification: true });
+    fireEvent.click(screen.getByRole("button", { name: "补充当前题" }));
     fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "要保留的答案" } });
-    fireEvent.change(screen.getByPlaceholderText("补充模糊的符号、条件，或换一张更清楚的图片"), { target: { value: "补充信息" } });
+    fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "补充信息" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect((await screen.findByRole("alert")).textContent).toContain("当前题目已经讲解过");
     // 输入区已卸载，但告警仍显示在读取失败卡片上方。
     await screen.findByText("没能读取会话记录");
     expect(screen.getByRole("alert").textContent).toContain("当前题目已经讲解过");
     fireEvent.click(screen.getByRole("button", { name: "刷新会话记录" }));
-    await screen.findByPlaceholderText("补充模糊的符号、条件，或换一张更清楚的图片");
+    await screen.findByPlaceholderText(/围绕当前题目继续追问/);
     expect(state.reads()).toBeGreaterThanOrEqual(3);
     expect(screen.getByRole("alert").textContent).toContain("当前题目已经讲解过");
     expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("要保留的答案");
-    expect((screen.getByPlaceholderText("补充模糊的符号、条件，或换一张更清楚的图片") as HTMLTextAreaElement).value).toBe("补充信息");
+    expect((screen.getByPlaceholderText(/围绕当前题目继续追问/) as HTMLTextAreaElement).value).toBe("补充信息");
   });
+});
+
+test("真题卡片按钮发送明确的 question kind 与来源轮次", async () => {
+  const card = {
+    question_id: "py-2024-2025-s1-final-choice-1",
+    build_id: "iv-0123456789abcdef",
+    question_type: "choice" as const,
+    number_label: "1",
+    statement: "下列 Python 表达式的值是？",
+    content_sha256: "a".repeat(64),
+    options: [{ label: "A", text: "1" }, { label: "B", text: "2" }],
+    code_lines: [], blank_marks: [], formulas: [], assets: [],
+    pages: { statement: [1], answer: [2] },
+    knowledge_points: [],
+    answer: { state: "original" as const, available: true },
+    review: { status: "approved", approved: true, stale: false },
+    source: { paper_id: "py-2024-2025-s1-final", paper_title: "Python 期末卷",
+      exam_type: "final", academic_year: "2024-2025", question_number: "1", may_show_answer: true },
+    content_issues: [], selected: false, answer_revealed: false, answer_detail: null,
+    source_request_id: "66666666-6666-4666-8666-666666666666",
+  };
+  const detail: ConversationDetail = {
+    conversation: { id: cid, title: "真题请求链路", created_at: date, updated_at: date },
+    turns: [{
+      request_id: card.source_request_id, seq: 1, kind: "dynamic", query: "找一道真题",
+      status: "completed", result: null, tutoring: null, exercise: null, evaluation: null,
+      error: null, started_at: date, finished_at: date,
+      question_results: [card], question_result_status: "ok",
+    }],
+    active_problem: null, active_exercise: null, active_question: card, record: null,
+  };
+  const requests: Record<string, unknown>[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/turns")) {
+      const body = JSON.parse(String(init?.body));
+      requests.push(body);
+      const result = { type: "result", conversation_id: cid, request_id: body.request_id,
+        kind: body.kind === "auto" ? "dynamic" : body.kind, result: null, tutoring: null, question: { ...card, selected: true,
+          ...(body.kind === "view_question_answer" ? { answer_revealed: true,
+            answer_detail: { state: "original", text: "B" } } : {}) },
+        assistant_message: "已选中", business_status: "succeeded", retryable: false };
+      detail.turns.push({
+        ...result, seq: detail.turns.length + 1, query: body.query ?? "",
+        status: "completed", error: null, started_at: date, finished_at: date,
+      } as ConversationDetail["turns"][number]);
+      return new Response(`data: ${JSON.stringify(result)}\n\n`, { headers: { "Content-Type": "text/event-stream" } });
+    }
+    if (url.endsWith(cid)) return Response.json(detail);
+    return Response.json({ items: [detail.conversation], total: 1 });
+  }));
+
+  render(<ConversationWorkspace downloads={{}} onDownload={vi.fn()} onOpenRecord={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: /真题请求链路/ }));
+  await screen.findByText("下列 Python 表达式的值是？");
+  fireEvent.click(screen.getByRole("button", { name: "选第 1 道题" }));
+  await waitFor(() => expect(requests).toHaveLength(1));
+  expect(requests[0]).toMatchObject({
+    kind: "select_question",
+    question_id: card.question_id,
+    question_source_turn: card.source_request_id,
+  });
+  expect(requests[0].query).toBe("");
+
+  fireEvent.click(await screen.findByRole("button", { name: "讲解这道题" }));
+  await waitFor(() => expect(requests).toHaveLength(2));
+  expect(requests[1]).toMatchObject({ kind: "explain_question", question_id: card.question_id });
+
+  fireEvent.click(screen.getAllByRole("button", { name: "生成一道变式" })[0]);
+  await waitFor(() => expect(requests).toHaveLength(3));
+  expect(requests[2]).toMatchObject({
+    kind: "auto",
+    question_id: card.question_id,
+    question_source_turn: card.source_request_id,
+    question_action: "exercise",
+  });
+
+  fireEvent.click(screen.getAllByRole("button", { name: "保存到错题本" })[0]);
+  await waitFor(() => expect(requests).toHaveLength(4));
+  expect(requests[3]).toMatchObject({
+    kind: "auto",
+    question_id: card.question_id,
+    question_source_turn: card.source_request_id,
+    question_action: "record",
+  });
+
+  // 当前轮次已有其他上下文时，仍按被点击的历史卡片提交答案。
+  fireEvent.click(screen.getAllByRole("radio", { name: "B. 2" })[0]);
+  fireEvent.click(screen.getAllByRole("button", { name: "提交并讲解" })[0]);
+  await waitFor(() => expect(requests).toHaveLength(5));
+  expect(requests[4]).toMatchObject({ kind: "explain_question", student_answer: "B",
+    question_id: card.question_id, question_source_turn: card.source_request_id });
+  expect(requests[4]).not.toHaveProperty("exercise_id");
+  expect(requests[4]).not.toHaveProperty("solution_text");
+  expect(screen.getAllByText("下列 Python 表达式的值是？")).toHaveLength(1);
+  expect(screen.getAllByRole("button", { name: "查看题目主卡" }).length).toBeGreaterThan(0);
+  const toggle = screen.getByRole("button", { name: "会话列表" });
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(toggle);
+  expect(screen.getByRole("button", { name: "收起会话列表" }).getAttribute("aria-expanded")).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: "查看参考答案" }));
+  await waitFor(() => expect(requests).toHaveLength(6));
+  await waitFor(() => expect((screen.getByText("参考答案（已查看，点击展开）").closest("details") as HTMLDetailsElement).open).toBe(true));
+  expect(screen.getAllByText("下列 Python 表达式的值是？")).toHaveLength(1);
 });
 

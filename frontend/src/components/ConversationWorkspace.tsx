@@ -8,16 +8,15 @@ import {
 } from "react";
 import ConversationList from "./ConversationList";
 import ConversationTurn from "./ConversationTurn";
-import TurnComposer, {
-  type ComposerMode,
-  type PendingFile,
-} from "./TurnComposer";
+import AssistantDraft from "./AssistantDraft";
+import TurnComposer, { type PendingFile } from "./TurnComposer";
 import {
   ConversationsApiError,
   createConversation,
   createRequestId,
   getConversation,
   listConversations,
+  regenerateTurnReply,
   revealExerciseSolution,
   streamTurn,
   turnBusinessStatus,
@@ -26,6 +25,7 @@ import {
   type ConversationSummary,
   type ExerciseAttemptView,
   type ProblemView,
+  type QuestionCard,
   type Source,
   type SuggestionItem,
   type TurnKind,
@@ -58,6 +58,20 @@ type LiveState = {
   requestId: string;
   stage: "starting" | TurnStage;
   message: string;
+};
+
+/**
+ * 输入区的显式意图：只由历史卡片上的“纠正/补充/新题”等明确对象操作设置，
+ * 不再以输入模式按钮暴露给普通聊天（F008）。
+ */
+type ComposerMode = "auto" | "supplement" | "correction" | "new";
+
+/** 正在流式生成的正文；interrupted 表示断流/停止后未保存的临时文本。 */
+type StreamDraft = {
+  conversationId: string;
+  requestId: string;
+  text: string;
+  interrupted: boolean;
 };
 
 type ConversationWorkspaceProps = {
@@ -147,8 +161,13 @@ export default function ConversationWorkspace({
   const [notice, setNotice] = useState<string | null>(null);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // F008：普通自然语言输入不再有“追问/补充/纠正/新题”模式按钮；这里的
+  // mode 只由历史卡片上的明确对象操作（纠正/补充/新题）设置。
   const [mode, setMode] = useState<ComposerMode>("auto");
+  const [streamDraft, setStreamDraft] = useState<StreamDraft | null>(null);
+  const [regeneratingReplyId, setRegeneratingReplyId] = useState<string | null>(null);
   const [files, setFiles] = useState<PendingFile[]>([]);
   const [studentAnswer, setStudentAnswer] = useState("");
   const [solutionText, setSolutionText] = useState("");
@@ -310,6 +329,9 @@ export default function ConversationWorkspace({
       setSubmitting(false);
       stickToBottomRef.current = true;
       updateLive(null);
+      // 切换会话时旧请求的临时正文必须一起清掉：迟到的片段会因操作序号变化
+      // 被忽略，但已经显示出来的半截文字不能留在新会话页面上。
+      setStreamDraft(null);
       setNotice(null);
       setErrorNotice(null);
       if (currentIdRef.current) composerDraftsRef.current.set(currentIdRef.current, composerRef.current);
@@ -475,6 +497,9 @@ export default function ConversationWorkspace({
         exerciseId?: string;
         retryOf?: string;
         attemptKind?: "supplement" | "correction";
+        questionId?: string;
+        questionSourceTurn?: string;
+        questionAction?: "exercise" | "record";
       } = {},
     ) => {
       if (submittingRef.current) {
@@ -487,7 +512,13 @@ export default function ConversationWorkspace({
 
       const text = (textOverride ?? draft).trim();
       const pending = options.files ?? (kindOverride ? [] : filesRef.current);
+      const isQuestionTurn = kindOverride === "select_question"
+        || kindOverride === "explain_question"
+        || kindOverride === "view_question_answer";
+      const hasQuestionTarget = Boolean(options.questionId && options.questionSourceTurn);
       if (!text && pending.length === 0 && !options.retryOf &&
+          !(isQuestionTurn && hasQuestionTarget) &&
+          !(options.questionAction && hasQuestionTarget) &&
           !(kindOverride === "exercise" && (options.studentAnswer?.trim() || options.solutionText?.trim()))) {
         return;
       }
@@ -506,7 +537,7 @@ export default function ConversationWorkspace({
       }
       const explicitFields = kind === "problem" || kind === "supplement" || kind === "correction";
       // 隐藏的附加草稿从不决定普通聊天的意图；只由显式入口读取。
-      const submittedAnswer = kind === "exercise" ? options.studentAnswer ?? "" : explicitFields ? options.studentAnswer ?? (!kindOverride ? studentAnswer : "") : "";
+      const submittedAnswer = kind === "exercise" || kind === "explain_question" ? options.studentAnswer ?? "" : explicitFields ? options.studentAnswer ?? (!kindOverride ? studentAnswer : "") : "";
       const submittedSolution = kind === "exercise" ? options.solutionText ?? "" : explicitFields ? options.solutionText ?? (!kindOverride ? solutionText : "") : "";
 
       const requestId = createRequestId();
@@ -526,6 +557,7 @@ export default function ConversationWorkspace({
         stage: "starting",
         message: pending.length ? "正在上传图片…" : "正在提交…",
       });
+      setStreamDraft(null);
 
       try {
         const uploaded: { id: string; role: AttachmentRole }[] = [];
@@ -565,6 +597,9 @@ export default function ConversationWorkspace({
           exerciseId: options.exerciseId,
           retryOf: options.retryOf,
           attemptKind: options.attemptKind,
+          questionId: options.questionId,
+          questionSourceTurn: options.questionSourceTurn,
+          questionAction: options.questionAction,
           startNew: options.startNew ?? (!kindOverride && kind === "problem" && mode === "new"),
           signal: controller.signal,
           onProgress: (event: TurnProgressEvent) => {
@@ -577,6 +612,24 @@ export default function ConversationWorkspace({
               message: event.message,
             });
           },
+          onMessageDelta: (event) => {
+            // 正文片段只属于当前会话与当前请求；迟到或他人的片段直接丢弃，
+            // 且不触碰输入框、答案草稿和附件。
+            if (!isCurrentOperation(conversationId, sequence)) {
+              return;
+            }
+            setStreamDraft((current) => {
+              if (current && current.requestId !== requestId) {
+                return current;
+              }
+              return {
+                conversationId,
+                requestId,
+                text: (current?.text ?? "") + event.delta,
+                interrupted: false,
+              };
+            });
+          },
         });
 
         if (!isCurrentOperation(conversationId, sequence)) {
@@ -585,6 +638,9 @@ export default function ConversationWorkspace({
 
         updateLive(null);
         setNotice(null);
+        // 收到合法终止事件后，以服务端保存的完整正文为准：临时拼接立刻丢弃，
+        // 后续从会话记录渲染，避免“流式文本 + 最终正文”重复出现。
+        setStreamDraft(null);
         const detail = await loadDetail(conversationId);
         // loadDetail 期间用户可能切到另一个会话并开始输入；不能清掉它的草稿。
         if (!isCurrentOperation(conversationId, sequence)) {
@@ -632,11 +688,20 @@ export default function ConversationWorkspace({
         if (!isCurrentOperation(conversationId, sequence)) {
           return;
         }
+        const interruptedDraft = (state: StreamDraft | null): StreamDraft | null =>
+          state && state.requestId === requestId ? { ...state, interrupted: true } : state;
         if (isAbortError(error)) {
+          // 用户停止或断流：临时正文不能显示成完整成功回复。
+          setStreamDraft((current) =>
+            current && current.requestId === requestId && current.text
+              ? { ...current, interrupted: true }
+              : null,
+          );
           return;
         }
 
         updateLive(null);
+        setStreamDraft(interruptedDraft);
         setErrorNotice(toMessage(error));
 
         const uncertain =
@@ -703,6 +768,11 @@ export default function ConversationWorkspace({
     abortRef.current?.abort();
     abortRef.current = null;
     updateLive(null);
+    setStreamDraft((current) =>
+      current && current.requestId === active.requestId && current.text
+        ? { ...current, interrupted: true }
+        : null,
+    );
     setSubmitting(false);
     submittingRef.current = false;
     setNotice("已停止，正在确认服务端状态…");
@@ -746,13 +816,6 @@ export default function ConversationWorkspace({
     },
     [submit],
   );
-
-  const handleModeChange = useCallback((next: ComposerMode) => {
-    setMode(next);
-    if (next !== "correction") {
-      setTargetProblem(null);
-    }
-  }, []);
 
   const handleCorrect = useCallback((problem: ProblemView) => {
     setTargetProblem(problem);
@@ -915,11 +978,103 @@ export default function ConversationWorkspace({
     [handleExerciseReveal, handleRecord, scrollToExercise, submit],
   );
 
+  const handleQuestionAction = useCallback(
+    (
+      action: "select" | "explain" | "view" | "exercise" | "record" | "answer",
+      card: QuestionCard,
+      answer?: string,
+    ) => {
+      if (action === "exercise" || action === "record") {
+        if (!card.source_request_id) {
+          setErrorNotice("这道题缺少查题轮次信息，请重新查题后再操作。");
+          return;
+        }
+        void submit(
+          "auto",
+          action === "exercise" ? "为这道真题生成一道变式" : "把这道真题保存到错题本",
+          {
+            questionId: card.question_id,
+            questionSourceTurn: card.source_request_id,
+            questionAction: action,
+          },
+        );
+        return;
+      }
+      if (!card.source_request_id) {
+        setErrorNotice("这道题缺少查题轮次信息，请重新查题后再操作。");
+        return;
+      }
+      if (action === "answer") {
+        if (!answer || !card.options.some((option) => option.label === answer)) return;
+        void submit("explain_question", `这道题我选 ${answer}，请核对并讲解。`, {
+          questionId: card.question_id,
+          questionSourceTurn: card.source_request_id,
+          studentAnswer: answer,
+        });
+        return;
+      }
+      const kind =
+        action === "select"
+          ? "select_question"
+          : action === "explain"
+            ? "explain_question"
+            : "view_question_answer";
+      void submit(kind, "", {
+        questionId: card.question_id,
+        questionSourceTurn: card.source_request_id,
+      }).then(() => {
+        if (action !== "view") return;
+        // Explicitly asking to view the answer opens the existing main card.
+        // Later lecture/history turns still keep it collapsed by default.
+        window.setTimeout(() => {
+          const key = `${card.question_id}:${card.build_id}:${card.content_sha256}`;
+          const answer = document.getElementById(`question-${key}`)?.querySelector<HTMLDetailsElement>("details[data-question-answer]");
+          if (answer) {
+            answer.open = true;
+            answer.scrollIntoView?.({ behavior: "smooth", block: "center" });
+          }
+        }, 0);
+      });
+    },
+    [submit],
+  );
+
   const handleRetry = useCallback(
     (turn: ConversationDetail["turns"][number]) => {
       void submit("auto", "", { retryOf: turn.request_id });
     },
     [submit],
+  );
+
+  const handleRegenerateReply = useCallback(
+    async (turn: ConversationDetail["turns"][number]) => {
+      if (!currentIdRef.current) {
+        return;
+      }
+      const target = currentIdRef.current;
+      setRegeneratingReplyId(turn.request_id);
+      setErrorNotice(null);
+      try {
+        const reply = await regenerateTurnReply(target, turn.request_id);
+        if (currentIdRef.current !== target) {
+          return;
+        }
+        setNotice(
+          reply.reply_status === "complete"
+            ? "回复已重新生成。"
+            : "这次仍不完整，可以稍后再试。",
+        );
+        await loadDetail(target);
+      } catch (error) {
+        if (currentIdRef.current !== target) {
+          return;
+        }
+        setErrorNotice(toMessage(error));
+      } finally {
+        setRegeneratingReplyId(null);
+      }
+    },
+    [loadDetail],
   );
 
   // 错误提示固定在输入区附近；详情读取失败时输入区会卸载，因此也要在
@@ -975,6 +1130,33 @@ export default function ConversationWorkspace({
 
   // 每道练习只保留一张题目主卡；其余出现该练习的轮次按 request_id 对应到具体一次作答，
   // 渲染成紧凑回执。历史数据没有 request_id 时回退为“查看完整题目”链接，不丢记录。
+  const questionPresentation = useMemo(() => {
+    const owners = new Map<string, string>();
+    const snapshots = new Map<string, QuestionCard>();
+    if (detailState.phase === "ready") {
+      for (const turn of detailState.detail.turns) {
+        if (!turn.question) continue;
+        const card = turn.question;
+        const key = `${card.question_id}:${card.build_id}:${card.content_sha256}`;
+        if (!owners.has(key)) owners.set(key, turn.request_id);
+        const previous = snapshots.get(key);
+        snapshots.set(key, {
+          ...previous, ...card,
+          answer_revealed: Boolean(previous?.answer_revealed || card.answer_revealed),
+          answer_detail: card.answer_detail ?? previous?.answer_detail,
+          answer_revealed_at: card.answer_revealed_at ?? previous?.answer_revealed_at,
+          source_request_id: previous?.source_request_id ?? card.source_request_id,
+          reference_code: card.reference_code ?? previous?.reference_code,
+          code_blocks: card.code_blocks?.length ? card.code_blocks : previous?.code_blocks,
+          code_annotations: card.code_annotations?.length ? card.code_annotations : previous?.code_annotations,
+          independent_solutions: card.independent_solutions?.length ? card.independent_solutions : previous?.independent_solutions,
+          code_examples: card.code_examples?.length ? card.code_examples : previous?.code_examples,
+        });
+      }
+    }
+    return { owners, snapshots };
+  }, [detailState]);
+
   const exercisePresentation = useMemo(() => {
     const ownerByExercise = new Map<string, string>();
     const attemptByTurn = new Map<string, ExerciseAttemptView>();
@@ -1033,17 +1215,22 @@ export default function ConversationWorkspace({
       className="flex h-full min-h-0 flex-col"
       aria-labelledby="conversation-heading"
     >
-      <div className="mb-2 hidden shrink-0 items-baseline justify-between gap-2 sm:flex">
-        <h2 id="conversation-heading" className="text-sm font-semibold text-ink">
-          学习会话
-        </h2>
-        <p className="text-[11px] text-slate-500">
+      <div className="mb-2 flex shrink-0 items-center justify-between gap-2">
+        <div className="flex items-center gap-3">
+          <button type="button" aria-expanded={sidebarOpen} aria-controls="conversation-list-panel"
+            onClick={() => setSidebarOpen((open) => !open)}
+            className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs text-slate-600">
+            {sidebarOpen ? "收起会话列表" : "会话列表"}
+          </button>
+          <h2 id="conversation-heading" className="text-sm font-semibold text-ink">学习会话</h2>
+        </div>
+        <p className="hidden text-[11px] text-slate-500 lg:block">
           一次一道题；历史在消息区上下滚动，输入框固定在底部
         </p>
       </div>
 
-      <div className="grid min-h-0 flex-1 gap-3 md:grid-cols-[230px_minmax(0,1fr)]">
-        <div className="max-h-44 min-h-0 overflow-y-auto md:h-full md:max-h-none">
+      <div className={`grid min-h-0 flex-1 gap-3 ${sidebarOpen ? "md:grid-cols-[200px_minmax(0,1fr)]" : "grid-cols-1"}`}>
+        <div id="conversation-list-panel" className={`${sidebarOpen ? "" : "hidden"} max-h-36 min-h-0 overflow-y-auto md:h-full md:max-h-none`}>
           <ConversationList
             conversations={listItems}
             currentId={currentId}
@@ -1051,7 +1238,7 @@ export default function ConversationWorkspace({
             error={listError}
             creating={creating}
             onCreate={() => void handleCreate()}
-            onSelect={openConversation}
+            onSelect={(id) => { openConversation(id); setSidebarOpen(false); }}
             onRetry={() => setListAttempt((value) => value + 1)}
           />
         </div>
@@ -1165,9 +1352,14 @@ export default function ConversationWorkspace({
                         <ConversationTurn
                           key={turn.request_id}
                           turn={turn}
+                          questionOwners={questionPresentation.owners}
+                          questionSnapshots={questionPresentation.snapshots}
+                          onJumpToQuestion={(key) => document.getElementById(`question-${key}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}
                           downloads={downloads}
                           onDownload={onDownload}
                           onRetry={handleRetry}
+                          onRegenerateReply={(item) => void handleRegenerateReply(item)}
+                          regeneratingReply={regeneratingReplyId === turn.request_id}
                           onFeedback={handleFeedback}
                           onRecord={handleRecord}
                           onCorrect={handleCorrect}
@@ -1178,6 +1370,7 @@ export default function ConversationWorkspace({
                           onSubmitExerciseAnswer={handleExerciseAnswer}
                           onRevealExerciseSolution={handleExerciseReveal}
                           onSuggestionClick={handleSuggestionClick}
+                          onQuestionAction={handleQuestionAction}
                           onJumpToExercise={handleJumpToExercise}
                           onCorrectExercise={handleCorrectExercise}
                           isLatestTurn={
@@ -1232,6 +1425,15 @@ export default function ConversationWorkspace({
                   </ul>
                 )}
 
+                {streamDraft &&
+                  streamDraft.conversationId === currentId &&
+                  (streamDraft.text || streamDraft.interrupted) && (
+                  <AssistantDraft
+                    text={streamDraft.text}
+                    interrupted={streamDraft.interrupted}
+                  />
+                )}
+
                 {live && (
                   <div
                     aria-live="polite"
@@ -1258,14 +1460,12 @@ export default function ConversationWorkspace({
                   disabledReason={composerDisabledReason}
                   confirmedCourse={confirmedCourse}
                   activeProblem={activeProblem}
-                  mode={mode}
                   files={files}
                   studentAnswer={studentAnswer}
                   solutionText={solutionText}
                   sourcePaperId={sourcePaperId}
                   sourceOptions={sourceOptions}
                   onChange={setDraft}
-                  onModeChange={handleModeChange}
                   onAddFiles={addFiles}
                   onRemoveFile={removeFile}
                   onStudentAnswerChange={setStudentAnswer}

@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.questions.models import ExerciseSourceView, QuestionCard
 from app.querying.models import ErrorCode, ResultEvent
 from app.tutoring.models import AttachmentView, ProblemView, TutoringResult
 
@@ -18,7 +19,52 @@ BusinessStatus = Literal["succeeded", "partial", "failed", "needs_input"]
 RECOVERABLE_CODES = {
     "MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_UNAVAILABLE",
     "MODEL_RESPONSE_INVALID", "CATALOG_UNAVAILABLE", "QUERY_FAILED", "TUTORING_FAILED",
+    "QUESTION_SEARCH_FAILED", "QUESTION_BANK_UNAVAILABLE",
 }
+
+QuestionResultStatus = Literal[
+    "ok",
+    "missing_answer",
+    "no_match",
+    "unreviewed",
+    "bank_not_built",
+    "bank_unavailable",
+    "source_changed",
+    "source_pruned",
+    "degraded",
+    "error",
+]
+
+
+ReplyStatus = Literal["complete", "truncated", "failed"]
+
+_REPLY_MODE_TO_STATUS: dict[str, str] = {
+    "model": "complete",
+    "clarification": "complete",
+    "truncated": "truncated",
+    "incomplete": "truncated",
+    "fallback": "failed",
+}
+
+
+def reply_state(recovery: dict[str, Any]) -> tuple[ReplyStatus | None, bool]:
+    """由恢复记录里的回复元数据推出公开状态与“能否只重做正文”。
+
+    业务完成与回复完整性是两件事：操作都成功、但正文被截断或改用了兜底
+    说明时，``business_status`` 仍然是 ``succeeded``，由这里的
+    ``reply_status`` 单独表达正文问题。
+    """
+
+    meta = (recovery or {}).get("reply") or {}
+    mode = meta.get("mode")
+    if not mode:
+        return None, False
+    status = _REPLY_MODE_TO_STATUS.get(str(mode), "failed")
+    retryable = status != "complete" and bool(recovery.get("reply_input"))
+    if meta.get("reason") == "reply_not_configured":
+        # 没有配置回复模型时重试也不会变好，不提供入口。
+        retryable = False
+    return status, retryable  # type: ignore[return-value]
 
 
 def business_summary(value: Any) -> tuple[BusinessStatus | None, bool, str | None]:
@@ -59,10 +105,18 @@ TurnKind = Literal[
     "exercise_answer",
     "reveal_solution",
     "dynamic",
+    "select_question",
+    "explain_question",
+    "view_question_answer",
 ]
 
-# 会话轮次的错误码在查询错误码之外，增加本地存储故障。
-TurnErrorCode = ErrorCode | Literal["STORAGE_UNAVAILABLE", "BUSINESS_REJECTED"]
+# 会话轮次的错误码在查询错误码之外，增加本地存储故障与题库故障。
+TurnErrorCode = ErrorCode | Literal[
+    "STORAGE_UNAVAILABLE",
+    "BUSINESS_REJECTED",
+    "QUESTION_SEARCH_FAILED",
+    "QUESTION_BANK_UNAVAILABLE",
+]
 
 TurnStage = Literal[
     "dispatching",
@@ -78,6 +132,9 @@ TurnStage = Literal[
     "scheduling",
     "generating_exercise",
     "evaluating_exercise",
+    "searching_questions",
+    "viewing_question",
+    "composing_reply",
 ]
 
 ExerciseStatus = Literal["pending_answer", "submitted", "revealed"]
@@ -123,6 +180,8 @@ class ExerciseView(BaseModel):
     revealed_solution_at: datetime | None = None
     answered_after_revealed: bool = False
     evaluation: ExerciseEvaluation | None = None
+    # 由真题生成的练习显示来源；普通练习为 None。
+    source_question: ExerciseSourceView | None = None
     # 核心安全控制：仅在已主动查看或作答后由服务层决定是否回传
     reference_solution_text: str | None = None
     attachments: list[AttachmentView] = Field(default_factory=list)
@@ -190,6 +249,10 @@ class Turn(BaseModel):
     tutoring: TutoringResult | None = None
     exercise: ExerciseView | None = None
     evaluation: ExerciseEvaluation | None = None
+    question_results: list[QuestionCard] = Field(default_factory=list)
+    question_result_status: QuestionResultStatus | None = None
+    question_result_message: str | None = None
+    question: QuestionCard | None = None
     composite_results: list[ActionResultItem] = Field(default_factory=list)
     assistant_message: str | None = None
     suggestions: list[SuggestionItem] = Field(default_factory=list)
@@ -204,10 +267,14 @@ class Turn(BaseModel):
     business_status: BusinessStatus | None = None
     retryable: bool = False
     retry_hint: str | None = None
+    # 正文完整性与业务完成分开表达。
+    reply_status: ReplyStatus | None = None
+    reply_retryable: bool = False
 
     @model_validator(mode="after")
     def _check_payload(self) -> "Turn":
         self.business_status, self.retryable, self.retry_hint = business_summary(self)
+        self.reply_status, self.reply_retryable = reply_state(self.recovery)
         # 无检查点的旧动态失败不能安全重放组合动作。
         if self.kind == "dynamic" and self.status != "completed" and not self.recovery:
             self.retryable = False
@@ -226,6 +293,8 @@ class Turn(BaseModel):
                     self.result is not None,
                     self.tutoring is not None,
                     self.exercise is not None,
+                    bool(self.question_results),
+                    self.question is not None,
                     bool(self.composite_results),
                     bool(self.assistant_message),
                 ]
@@ -265,6 +334,7 @@ class ConversationDetail(BaseModel):
     turns: list[Turn]
     active_problem: ProblemView | None = None
     active_exercise: ExerciseView | None = None
+    active_question: QuestionCard | None = None
     context: ConversationContextView | None = None
     record: RecordRef | None = None
 
@@ -277,6 +347,20 @@ class TurnProgressEvent(BaseModel):
     message: str
 
 
+class TurnMessageDeltaEvent(BaseModel):
+    """F008：模型实际流式生成的正文片段。
+
+    只表示“正在生成”，不代表业务成功；客户端必须等到 result 才能结束本轮。
+    ``seq`` 在同一 (conversation_id, request_id) 内从 1 开始严格递增。
+    """
+
+    type: Literal["message_delta"] = "message_delta"
+    conversation_id: str
+    request_id: str
+    seq: int = Field(ge=1)
+    delta: str = Field(min_length=1, max_length=400)
+
+
 class TurnResultEvent(BaseModel):
     type: Literal["result"] = "result"
     conversation_id: str
@@ -286,6 +370,10 @@ class TurnResultEvent(BaseModel):
     tutoring: TutoringResult | None = None
     exercise: ExerciseView | None = None
     evaluation: ExerciseEvaluation | None = None
+    question_results: list[QuestionCard] = Field(default_factory=list)
+    question_result_status: QuestionResultStatus | None = None
+    question_result_message: str | None = None
+    question: QuestionCard | None = None
     composite_results: list[ActionResultItem] = Field(default_factory=list)
     assistant_message: str | None = None
     suggestions: list[SuggestionItem] = Field(default_factory=list)
@@ -293,6 +381,8 @@ class TurnResultEvent(BaseModel):
     business_status: BusinessStatus | None = None
     retryable: bool = False
     retry_hint: str | None = None
+    reply_status: ReplyStatus | None = None
+    reply_retryable: bool = False
 
     @model_validator(mode="after")
     def _check_payload(self) -> "TurnResultEvent":
@@ -309,6 +399,8 @@ class TurnResultEvent(BaseModel):
                 self.result is not None,
                 self.tutoring is not None,
                 self.exercise is not None,
+                bool(self.question_results),
+                self.question is not None,
                 bool(self.composite_results),
                 bool(self.assistant_message),
             ]
@@ -328,4 +420,4 @@ class TurnErrorEvent(BaseModel):
     message: str
 
 
-TurnEvent = TurnProgressEvent | TurnResultEvent | TurnErrorEvent
+TurnEvent = TurnProgressEvent | TurnMessageDeltaEvent | TurnResultEvent | TurnErrorEvent

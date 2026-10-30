@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, test, vi } from "vitest";
 import TurnComposer from "./TurnComposer";
 import type { ComponentProps } from "react";
+import type { ProblemView } from "../lib/conversationsApi";
 
 function setup(props: Partial<ComponentProps<typeof TurnComposer>> = {}) {
   const onChange = vi.fn();
@@ -14,14 +15,12 @@ function setup(props: Partial<ComponentProps<typeof TurnComposer>> = {}) {
       disabledReason={null}
       confirmedCourse={null}
       activeProblem={null}
-      mode="auto"
       files={[]}
       studentAnswer=""
       solutionText=""
       sourcePaperId=""
       sourceOptions={[]}
       onChange={onChange}
-      onModeChange={vi.fn()}
       onAddFiles={vi.fn()}
       onRemoveFile={vi.fn()}
       onStudentAnswerChange={vi.fn()}
@@ -105,5 +104,20 @@ describe("输入区：快捷键、输入法状态和示例", () => {
     setup();
     expect(screen.getByRole("button", { name: "帮我找期末试卷" })).toBeTruthy();
     expect(screen.queryByText(/高数/)).toBeNull();
+  });
+
+  test("已移除追问/补充/纠正/新题输入模式按钮", () => {
+    setup({
+      activeProblem: {
+        id: "p1",
+        version: 2,
+        status: "explained",
+      } as unknown as ProblemView,
+    });
+
+    for (const label of ["追问", "补充", "纠正", "新题"]) {
+      expect(screen.queryByRole("button", { name: label })).toBeNull();
+    }
+    expect(screen.getByText(/不需要切换模式/)).toBeTruthy();
   });
 });

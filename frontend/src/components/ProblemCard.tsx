@@ -5,6 +5,9 @@ type Explanation = Extract<TutoringResult, { kind: "explanation" }>;
 
 type ProblemCardProps = {
   result: Explanation;
+  showStatement?: boolean;
+  /** 正文已经完整讲过一遍时，卡片默认收起，避免同一段讲解重复展开。 */
+  compact?: boolean;
   busy: boolean;
   onFeedback: (problem: ProblemView) => void;
   onRecord: (problem: ProblemView) => void;
@@ -15,6 +18,8 @@ type ProblemCardProps = {
 
 export default function ProblemCard({
   result,
+  showStatement = true,
+  compact = false,
   busy,
   onFeedback,
   onRecord,
@@ -44,13 +49,13 @@ export default function ProblemCard({
         </span>
       </div>
 
-      <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-7 text-ink">
+      {showStatement && <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-7 text-ink">
         {problem.statement_text}
-      </p>
+      </p>}
 
-      {problem.attachments.length > 0 && (
+      {problem.attachments.some((image) => showStatement || image.role === "solution") && (
         <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
-          {problem.attachments.map((image) => (
+          {problem.attachments.filter((image) => showStatement || image.role === "solution").map((image) => (
             <a
               key={image.id}
               href={image.url}
@@ -98,38 +103,80 @@ export default function ProblemCard({
         </ul>
       </div>
 
-      <div className="mt-4">
-        <h4 className="text-xs font-semibold tracking-wide text-slate-500">
-          解题步骤
-        </h4>
-        <ol className="mt-2 space-y-2">
-          {result.steps.map((step) => (
-            <li key={step.index} className="rounded-xl bg-slate-50/80 p-3">
-              <p className="text-sm font-medium text-ink">
-                {step.index}. {step.title}
+      {compact ? (
+        <details className="mt-4 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+          <summary className="cursor-pointer text-xs font-medium text-river">
+            正文已经完整讲解，需要时展开讲解卡片
+          </summary>
+          <div className="mt-3 space-y-4">
+            <ol className="space-y-2">
+              {result.steps.map((step) => (
+                <li key={step.index} className="rounded-xl bg-white p-3">
+                  <p className="text-sm font-medium text-ink">
+                    {step.index}. {step.title}
+                  </p>
+                  <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
+                    {step.content}
+                  </p>
+                </li>
+              ))}
+            </ol>
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
+              <p className="text-[11px] font-medium text-emerald-800">最终答案</p>
+              <p className="mt-1 whitespace-pre-wrap break-words text-sm font-medium text-emerald-950">
+                {result.final_answer}
               </p>
-              <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
-                {step.content}
+            </div>
+            {result.error_analysis && (
+              <div className="rounded-xl border border-rose-200 bg-rose-50/80 p-3">
+                <p className="text-[11px] font-medium text-rose-800">
+                  你解法中的具体问题
+                </p>
+                <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-rose-950">
+                  {result.error_analysis}
+                </p>
+              </div>
+            )}
+          </div>
+        </details>
+      ) : (
+        <>
+          <div className="mt-4">
+            <h4 className="text-xs font-semibold tracking-wide text-slate-500">
+              解题步骤
+            </h4>
+            <ol className="mt-2 space-y-2">
+              {result.steps.map((step) => (
+                <li key={step.index} className="rounded-xl bg-slate-50/80 p-3">
+                  <p className="text-sm font-medium text-ink">
+                    {step.index}. {step.title}
+                  </p>
+                  <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
+                    {step.content}
+                  </p>
+                </li>
+              ))}
+            </ol>
+          </div>
+
+          <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
+            <p className="text-[11px] font-medium text-emerald-800">最终答案</p>
+            <p className="mt-1 whitespace-pre-wrap break-words text-sm font-medium text-emerald-950">
+              {result.final_answer}
+            </p>
+          </div>
+
+          {result.error_analysis && (
+            <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50/80 p-3">
+              <p className="text-[11px] font-medium text-rose-800">
+                你解法中的具体问题
               </p>
-            </li>
-          ))}
-        </ol>
-      </div>
-
-      <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
-        <p className="text-[11px] font-medium text-emerald-800">最终答案</p>
-        <p className="mt-1 whitespace-pre-wrap break-words text-sm font-medium text-emerald-950">
-          {result.final_answer}
-        </p>
-      </div>
-
-      {result.error_analysis && (
-        <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50/80 p-3">
-          <p className="text-[11px] font-medium text-rose-800">你解法中的具体问题</p>
-          <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-rose-950">
-            {result.error_analysis}
-          </p>
-        </div>
+              <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-rose-950">
+                {result.error_analysis}
+              </p>
+            </div>
+          )}
+        </>
       )}
 
       {result.uncertainties.length > 0 && (

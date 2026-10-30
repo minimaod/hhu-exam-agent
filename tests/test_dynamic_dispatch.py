@@ -94,7 +94,8 @@ async def test_broad_demand_introduces_and_sets_course(tmp_path: Path) -> None:
 
     res_event = next(e for e in events if e.type == "result")
     assert res_event.kind == "dynamic"
-    assert "已确认复习科目为 Python" in res_event.assistant_message
+    # F008：带工具调用的决策轮不再转发模型散文，正文由已执行结果拼出。
+    assert "Python" in res_event.assistant_message
     assert any(it.action == "introduce" for it in res_event.composite_results)
 
     # 验证上下文持久化
@@ -317,7 +318,9 @@ async def test_composite_actions_save_and_exercise(tmp_path: Path) -> None:
 
     res_event = next(e for e in events if e.type == "result")
     assert res_event.kind == "dynamic"
-    assert "已为您保存该题至错题本" in res_event.assistant_message
+    # F008：正文来自两条真实执行结果（保存错题 + 生成练习），不是规划时的散文。
+    assert "错题本" in res_event.assistant_message
+    assert "练习" in res_event.assistant_message
 
     # 验证复合操作各自反馈
     actions_done = [item.action for item in res_event.composite_results]
@@ -378,5 +381,6 @@ async def test_paper_scope_follows_current_request_not_model_default(
     assert saved.assistant_message == result.assistant_message
     replay = [e async for e in svc.stream_prepared(svc.prepare_turn(conversation.id, data), make_dummy_request())][-1]
     assert replay.result.total == total
-    assert len(scheduler.calls) == 1
+    # 一次规划 + 一次“模型收尾”的决策（原生工具循环会回到模型）。
+    assert len(scheduler.calls) == 2
 

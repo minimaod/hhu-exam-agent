@@ -42,6 +42,8 @@ from app.conversations.errors import (
 )
 from app.conversations.service import build_store_state
 from app.papers.errors import CatalogUnavailableError, PaperUnavailableError
+from app.questions.errors import QuestionError
+from app.questions.runtime import build_question_runtime
 
 
 @asynccontextmanager
@@ -54,7 +56,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.query_config = load_config_state()
     app.state.conversation_store = build_store_state()
-    yield
+    app.state.question_runtime = build_question_runtime()
+    try:
+        yield
+    finally:
+        runtime = getattr(app.state, "question_runtime", None)
+        if runtime is not None:
+            runtime.close()
 
 
 app = FastAPI(
@@ -251,3 +259,13 @@ async def handle_mistake_record_conflict(
     if exc.record_id is not None:
         content["record_id"] = exc.record_id
     return JSONResponse(status_code=409, content=content)
+
+
+@app.exception_handler(QuestionError)
+async def handle_question_error(
+    request: Request,
+    exc: QuestionError,
+) -> JSONResponse:
+    """题库集成错误：404/409/410/503 由异常自身给出，正文不含内部路径。"""
+
+    return _detail_response(exc.status_code, exc.message)

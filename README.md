@@ -1,130 +1,447 @@
 # 河海大学考试复习助手
 
-面向河海大学学生、基于 LangGraph 调度 Agent 的考试复习助手：在同一个会话里用自然语言查真题、讲题、按需练习和整理错题。Agent 根据学生发言和会话上下文规划动作，由程序执行检索、保存与校验，并把真实执行结果反馈给 Agent 继续决策。
+面向河海大学学生的本地全栈 Agent 应用。在同一个学习会话中，学生可以查找试卷、定位 Python 真题、询问考点、提交图文题目、请求讲解、练习和整理错题。
+
+前端使用 React + TypeScript，后端使用 FastAPI，LangGraph 组织原生工具调用循环。模型根据上下文选择能力，程序负责查询真实资料、检查目标与操作条件、保存结果，再把执行结果交回模型继续决策。
 
 项目地址：[minimaod/hhu-exam-agent](https://github.com/minimaod/hhu-exam-agent)
 
-**当前为本地运行的最小版本，尚未部署在线服务。仓库提供源码、试卷目录和运行说明；真实试卷 PDF 与 API 密钥需自行准备。**
+**当前为本地原型，尚未部署在线服务。最新返修已完成实现与自检，用户重新体验验收待完成。仓库提供源码、试卷目录和工具代码；PDF、已构建题库、模型缓存、个人学习数据和真实 API 密钥需在本地准备。**
+
+阅读入口：[全栈架构](#全栈架构) · [Agent 架构](#agent-架构) · [本地启动](#本地启动) · [检查与验证](#检查与验证) · [资料目录](#资料目录)
 
 ## 功能与边界
 
-- 自然语言查询：一次查询一门课程，支持期中、期末或全部类型。
-- 统一学习会话：新建、切换和恢复会话；会话可查试卷，也可提交文字/图片题目、自己的答案和解法。会话页采用聊天式布局：历史消息在独立区域上下滚动，输入框固定在底部，不随消息滚动。
-- 题目辅导：题目不清楚时先请求补充；清楚后展示知识点、步骤、最终答案；有学生解法时分析具体错误。
-- 来源可选：可从会话中的查询结果选择已登记试卷；学生自述来源单独标注“未核实”，不从图片猜试卷或题号。
-- 错题本：只有明确“记录这题”或点击记录按钮才建立正式记录；可回看题目、图片、来源、讲解、追问和反馈，并纠正或删除记录。
-- 会话自动保存：每轮输入、结果和执行状态保存到本地 SQLite；刷新页面或重启后端后仍可查看，可围绕当前题目继续追问。
-- 手动筛选与下载：按课程名称或别名、考试类型查询；通过登记 ID 定位本地 PDF，保留文件名，显示下载错误。
-- 动态练习：在会话中按需生成类似题（参考最近题目去重）；答案与解题过程分开填写，评价后可订正或补充，每次作答独立保留；看过参考解答后作答会如实标注“不代表独立掌握”。
-- 动态调度：一句话可组合多个动作（如“保存这题，再来一道类似题”）；已确认的课程、当前题目和练习在后续轮次中继承；建议按钮只在当前有效时显示。
-- 失败可恢复：业务结果区分成功、部分完成、未完成、待补充；失败轮次可从原轮次重试，已成功的动作不重做。
-- 模型只做意图规划、题目整理、讲解、出题与评价；是否记录、来源校验、保存和“已保存/已记录”提示由程序执行。
-
-当前不支持年份或学年筛选、精确课程版本筛选、长期学习进度记忆与掌握度评估、题型统计和个性化复习计划。不提供会话删除；删除错题记录只删除记录和修订，保留原会话与图片。
-
-## Agent 设计
-
-项目的核心是一个基于 LangGraph 的 **“决策 → 执行 → 观察 → 再决策”调度 Agent**（`app/conversations/graph.py`）。学生在同一个会话里自然说话，Agent 判断要查试卷、讲题、出练习、评价作答还是记错题，并按需组合多个动作。
-
-### 设计原则：模型做决策，程序管事实
-
-| 由模型负责 | 由程序负责 |
+| 能力 | 当前实现 |
 | --- | --- |
-| 理解意图、规划 1~3 个动作、写讲解与评价、生成练习题 | 校验动作参数与依赖、检索试卷目录、写入 SQLite、错题记录、“已保存/已记录”提示 |
+| 查卷与下载 | 根据课程别名、考试类型查询已登记目录，按登记 ID 下载本地 PDF |
+| Python 真题 | 按内容、试卷、题型或原卷题号查题；支持整卷题型浏览、分批继续及换题 |
+| 自然语言问答 | 围绕当前题问考点、要提示、解释题意或请求完整讲解；不要求使用固定口令 |
+| 图文辅导 | 输入文字、上传或粘贴题图，题目不清楚时澄清；可结合学生答案和过程分析错误 |
+| 按需练习 | 从当前题生成类似题、提交作答、评价、补充和订正；每次尝试独立保存 |
+| 错题本 | 根据明确保存要求、按钮或对清晰保存建议的确认建立记录，回看与纠正题目、讲解和来源 |
+| 持久会话 | 保存轮次、选题、作答、上下文与执行状态；刷新或重启后恢复 |
+| 流式回复与恢复 | 展示处理进度和正文片段；业务重试保留已成功动作，正文可单独重新生成 |
 
-模型输出必须是受 Pydantic 约束的 JSON（`ScheduleDecision`，`extra="forbid"`），不合格即视为失败；模型无法直接写库，也不能声称某份试卷“不存在”——目录事实只来自真实查询结果。
+本地 Python 数据快照：20 份试卷、285 页、1154 道题，其中 1152 道已批准发布（选择 788、填空 324、编程 40），另 2 道原卷选项异常题隔离。58 道没有原卷答案的题单独保留缺失标记，并提供独立解答，不冒充原卷答案。这是当前本地资料的覆盖范围，不代表全部年份的 Python 考试。
 
-### LangGraph 图
+其余课程目前以试卷目录与原卷下载为主；题库能力按实际数据报告，不编造未建立的学科真题。Python 题库可按已有学年、学期和题号定位；通用试卷目录查询仍主要支持课程与考试类型，不能把题库定位能力等同于所有课程均支持任意年份或课程版本筛选。
 
-**图 1：调度 Agent 主图**（`DynamicReviewGraph`，`app/conversations/graph.py`）
+长期薄弱点记忆、掌握度评估、题型统计、个性化复习计划、多用户登录与线上部署尚未实现。当前不提供会话删除；删除错题记录会保留原会话和题图。
+
+## 全栈架构
+
+### 各层如何配合
+
+| 层 | 职责 | 主要代码 |
+| --- | --- | --- |
+| React 页面 | 管理当前会话、输入草稿、附件、作答与卡片；显示临时正文和服务端保存结果 | [components](frontend/src/components) |
+| 前端请求层 | 发起 HTTP 请求、解析 POST 返回的 SSE 流、校验事件和处理取消/迟到响应 | [conversationsApi.ts](frontend/src/lib/conversationsApi.ts) |
+| FastAPI 接口 | 用 Pydantic 校验请求，组装服务依赖，将业务结果转为 JSON、文件或 SSE 响应 | [api](app/api)、[main.py](app/main.py) |
+| 会话业务层 | 校验请求去重、对象归属与版本，协调 Agent 和业务能力，维护检查点与持久化 | [service.py](app/conversations/service.py) |
+| Agent 调度层 | 根据本轮请求、上下文和真实工具结果选择下一步 | [graph.py](app/conversations/graph.py)、[tools.py](app/conversations/tools.py) |
+| 业务能力层 | 查卷、查题、读取来源、讲解、出题、评价与保存记录 | [papers](app/papers)、[questions](app/questions)、[tutoring](app/tutoring)、[mistakes](app/mistakes) |
+| 数据访问层 | 读目录与题库；事务写入会话、作答、记录和恢复状态 | [repository.py](app/conversations/repository.py)、[question_bank](app/question_bank) |
+| 模型适配层 | 构造 DeepSeek 客户端，分别支持原生工具调用、结构化辅导结果和流式正文 | [llm.py](app/llm.py)、[reply.py](app/conversations/reply.py) |
+
+```mermaid
+flowchart LR
+    subgraph browser["浏览器"]
+        UI["React 页面<br/>会话、输入、题卡、错题本"]
+        Client["TypeScript 请求层<br/>HTTP 与 SSE 解析"]
+        UI --> Client
+    end
+    subgraph backend["FastAPI 后端"]
+        API["接口层<br/>请求校验、依赖组装"]
+        Conversation["ConversationService<br/>上下文、目标校验、事务与恢复"]
+        Agent["LangGraph 调度 Agent<br/>原生工具调用循环"]
+        Services["业务能力<br/>查卷、查题、辅导、练习、记录"]
+        Reply["回复阶段<br/>公开材料投影与正文流"]
+        API --> Conversation
+        Conversation --> Agent
+        Agent --> Services
+        Services -->|"真实工具结果"| Agent
+        Conversation --> Reply
+    end
+    subgraph local["本地数据"]
+        Catalog["catalog.json 与原始 PDF"]
+        Bank["真题库<br/>SQLite、BM25、Qdrant、审核记录"]
+        Study["学习库 SQLite<br/>会话、作答、错题、检查点"]
+        Images["附件文件"]
+    end
+    Model["DeepSeek API"]
+    Client -->|"JSON / 文件上传"| API
+    API -->|"SSE / JSON / 文件"| Client
+    Agent <-->|"tool_calls / 决策"| Model
+    Services <-->|"讲解、出题、评价"| Model
+    Reply <-->|"自然语言正文"| Model
+    Services --> Catalog
+    Services --> Bank
+    Conversation --> Study
+    Conversation --> Images
+```
+
+模型通过后端适配器调用，浏览器不持有 API 密钥，也不直接访问模型、SQLite、Qdrant 或磁盘文件。Qdrant 使用本地存储模式，当前无需单独启动向量数据库服务器。
+
+### 一次请求的数据流
+
+以“给出刚刚那张卷的选择题第五题，说明它考什么”为例：
+
+1. 前端向会话轮次接口提交文字、conversation_id 和唯一 request_id；若有图片，先上传附件，再在轮次里引用附件 ID。
+2. FastAPI 校验参数。会话服务检查重复请求与运行冲突，先保存 running 轮次，读取已确认课程、最近明确试卷、当前题目和浏览位置。
+3. 调度 Agent 选择工具。程序将“试卷 + 题型 + 原卷题号”解析为实际目标，检查来源和唯一性；跨页题号可重新定位，同号多题型才要求澄清。
+4. 工具结果回到 Agent。它可以继续读取材料或决定本轮已有足够信息回答；选题成功不会自动强制学生先作答。
+5. 业务结果与回复恢复材料先落库。回复阶段取得本轮允许使用的题面、来源和结果，生成考点说明；纯选题只确认真实目标。
+6. 前端收到 message_delta 时展示临时正文，收到最终 result 后以服务端保存正文和卡片替换临时内容；刷新通过 GET 会话详情恢复。
+
+下面展示通常需要生成正文时的时序，具体工具步骤由请求决定：
+
+```mermaid
+sequenceDiagram
+    participant B as React 浏览器
+    participant A as FastAPI
+    participant S as 会话服务
+    participant D as 学习库
+    participant G as 调度 Agent
+    participant T as 业务工具
+    participant R as 回复阶段
+    B->>A: POST turns（query、request_id、对象引用）
+    A->>S: 已校验请求
+    S->>D: 写 running，读取持久上下文
+    S->>G: 用户请求与当前上下文
+    loop 有工具请求且预算允许
+        G->>T: 已校验的工具参数
+        T-->>G: 真实结果或明确的失败/歧义
+        G->>G: 根据观察继续决策
+    end
+    G-->>S: 本轮工具结果与结束原因
+    S->>D: 保存业务结果和回复材料
+    S->>R: 按请求范围投影的公开材料
+    R-->>S: 正文片段
+    S-->>B: SSE message_delta（seq）
+    S->>D: 保存最终正文与回复状态
+    S-->>B: SSE result（最终保存结果）
+    B->>B: 替换临时正文，更新卡片
+```
+
+SSE 是一次 HTTP 请求的流式响应。前端请求层读取响应体并解析事件，不依赖 WebSocket。HTTP 200 只表示流已建立，业务是否完成要看最终事件和服务端记录。确定性澄清和纯选题确认可直接形成正文，无需额外调用回复模型。
+
+### 数据放在哪里
+
+| 数据 | 用途与写入方式 |
+| --- | --- |
+| data/papers/catalog.json | 试卷登记事实：课程、学年、考试类型、标题、相对 PDF 路径 |
+| data/papers 下的 PDF | 原始资料；后端校验登记 ID、文件路径及来源后提供下载或原页 |
+| data/local/question-bank | 版本化题目事实库、索引、题图、模型缓存与审核记录；运行时只返回已批准且内容哈希匹配的题 |
+| data/local/study.sqlite3 | 可写学习库：会话、轮次、题目版本、选题与查看事实、练习和作答、错题、恢复检查点 |
+| data/local/attachments | 用户上传的题目和解法图片；数据库保存元数据与关联 |
+
+真题事实库和学习库是两个用途不同的 SQLite 数据源。前者描述“原卷是什么”，后者记录“这个会话做了什么”；不把模型生成的解答写回成原卷答案。已请求的讲解正文、作答与恢复材料会保存在学习库中。
+
+### 代码导航
+
+```text
+app/
+├─ main.py                    # 启动配置、数据库初始化、路由与异常处理
+├─ api/                       # HTTP、文件与 SSE 接口
+├─ conversations/
+│  ├─ graph.py                # LangGraph 循环和调度模型
+│  ├─ tools.py                # 原生工具 Schema、参数校验与公开结果字段
+│  ├─ protocol.py             # 工具与内部动作契约
+│  ├─ service.py              # 业务协调、目标解析、恢复与回复材料
+│  ├─ reply.py                # 独立流式正文
+│  ├─ repository.py           # 学习库事务与持久化
+│  └─ schema.py               # v5 结构与逐级迁移
+├─ question_bank/             # 题目事实、BM25、向量检索与 RRF
+├─ questions/                 # 会话内查题、来源、卡片与答案可见性
+├─ papers/                    # 试卷目录、课程别名与下载
+├─ tutoring/                  # 图文辅导、练习生成、作答评价
+├─ mistakes/                  # 错题记录与修订
+├─ querying/                  # 保留的无状态查询理解与工作流
+└─ llm.py                     # DeepSeek 模型适配
+frontend/
+├─ src/components/            # 会话、正文、题卡、练习与错题页面
+├─ src/lib/                   # 请求、SSE 解析与响应校验
+└─ vite.config.ts             # 开发端口与 /api 代理
+tools/question_bank/          # 抽取、校订、构建、评估与发布工具
+tests/                        # 协议、业务、迁移、故障、模型替身与资料测试
+```
+
+## Agent 架构
+
+### 一个调度 Agent，协调多种业务能力
+
+当前使用一个 LangGraph 调度 Agent。各课程共用工具与规则，差异由课程能力和本地数据决定。辅导、出题和评价是调度器调用的业务能力；它们可以使用同一 DeepSeek 提供方的模型，但不各自维护独立的自主调度循环。
+
+调度采用原生 Tool Calling：SchedulerAgent 通过 bind_tools 提供工具 Schema，接收模型返回的 tool_calls；程序校验名称和参数，将调用规范化为内部 ActionPlan。执行结果按 tool_call_id 返回 tool 消息，模型看到真实结果后再决定下一步。内部仍使用 Pydantic 契约，辅导等任务也会产生结构化结果；这与“让模型输出一段 JSON 动作清单作为调度协议”不同。
+
+### 决策、执行、观察、再决策
 
 ```mermaid
 flowchart TD
-    START([START]) --> decide
-    decide["decide<br/>SchedulerAgent 调用 DeepSeek<br/>输出 ScheduleDecision（1~3 个动作）"]
-    decide -->|pending 非空| execute
-    decide -->|无动作 / 超过 2 轮决策| respond
-    execute["execute<br/>取出下一个动作<br/>依赖检查 · 单轮去重 · 上限 4 个<br/>执行后写入 observations"]
-    execute -->|还有 pending| execute
-    execute -->|needs_user：需学生作答或补充| respond
-    execute -->|有失败且未达 2 轮| decide
-    execute -->|全部成功 / 澄清 / 再决策失败| respond
-    respond["respond<br/>汇总结果与建议按钮"] --> END([END])
+    Input["本轮请求 + 持久上下文"] --> Decide["decide<br/>原生工具决策"]
+    Decide -->|"有工具调用"| Execute["execute<br/>参数、目标、依赖、去重与预算检查"]
+    Execute --> Observe["工具结果进入 observations<br/>按 tool_call_id 回传"]
+    Observe -->|"本批仍有可执行调用"| Execute
+    Observe -->|"本批完成且预算允许"| Decide
+    Execute -->|"真实歧义、缺必要信息或明确要自己先做"| Finish["结束工具阶段"]
+    Decide -->|"不再请求工具"| Finish
+    Observe -->|"达到上限或不可继续"| Finish
+    Finish --> Save["保存业务结果与回复材料"]
+    Save --> Reply["独立回复阶段<br/>自然正文或确定性确认"]
 ```
 
-**图 2：动作与子工作流的调用关系**
+“查到题”“选中题”是执行事实，不等于必须结束教学对话。问考点时可在同轮定位并回答；只要求选题时确认选中结果；确实无法唯一确定试卷或题型时才澄清。讲解、练习和保存由学生需求驱动，工具的实际材料与写入条件仍由程序检查。
 
-```mermaid
-flowchart LR
-    execute["execute 节点"] --> A{动作类型}
-    A -->|query_papers| Q["试卷查询图"]
-    A -->|explain_problem| T["题目辅导图"]
-    A -->|generate_exercise| G["练习生成 + 去重<br/>最近 5 题 · 最多 2 次"]
-    A -->|evaluate_exercise| E["作答评价<br/>尝试只追加 · 条件写入"]
-    A -->|record_mistake / record_feedback| R["程序直接写 SQLite"]
-    A -->|followup / reveal / introduce / clarify| O["其他动作"]
-```
+### 工具与业务服务
 
-**图 3：子工作流**（`app/querying/workflow.py`、`app/tutoring/workflow.py`）
-
-```mermaid
-flowchart LR
-    subgraph 试卷查询图
-        qs([START]) --> qu["understand<br/>模型提取课程/类型"]
-        qu -->|search| qr["retrieve<br/>PaperService 检索"]
-        qu -->|clarify| qc["clarify"]
-        qu -->|unsupported| qx["unsupported"]
-        qr --> qe([END])
-        qc --> qe
-        qx --> qe
-    end
-    subgraph 题目辅导图
-        ts([START]) --> tu["understand<br/>读取题目与图片"]
-        tu -->|清楚| te["explain<br/>知识点、步骤、错因"]
-        tu -->|不清楚 / 多题| tc["clarify<br/>不调用讲解模型"]
-        te --> tend([END])
-        tc --> tend
-    end
-```
-
-### 动作工具箱
-
-| 动作 | 作用 | 前置依赖 |
+| 原生工具 | 业务能力 | 主要执行位置 |
 | --- | --- | --- |
-| `introduce` | 确认课程，介绍能力并建议下一步 | — |
-| `query_papers` | 调用试卷检索（课程别名归一、考试类型） | — |
-| `explain_problem` | 题目讲解（新题 / 补充 / 纠正三种模式） | — |
-| `followup_problem` | 回答对当前题的追问 | 题目已讲解 |
-| `generate_exercise` | 按需生成类似练习题（去重） | 题目已讲解 |
-| `evaluate_exercise` | 评价学生作答 | 存在练习 |
-| `reveal_solution` | 展示参考解答 | 存在练习 |
-| `record_mistake` | 保存到错题本 | 题目已讲解 |
-| `record_feedback` | 记录“我懂了”等自述 | — |
-| `clarify_or_reply` | 澄清歧义、接受拒绝、寒暄 | — |
+| confirm_course | 确认当前课程 | 会话服务与上下文 |
+| query_papers | 查试卷目录和下载入口 | PaperService |
+| search_questions | 按内容、题型、试卷或题号查已审核真题 | QuestionRuntime / QuestionBankService |
+| list_paper_questions | 按卷与题型浏览，返回真实总数、范围和续页位置 | 同上，使用有序浏览 |
+| select_question | 选定实际题目，绑定来源与版本 | 会话服务与学习库 |
+| explain_problem | 根据题目材料讲解，或按请求范围回答 | 辅导能力与公开材料问答 |
+| answer_followup | 围绕当前题继续追问 | 辅导能力与会话上下文 |
+| generate_exercise | 按当前材料生成类似练习并检查重复 | 练习生成能力 |
+| evaluate_exercise | 评价作答，支持补充与订正 | 作答评价能力 |
+| reveal_solution | 按需读取练习参考解答 | 练习服务与学习库 |
+| show_question_answer | 按需查看真题参考答案 | 题目服务与查看事实 |
+| save_mistake | 保存错题与来源、题目版本和反馈 | 记录服务与学习库 |
+| record_feedback | 保存“我懂了”等自述反馈 | 学习库 |
+| ask_user | 请求必要澄清 | 会话服务 |
 
-### 可控性护栏
+模型无法直接写库或提供本地文件。是否找到资料、是否保存成功、当前题号及来源，都来自工具和程序实际结果。
 
-- **有界循环**：每轮最多决策 2 次、每次最多规划 3 个动作、累计最多执行 4 个；超出的动作标为“未执行”，不会被当作已完成。
-- **依赖检查**：前置动作失败时，依赖它的动作自动跳过并说明原因（例如纠正失败后不再出题）。
-- **单轮去重**：有副作用的动作在一轮内最多尝试一次，重新决策时也不会重复保存或重复出题。
-- **观察驱动的再决策**：动作失败后把执行结果回传给模型重新决策；需要学生回答时立即结束本轮，等待输入。
-- **行为红线**（写在提示词中并由测试覆盖）：“我懂了”只记录反馈，不会自动出题或存错题；“好”“可以”等歧义回答先澄清；学生说“不用了”不再推荐；未指定考试类型时不默认期末。
-- **上下文继承**：已确认课程、当前题目和练习状态持久化保存，例如“给我期末试卷”会沿用上一轮确认的课程。
-- **纯图片输入**由程序判断：当前有待作答练习时视为作答，否则视为新题。
+### 真题检索与浏览
 
-### 练习闭环（出题 → 作答 → 评价 → 订正）
+```mermaid
+flowchart LR
+    Request["查题请求"] --> Filter["课程、试卷、题型、题号<br/>审核状态与内容哈希过滤"]
+    Filter --> Mode{"是否有内容关键词"}
+    Mode -->|"有"| Sparse["BM25 关键词召回"]
+    Mode -->|"有"| Dense["本地 BGE 向量召回"]
+    Sparse --> RRF["RRF 融合与相关性检查"]
+    Dense --> RRF
+    Mode -->|"无，按卷浏览"| Browse["SQLite 稳定题序<br/>按 offset / limit 分批"]
+    RRF --> Cards["真实题卡、来源与返回范围"]
+    Browse --> Cards
+```
 
-- 每次作答在 `exercise_attempts` 表中**只追加、不覆盖**，分为首次、补充、订正三种；评价写入时检查该作答是否已有评价，迟到或重复的响应不会覆盖已有结果。
-- 看过参考解答后再作答，评价强制标注 `after_reveal`，说明“答案正确不代表独立掌握”。
-- 生成练习时参考最近 5 道题避免重复，最多生成 2 次；仍重复则如实说明，不保存。
+题库使用 SQLite 保存事实，BM25 处理关键词匹配，本地 BAAI/bge-small-zh-v1.5 编码查询并在 Qdrant 中检索向量，再用 RRF 融合排序；向量不可用时可按实际状态降级。按试卷和题号浏览不需要把卷名当作题干关键词做语义搜索。
 
-### 可靠性：Agent 中途失败怎么办
+题目带 question_id、build、内容哈希和来源轮次。会话服务的共用目标解析同时检查试卷、题型、原卷题号与唯一性，避免换卷后命中旧卷同号题，也区分“原卷第 5 题”和“列表第 5 个”。
 
-- 每轮先写入 `running` 状态再执行；结果先落库，再通过 SSE 推送给前端。
-- 同一个 `request_id` 重复提交时直接回放已保存结果，不会再次调用模型。
-- 失败后使用 `retry_of` 重试：服务端按原计划的检查点恢复，**已成功的动作不重做**，只重新执行失败及依赖它的动作。
-- 运行状态（running / completed / failed / interrupted）与业务结果（成功 / 部分完成 / 未完成 / 待补充）分开记录，部分完成时已有结果仍会展示。
-- 后端重启时，遗留的进行中轮次标记为“已中断”，不会自动重新调用模型。
+### 上下文与回复阶段
+
+| 信息 | 如何使用 |
+| --- | --- |
+| 已确认课程、当前题目与练习 | 从学习库恢复，供本轮决策使用 |
+| 最近明确试卷、题型、查询条件与位置 | 保存于轮次结果中，用于“刚刚那张卷”“继续”“换一道”等后续请求 |
+| 最近对话摘要 | 提供语境，不把全部会话历史无限放入提示词 |
+| 本轮 observations | 告诉模型哪些调用真的成功、失败或缺信息 |
+| 回复材料 | 由程序投影：真实结果、相关公开题面、已请求的讲解及本轮回答范围 |
+
+调度阶段的模型文本不直接作为正文输出。工具阶段结束后，[reply.py](app/conversations/reply.py) 使用没有写入工具的独立回复调用组织正文；因此“模型准备做什么”和“实际做完什么”分开处理。
+
+学生只问考点或要提示时，正文取得相关公开材料，不自动开启完整答案或建立完整讲解记录。纯选题只返回真实目标的简短确认；纯浏览保留题卡，正文只接收数量与范围，避免模型从公开题干擅自解题。确定性澄清和选题确认可不调用正文模型。
+
+### 上限、持久化与恢复
+
+- 每轮最多 4 次工具决策，每次响应最多接受 3 个工具调用，累计最多 4 次工具尝试；无效和被拒绝的调用也消耗预算。这是调度上限，辅导和最终回复的模型请求另计。
+- 成功结果和失败结果都会进入后续观察；失败步骤的依赖不会继续冒充成功，有副作用的动作保留去重与检查点。
+- “我懂了”记录为自述，不自动出题或保存，也不等于长期掌握度；歧义确认和拒绝按上下文处理。
+- 业务结果与回复材料先保存，再输出正文片段。正文失败不会撤销已经成功的保存、选题或作答。
+- 同一 request_id 的已结束请求直接回放结果。业务失败可用新的 request_id 与 retry_of 恢复，已成功动作不重做。
+- 业务已完成但正文中断时，可只重新生成正文，不重新讲题、出题或保存记录；恢复材料在重新使用时仍按请求范围过滤。
+- 后端重启后恢复已保存会话，遗留 running 轮次标为 interrupted，不自动再次调用模型。
+
+运行状态、业务结果和回复完整性分别表达：轮次可以已经 completed、业务 succeeded，但 reply_status 仍为 failed 或 truncated；确定性确认未尝试回复模型时，reply_status 可以为空。前端据此提供相应恢复入口，不能仅凭 HTTP 200 或收到一段文字判定全部完成。
+
+## 本地启动
+
+### 1. 环境与模型配置
+
+使用 Python 3.12、Node.js 24、uv 和 pnpm。Python 与前端依赖分别由 [uv.lock](uv.lock) 和 [pnpm-lock.yaml](frontend/pnpm-lock.yaml) 锁定。
+
+将项目根目录的 [.env.example](.env.example) 复制为 .env，在本地填写密钥：
+
+```dotenv
+DEEPSEEK_API_KEY=your-api-key-here
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-flash
+```
+
+模型名称以本地配置为准。调度采用原生工具调用，辅导按任务使用结构化输出，回复采用文本流；后端模型适配默认关闭思考模式。环境变量优先于 .env，配置在后端启动时读取，修改后需重启。真实密钥仅在后端使用，不放入前端 VITE_* 变量。
+
+缺少模型配置时，健康检查、手动目录查询和已保存历史仍可用；需要模型的新轮次会返回配置错误。
+
+### 2. 启动后端
+
+在项目根目录运行：
+
+```powershell
+uv sync
+uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+接口文档：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)。
+
+### 3. 启动前端
+
+另开终端：
+
+```powershell
+cd frontend
+pnpm install
+pnpm dev
+```
+
+打开 [http://127.0.0.1:5173](http://127.0.0.1:5173)。Vite 将 /api 代理到本地 8000 端口；生产部署入口需另行配置。
+
+### 4. 准备资料与题库
+
+| 运行范围 | 需要准备的数据 |
+| --- | --- |
+| 目录查询 | 仓库中的 data/papers/catalog.json |
+| 原卷下载 | 按目录 file_path 将 PDF 放到 data/papers 对应位置；缺文件时下载返回 404 |
+| 文字/图片辅导、练习 | 有效模型配置；用户提供题目材料，学习库由后端初始化 |
+| Python 真题检索与来源回看 | 已构建的版本化题库、匹配的审核记录和模型缓存，以及来源 PDF |
+
+**克隆源码不等于取得本地 1152 道已发布题。** data/local 已被忽略，题库索引、校订与审核数据不会随源码提交；只补齐 PDF 也不会自动生成已审核题库。没有题库时相应能力报告未建立或不可用，目录查询和原卷下载仍按各自条件工作。
+
+题库准备流程是“抽取 → 校订与审核 → 构建和校验 → 发布”，相关工具位于 [tools/question_bank](tools/question_bank)。构建版本、题目内容与审核决定的哈希须一致；未经审核的候选不会作为正式真题返回。工具参数可分别查看：
+
+```powershell
+uv sync --group ingest
+uv run python -m tools.question_bank.build --help
+uv run python -m tools.question_bank.publish --help
+uv run python -m tools.question_bank.search_cli --help
+```
+
+题库默认位于 data/local/question-bank，可通过进程环境变量 HHU_QB_ROOT 指定另一份完整题库。Qdrant 本地目录具有独占锁；测试或离线工具使用独立副本，不与正在运行的应用同时打开同一索引目录。切换已发布题库或修改配置后，让后端重新加载。
+
+### 5. 学习数据与图片
+
+首次启动创建 data/local/study.sqlite3；题目和解法图片保存在 data/local/attachments。环境变量 HHU_STUDY_DB 可指向另一份学习库。旧库按 v1→v2→v3→v4→v5 逐级迁移，失败回滚，不自动清空原文件；操作前备份数据库及附件。
+
+需要空白学习环境时，可指定新的 HHU_STUDY_DB。data/local 下同时保存题库和学习数据，不应把删除整个目录作为常规重置学习记录的方式。
+
+会话与错题保存在后端所在设备，不会自动跨设备同步。删除错题记录只删除记录及修订关联，保留原会话和图片；当前没有会话删除入口。后端启动时会清理超过 24 小时且没有被使用的待提交图片，不清理已提交题图。
+
+图片支持 JPEG、PNG、GIF、WebP，按实际内容校验；单张最多 6 MiB，一轮最多 4 张、合计 20 MiB，单边不超过 8192 像素、总像素不超过 4000 万。图片和来源文件通过后端受控接口读取，校验会话与对象归属，不暴露磁盘路径。
+
+## 使用示例
+
+| 学生输入 | 处理方式 |
+| --- | --- |
+| 我要复习高数；给我期末试卷 | 确认课程后，后续目录查询沿用该课程 |
+| 找一道 Python 循环选择真题 | 从已审核题库按内容与题型查题 |
+| 给出这张卷全部选择题；继续 | 按已确定试卷浏览，说明总数、本次范围与续页位置 |
+| 给出刚刚那张试卷的选择题第五题 | 同时定位试卷、题型和原卷题号；无需先翻到该页 |
+| 这段代码考什么知识点 | 回答考点，不强制先作答，也不自动公开完整解法 |
+| 只给提示，先别公布答案 | 根据公开材料提供提示，限制回答深度 |
+| 讲解这道题；为什么这个选项不对 | 根据当前目标及请求范围解释 |
+| 先让我自己做，不给答案 | 保留自主作答要求 |
+| 保存这题，再来一道类似题 | 根据真实结果和依赖组合保存、生成练习 |
+| 我懂了 | 保存自述反馈，不自动出题或加入错题本 |
+
+也可上传或粘贴题目图片，提交自己的答案和过程。题目不清楚时先补充；纠正题干保留旧版本，新的讲解与具体版本关联。练习作答只追加，支持补充和订正；看过参考解答后作答会如实标注。
+
+输入框 Enter 换行，Ctrl/⌘ + Enter 发送。处理中可以停止；之后以服务端已保存状态决定查看结果、只重做正文或重试业务。切换会话后，旧请求的迟到响应不能覆盖新会话草稿。
+
+## 接口
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/health` | 返回 `{"status":"ok","service":"hhu-exam-review"}` |
+| `GET /api/papers` | 按可选 `course`、`exam_type` 查询，返回 `items`、`total` |
+| `GET /api/papers/{paper_id}/download` | 按已登记 ID 返回 PDF 附件 |
+| `POST /api/query` | 接收 `{"query":"找高数期末试卷"}`，通过 SSE 返回进度及最终结果（无会话状态） |
+| `POST /api/conversations` | 接收空对象 `{}`，201 返回会话摘要 |
+| `GET /api/conversations` | 返回 `items`、`total`，按更新时间降序、ID 稳定排序 |
+| `GET /api/conversations/{id}` | 返回会话摘要和按顺序排列的全部轮次 |
+| `POST /api/conversations/{id}/turns` | 提交一轮会话，通过 SSE 返回进度及最终结果；可选 `attempt_kind`（`supplement`/`correction`）和 `retry_of`（从失败轮次恢复重试） |
+| `POST /api/conversations/{id}/turns/{request_id}/reply` | 只重新生成已保存轮次的正文，复用业务结果，不重跑工具 |
+| `GET /api/conversations/{id}/questions/{qid}/source` | 按 build、题面/答案页类型和物理页读取原卷，校验来源 |
+| `GET /api/conversations/{id}/questions/{qid}/assets/{aid}` | 读取该题已绑定的题图 |
+| `GET /api/conversations/{id}/questions/{qid}/answer` | 按选题与查看权限读取参考答案 |
+| `POST /api/conversations/{id}/exercises/{eid}/reveal` | 查看练习参考解答，并标记之后的作答为“已看解答后作答” |
+| `POST /api/conversations/{id}/attachments` | `multipart/form-data` 上传题目/解法图片，返回附件元数据 |
+| `GET /api/conversations/{id}/attachments/{aid}` | 读取会话内图片，校验归属，不返回磁盘路径 |
+| `POST /api/mistake-records` | 把当前已讲解题目加入错题本；同一题重复请求返回已有记录 |
+| `GET /api/mistake-records` | 分页返回错题列表，按创建时间降序 |
+| `GET /api/mistake-records/{id}` | 返回题目、图片、来源、讲解、追问、反馈和修订摘要 |
+| `PATCH /api/mistake-records/{id}` | 修改标题、来源、反馈或“我懂了”自述 |
+| `POST /api/mistake-records/{id}/corrections` | SSE：纠正记录题干/图片/解法并重新讲解，旧讲解写入修订 |
+| `POST /api/mistake-records/{id}/adopt-problem` | 把同一会话更新版本的已讲解内容复制进记录 |
+| `DELETE /api/mistake-records/{id}` | 删除记录和修订，保留原会话与图片 |
+
+`exam_type` 接受 `midterm`、`final`、`other`；省略或空白表示全部。非法非空值返回 422。列表按学年降序，同学年按考试日期降序，未知日期在后；学年为“未标注”的记录排在最后。“转专业”是课程，不是考试类型，其试卷类型记为“其他”。
+
+保留的无状态 `POST /api/query` 接口接收 1–1000 字符的非空 query，返回 `progress/result/error`。统一学习会话使用 `POST /api/conversations/{id}/turns`，本轮文字上限 2000 字符，其 SSE 包含：
+
+| 事件 | 前端用途 |
+| --- | --- |
+| `progress` | 显示当前处理阶段，例如查题或组织回复 |
+| `message_delta` | 按递增 seq 拼接本轮临时正文，不当作已完整保存的最终回复 |
+| `result` | 使用最终保存的正文、题卡、业务与回复状态刷新轮次，丢弃临时正文 |
+| `error` | 显示执行失败与可恢复信息；不伪装为完整成功 |
+
+正常连接只有一个最终事件。HTTP 200 不代表后续业务一定成功；断流或停止后读取服务端状态，业务完成而正文未完成时可只重做正文。调度模型的思考与工具协议不会当作 message_delta 直接输出。
+
+会话轮次以 `query` 承载文字。页面统一输入使用 `kind: "auto"` 进入调度；省略 kind 保留旧查询语义，显式的补充、纠正、作答等请求仍按各自字段约定校验。题卡动作绑定 question_id 与 question_source_turn，避免点击历史卡却操作当前另一题。外层事件含 conversation_id、request_id 和 kind，结果可携带题目、讲解、练习、评价与动作结果；业务状态和 reply_status 分开表达。完整请求及响应结构以运行中的 [OpenAPI 文档](http://127.0.0.1:8000/docs) 和 [接口代码](app/api/conversations.py) 为准。
+
+会话/辅导/记录的错误约定：会话、题目、附件或记录不存在返回 404；非法 ID、字段组合、未登记来源、跨会话附件或图片损坏返回 422；图片过大 413、格式不支持 415；重复 `request_id` 内容不同、运行中冲突、已有活动题目、题目未讲解或记录旧版本冲突返回 409；数据库不可用、结构不兼容或模型配置缺失返回 503。
+
+结果或执行错误会先写入 SQLite，成功后才发送对应终止事件；保存失败发送 `STORAGE_UNAVAILABLE`，不会发送表示完成的结果。重复提交已结束的请求会回放已保存的结果或错误，不再次调用模型；已中断的请求没有可回放结果，返回 409，需使用新的 `request_id`。自动保存会话不会自动加入错题本；“已记录”只在记录写入成功后显示。
+
+目录整体不可用返回 503；未知 ID、文件缺失、越界、非 PDF 或当前不可读返回 404。下载前检查可预见的读取问题，传输过程中发生的文件变化仍可能导致中断。模型故障通过安全错误信息反馈，不把认证信息或服务端磁盘路径返回页面。
+
+PowerShell 查询示例：
+
+```powershell
+curl.exe "http://127.0.0.1:8000/api/health"
+curl.exe -G --data-urlencode "course=高数" --data-urlencode "exam_type=final" "http://127.0.0.1:8000/api/papers"
+```
+
+中文参数使用 `--data-urlencode`，避免 Windows 控制台直接拼接 URL 时的编码问题。
+
+## 检查与验证
+
+在项目根目录运行后端测试：
+
+```powershell
+uv sync
+uv run pytest tests -q
+```
+
+前端：
+
+```powershell
+cd frontend
+pnpm test
+pnpm typecheck
+pnpm build
+```
+
+后端覆盖接口与字段校验、原生工具协议、调度循环、来源和目标绑定、会话持久化、v1→v5 迁移、答案可见性、练习作答、记录、去重、断流和恢复。前端用 Node 测试运行器覆盖请求与 SSE 解析，用 Vitest + Testing Library 覆盖组件交互、草稿和迟到响应。
+
+完整后端测试还依赖本地 PDF、题库及部分冻结评估资料；源码仓库不包含这些数据，因此未补齐资源时不能期待完整回归全部通过。涉及真实题库的验证应使用独立副本，避免 Qdrant 目录锁冲突。部分文件锁测试使用 Windows API。
+
+最近一次 F008 返修验证：
+
+| 项目 | 结果与证据范围 |
+| --- | --- |
+| 后端完整回归 | 760 passed，0 failed、0 skipped；在独立学习库和正式题库副本上执行 |
+| 返修专题回归 | 共 53 项，覆盖自然表达、目标唯一性、换卷、分页、回复材料和恢复 |
+| 前端客户端与类型检查 | 37 项通过；TypeScript 检查通过 |
+| 真实模型与浏览器 | 实跑代码考点追问、明确换卷、同题号歧义三类场景；本轮调用 8 次 |
+| 前端 DOM 与生产构建 | 此前返修报告为 70 项 DOM 通过及构建通过；最新一轮未改前端，没有重复执行这两项 |
+| 验收状态 | 本轮实现与自检完成，用户重新体验验收待确认；不代表全部自然表达均已验证 |
+
+本轮直接修复和上述最终回归由导师在用户授权后执行；此前阶段含 Harness 实现与自检。项目同时用于学习 Agent 和全栈工程，区分实现、自检、复核和用户验收，不把有限样本表述为全部功能均已验证。
 
 ## 资料目录
 
@@ -480,214 +797,6 @@ flowchart LR
 资料来源及可提供方式：
 对应已有题名或补充说明：
 ```
-
-## 技术栈与架构
-
-- 前端：React 19、TypeScript、Vite、Tailwind CSS。
-- 后端：Python 3.12、FastAPI、Pydantic、Uvicorn。
-- 模型与流程：DeepSeek 官方接口、LangChain 模型适配、LangGraph 工作流。
-- 数据：JSON 试卷目录、本地 PDF，以及 `data/local/study.sqlite3` 中的会话、题目、附件和错题记录。
-- 通信：普通 HTTP 用于会话管理、图片、错题本与下载，SSE 反馈查询/辅导进度和最终结果。
-
-```text
-React 页面
-  ├─ 新建/切换会话 → FastAPI → 会话服务 → SQLite（会话、轮次、题目、附件）
-  ├─ 统一输入（文字/图片/练习作答）→ FastAPI → 会话服务
-  │                            ├─ 先写入 running 轮次并绑定附件
-  │                            ├─ 调度 Agent（LangGraph）：decide → execute → 观察 → 再决策；动作含查卷/讲题/追问/出题/评价/看解答/记录/反馈
-  │                            ├─ 查询：LangGraph + DeepSeek 提取条件 → 程序检索
-  │                            ├─ 辅导：题目理解 → 清晰度检查 → 澄清或讲解
-  │                            ├─ 练习：生成去重 → 作答尝试只追加 → 评价条件写入
-  │                            ├─ 结果与恢复检查点先保存，再通过 SSE 返回
-  │                            └─ 记录动作由程序写入错题本
-  │                   ← SSE 进度和最终结果
-  ├─ 错题本 → FastAPI → 记录服务 → SQLite（记录、修订、附件关联）
-  ├─ 手动筛选 → FastAPI → PaperService → PaperRepository
-  └─ 下载 → FastAPI → 根据登记 ID 检查路径及文件 → 返回 PDF
-```
-
-查询仍是一次模型理解加程序检索；辅导先整理题目并判断清晰度，不清楚时不调用讲解模型。调度 Agent 每次决策只接收持久上下文摘要（已确认课程、当前题目/练习状态、最近几轮摘要和本轮已执行结果），不会发送全部会话历史。未配置调度器时，保留旧版单次意图路由作为兼容路径。
-
-后端目录：
-
-```text
-app/
-├─ main.py          # 应用组装、启动配置、数据库初始化和统一异常处理
-├─ config.py        # 模型配置及启动快照
-├─ llm.py           # DeepSeek 模型构造、错误映射与响应读取
-├─ sse.py           # 统一 SSE 编码
-├─ streaming.py     # 查询/辅导共用的超时、断流与取消运行器
-├─ images.py        # 图片解码校验、原子写入与读取
-├─ api/             # 健康检查、试卷、查询、会话、附件与错题接口
-├─ conversations/   # 会话契约、v4 结构/迁移、调度 Agent（graph.py）、兼容意图路由、SQLite 仓库与服务
-├─ tutoring/        # 辅导契约、提示词、图文模型适配、LangGraph、练习生成/评价（exercise_llm.py）与去重（exercise_dedup.py）
-├─ mistakes/        # 错题记录契约、创建/回看/纠正/删除服务
-├─ papers/          # 试卷模型、别名、仓库、业务服务与异常
-└─ querying/        # 理解契约、提示词、模型适配、工作流与查询事件
-frontend/
-├─ src/components/  # 会话工作区/轮次/输入、练习主卡与作答回执、错题本、筛选、结果与试卷卡片
-├─ src/lib/         # HTTP 请求、会话/辅导/记录 SSE 解析、响应校验、下载、展示规则（display.ts）
-└─ vite.config.ts   # 本地开发端口及 /api 代理
-data/papers/
-└─ catalog.json     # 已登记资料；PDF 不随仓库提供
-data/local/         # 本地数据库、图片与演示数据；已被忽略，不进入仓库
-tests/              # 后端契约、迁移、图片、模型替身及真实资料测试
-```
-
-## 本地启动
-
-### 环境
-
-项目已使用 Python 3.12.13、Node.js 24.21.0、pnpm 12.5.1、uv 0.11.14 进行本地验证。依赖由 `uv.lock` 和 `frontend/pnpm-lock.yaml` 锁定。
-
-### 1. 准备模型配置
-
-复制项目根目录的 `.env.example` 为 `.env`，在本地填入 DeepSeek 密钥：
-
-```dotenv
-DEEPSEEK_API_KEY=your-api-key-here
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-flash
-```
-
-- 默认模型为 `deepseek-flash`，使用 JSON Output 并关闭思考模式。
-- 配置在后端启动时读取，已有环境变量优先；修改 `.env` 后需重启后端。
-- 密钥仅供后端读取，不放入前端 `VITE_*` 变量。
-- 缺少或错误配置不阻止健康检查、手动查询和会话历史；提交新的自然语言轮次时返回 503。
-- `.env` 已被忽略，示例配置只含占位值。
-
-### 2. 启动后端
-
-在项目根目录运行：
-
-```powershell
-uv sync
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-接口文档：<http://127.0.0.1:8000/docs>。
-
-### 3. 启动前端
-
-另开终端：
-
-```powershell
-cd frontend
-pnpm install
-pnpm dev
-```
-
-浏览器打开 <http://127.0.0.1:5173>。Vite 在开发时将 `/api` 请求代理到 `http://127.0.0.1:8000`；生产部署入口需另行配置。
-
-### 4. 准备 PDF
-
-按 `data/papers/catalog.json` 中的 `file_path`，在 `data/papers/` 下创建对应子目录并放入 PDF。PDF、密钥、依赖目录、构建产物与缓存不进入版本控制。
-
-### 5. 本地会话数据
-
-首次启动后端时，会在项目根目录创建 `data/local/study.sqlite3` 保存会话、轮次、题目和错题记录；题目图片保存在 `data/local/attachments/`（可能同时出现数据库的 `-wal`、`-shm` 附属文件）。整个 `data/local/` 已被忽略，不进入版本控制，也不会上传。
-
-- 旧版数据库启动时会按 v1→v2→v3→v4 在单个事务内逐级自动升级，保留原会话、轮次、题目与练习（旧练习回填为第 1 次作答）；升级失败会回滚并返回 503，不删除、不覆盖原文件。升级前建议停止后端并自行备份整个 `data/local/`。
-- 修改或删除数据库前先停止后端；需要重置本地数据时删除整个 `data/local/` 目录即可，这会同时丢失已有会话、错题和图片。
-- 会话与错题历史保存在本机，换浏览器或换设备不会同步。
-- 数据库损坏或结构版本不兼容时，会话/辅导/错题接口返回 503，健康检查、手动筛选和下载仍可用；程序不会自动清空或覆盖原文件。
-- 后端启动时会把上次遗留的“进行中”轮次标记为已中断，不会自动重新调用模型；超过 24 小时且没有被任何轮次/题目使用的待提交图片会被清理。
-- 删除错题记录只删除记录、修订和关联行，保留原会话和图片；本版本没有会话删除功能。
-
-### 6. 图片限制
-
-- 支持 JPEG、PNG、GIF、WebP，按真实文件内容识别，不信任扩展名或声明的 MIME。
-- 单张不超过 6 MiB；一轮最多 4 张、合计不超过 20 MiB；单边不超过 8192 像素、总像素不超过 4000 万。
-- 图片只能通过会话附件接口读取，接口校验会话归属，不返回磁盘路径。
-- 上传后未提交的附件 24 小时后清理；已提交附件随会话保留。彻底清空需停止后端后删除 `data/local/`。
-
-## 使用示例
-
-- 打开页面后先新建会话，再输入“我要复习高数”：查询高等数学大类的已登记资料。
-- “找大学物理期末试卷”：按课程及期末筛选。
-- “找C语言期末试卷”“找Python期中试卷”：按课程及类型筛选。
-- “找线代期末试卷”：使用课程别名查询。
-- “有没有转专业考试的试卷”：按课程“转专业”查询；这 10 份的类型是“其他”，与高数、线代等课程平级。
-- “我要复习”：提示补充课程。
-- “找大学化学试卷”：当前目录无匹配，返回空结果。
-- “只要 2024 年的高数试卷”：提示当前不支持该筛选条件。
-- 输入“计算极限 lim_{x→0} (sin x)/x”：进入辅导，展示知识点、步骤和最终答案。
-- 上传/粘贴题目图片，或提交自己的答案和解法：题目清楚时给出讲解；有解法时分析具体错误。
-- 题干或图片不清楚时先补充；纠正题干会创建新版本并重新讲解，旧讲解标记失效。
-- 点“我懂了”：只记录本次自述；点“记录这题”才加入错题本。
-- 错题本中可查看来源、图片、讲解、追问和反馈，纠正题干并重新讲解，或删除记录。
-- “给我出一道 Python 题”：生成练习；在题目卡片中分别填写答案和过程后提交评价，评价后可“再订正一次”，每次作答都保留。
-- “保存这题，再来一道类似题”：Agent 依次执行保存错题和生成练习两个动作；保存失败时不会继续出题。
-- 输入框中 Enter 换行，Ctrl/⌘ + Enter 发送。
-
-每次查询仍独立理解一句完整需求。查询/辅导过程中可以停止；停止或连接中断后会先读取服务端记录确认状态，再决定是否重新提交。切换会话会取消当前本地流，历史以服务端会话记录为准。点击某条结果的下载按钮，会另外请求对应 PDF。
-
-## 接口
-
-| 接口 | 用途 |
-| --- | --- |
-| `GET /api/health` | 返回 `{"status":"ok","service":"hhu-exam-review"}` |
-| `GET /api/papers` | 按可选 `course`、`exam_type` 查询，返回 `items`、`total` |
-| `GET /api/papers/{paper_id}/download` | 按已登记 ID 返回 PDF 附件 |
-| `POST /api/query` | 接收 `{"query":"找高数期末试卷"}`，通过 SSE 返回进度及最终结果（无会话状态） |
-| `POST /api/conversations` | 接收空对象 `{}`，201 返回会话摘要 |
-| `GET /api/conversations` | 返回 `items`、`total`，按更新时间降序、ID 稳定排序 |
-| `GET /api/conversations/{id}` | 返回会话摘要和按顺序排列的全部轮次 |
-| `POST /api/conversations/{id}/turns` | 提交一轮会话，通过 SSE 返回进度及最终结果；可选 `attempt_kind`（`supplement`/`correction`）和 `retry_of`（从失败轮次恢复重试） |
-| `POST /api/conversations/{id}/exercises/{eid}/reveal` | 查看练习参考解答，并标记之后的作答为“已看解答后作答” |
-| `POST /api/conversations/{id}/attachments` | `multipart/form-data` 上传题目/解法图片，返回附件元数据 |
-| `GET /api/conversations/{id}/attachments/{aid}` | 读取会话内图片，校验归属，不返回磁盘路径 |
-| `POST /api/mistake-records` | 把当前已讲解题目加入错题本；同一题重复请求返回已有记录 |
-| `GET /api/mistake-records` | 分页返回错题列表，按创建时间降序 |
-| `GET /api/mistake-records/{id}` | 返回题目、图片、来源、讲解、追问、反馈和修订摘要 |
-| `PATCH /api/mistake-records/{id}` | 修改标题、来源、反馈或“我懂了”自述 |
-| `POST /api/mistake-records/{id}/corrections` | SSE：纠正记录题干/图片/解法并重新讲解，旧讲解写入修订 |
-| `POST /api/mistake-records/{id}/adopt-problem` | 把同一会话更新版本的已讲解内容复制进记录 |
-| `DELETE /api/mistake-records/{id}` | 删除记录和修订，保留原会话与图片 |
-
-`exam_type` 接受 `midterm`、`final`、`other`；省略或空白表示全部。非法非空值返回 422。列表按学年降序，同学年按考试日期降序，未知日期在后；学年为“未标注”的记录排在最后。“转专业”是课程，不是考试类型，其试卷类型记为“其他”。
-
-自然语言问题去除首尾空白后须为 1–1000 个字符，否则返回 422。SSE 事件为 `progress`、`result` 或 `error`；`result.kind` 区分找到、无匹配、澄清和范围提示。正常连接仅有一个最终事件，HTTP 200 不代表后续业务一定成功，提前断流按未完成处理。
-
-会话轮次请求以 `query` 承载本轮文字。省略 `kind` 是 F004 旧客户端的查询语义；`kind: "auto"` 表示让服务端判断查询/辅导；也可显式使用 `query/problem/supplement/followup/correction/record/feedback`。图片、学生答案/解法、来源和 `problem_id` 按轮次类型校验。会话轮次事件在外层增加 `conversation_id`、`request_id` 和 `kind`，查询内层 `result` 仍使用上面的结果结构，辅导内层 `tutoring` 使用 `explanation/needs_clarification/followup_answer/feedback_recorded/record_created/record_exists/intent_clarification`。
-
-会话/辅导/记录的错误约定：会话、题目、附件或记录不存在返回 404；非法 ID、字段组合、未登记来源、跨会话附件或图片损坏返回 422；图片过大 413、格式不支持 415；重复 `request_id` 内容不同、运行中冲突、已有活动题目、题目未讲解或记录旧版本冲突返回 409；数据库不可用、结构不兼容或模型配置缺失返回 503。
-
-结果或执行错误会先写入 SQLite，成功后才发送对应终止事件；保存失败发送 `STORAGE_UNAVAILABLE`，不会发送表示完成的结果。重复提交已结束的请求会回放已保存的结果或错误，不再次调用模型；已中断的请求没有可回放结果，返回 409，需使用新的 `request_id`。自动保存会话不会自动加入错题本；“已记录”只在记录写入成功后显示。
-
-目录整体不可用返回 503；未知 ID、文件缺失、越界、非 PDF 或当前不可读返回 404。下载前检查可预见的读取问题，传输过程中发生的文件变化仍可能导致中断。模型故障通过安全错误信息反馈，不把认证信息或服务端磁盘路径返回页面。
-
-PowerShell 查询示例：
-
-```powershell
-curl.exe "http://127.0.0.1:8000/api/health"
-curl.exe -G --data-urlencode "course=高数" --data-urlencode "exam_type=final" "http://127.0.0.1:8000/api/papers"
-```
-
-中文参数使用 `--data-urlencode`，避免 Windows 控制台直接拼接 URL 时的编码问题。
-
-## 检查与构建
-
-后端：
-
-```powershell
-uv run pytest
-```
-
-测试覆盖目录校验、课程与类型筛选、排序、异常、模型请求及工作流分支；会话创建/排序/恢复、轮次落库顺序、重复与冲突、中断恢复和数据库故障隔离；还覆盖 v1→v4 迁移、调度 Agent 的动作依赖/上限/恢复重试、练习生成去重、作答尝试/订正/补充与评价条件写入、v1→v2 迁移、图片校验、调度、文字/图片题、错误解法、补充、纠正、追问、反馈、错题记录、纠正/采用新版/删除，以及前端实际异步交互和迟到响应。**完整后端测试包含真实 PDF 读取和下载用例，未补齐本地资料时不能全部通过。** 部分文件锁异常用例使用 Windows API。
-
-前端：
-
-```powershell
-cd frontend
-pnpm test
-pnpm typecheck
-pnpm build
-```
-
-前端测试使用 Node 内置测试运行器覆盖查询/会话/附件/记录 SSE 解析、分块边界、错误和提前断流以及展示规则；使用 Vitest + Testing Library 覆盖会话工作区、练习主卡与作答回执、建议按钮、输入框快捷键、下载反馈和迟到响应隔离。
-
-F006（动态复习对话与按需练习）完成后，Harness 自检后端 **378 项测试**通过；前端 **35 项 Node 测试 + 47 项 DOM 测试**、TypeScript 检查和生产构建通过，前端部分已由导师复跑验证。B 批在批准预算内调用真实模型验证了“看解答后作答”评价依据与练习去重；“补充后重新评价”的真实模型两轮样本未覆盖，由模型替身集成测试覆盖。功能已通过用户体验验收。更早的 F005 证据：真实进程验证包括：v1 演示库迁移到 v2 后 3 个旧会话和 5 个轮次完整；真实模型 23 次调用（文字题、错误解法、清晰图片、模糊图片、纠正、追问、查询、记录纠正等）；Vite 代理下健康检查、查询、手动筛选和 PDF 下载，下载文件 SHA-256 与原件一致；浏览器实际操作文字题、图片上传、记录、错题列表/详情、纠正、删除、刷新和后端重启恢复；F004 旧会话在浏览器中仍可打开。停止/中断、保存失败、非法图片、跨会话附件、迁移失败和数据库故障由自动化用例覆盖。上述结果为 Harness 自检，不等同于导师审阅或用户体验验收；真实调用数量与未验证项见任务实现报告。
 
 ## 参考项目
 

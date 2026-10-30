@@ -37,6 +37,7 @@ def build_chat_model(
     timeout: float,
     json_mode: bool = True,
     http_async_client: Any | None = None,
+    stream_usage: bool = False,
 ) -> ChatOpenAI:
     extra_body: dict[str, Any] = {
         "thinking": {"type": "disabled"},
@@ -44,6 +45,9 @@ def build_chat_model(
     }
     if json_mode:
         extra_body["response_format"] = {"type": "json_object"}
+    if stream_usage:
+        # 流式响应默认不带 usage；最终回复需要按实际 token 记录调用量。
+        extra_body["stream_options"] = {"include_usage": True}
 
     return ChatOpenAI(
         model=settings.model,

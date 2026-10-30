@@ -213,12 +213,9 @@ class FakeScheduler:
     async def plan(self, query: str, **kwargs) -> ScheduleDecision:
         self.calls.append({"query": query, **kwargs})
         if not self._decisions:
-            # 默认返回空或澄清
-            return ScheduleDecision(
-                actions=[ActionPlan(action="clarify_or_reply", reason="默认兜底回复")],
-                assistant_reply="请问有什么可以帮您？",
-                suggested_actions=["查试卷", "辅导题目"],
-            )
+            # 脚本用尽 = 模型主动收尾：原生工具调用里“不再返回 tool_calls”
+            # 就是结束信号，此时不应再硬塞一个澄清动作。
+            return ScheduleDecision(actions=[], assistant_reply="好的。")
         item = self._decisions.pop(0)
         if isinstance(item, QueryError):
             raise item

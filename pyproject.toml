@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115,<1.0",
+    "fastembed>=0.5,<1.0",
+    "jieba>=0.42,<1.0",
     "langchain-openai>=1.7,<2.0",
     "langgraph>=1.2,<2.0",
     "openai>=3.37,<4.0",
@@ -13,6 +15,7 @@ dependencies = [
     "pydantic>=2.9,<3.0",
     "python-dotenv>=1.2,<2.0",
     "python-multipart>=0.0.20",
+    "qdrant-client>=1.12,<2.0",
     "uvicorn[standard]>=0.32,<1.0",
 ]
 
@@ -23,6 +26,10 @@ dev = [
     "httpx>=0.28,<1.0",
     "pytest>=8.3,<9.0",
     "httpx2>=2.16,<3.0",
+]
+# F007 P0：离线抽取工具链。运行时不导入 PyMuPDF，因此仍留在可选组。
+ingest = [
+    "pymupdf>=1.26,<3.0",
 ]
 
 [tool.pytest.ini_options]

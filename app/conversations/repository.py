@@ -22,6 +22,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -51,6 +52,13 @@ from app.conversations.models import (
     TurnError,
 )
 from app.querying.models import ResultEvent
+from app.questions.cards import HIDDEN_FIELDS as QUESTION_ANSWER_FIELDS
+from app.questions.models import (
+    ExerciseSourceView,
+    QuestionCard,
+    QuestionSelection,
+    RecordSourceView,
+)
 from app.tutoring.models import AttachmentView, Explanation, Source, TutoringResult
 
 logger = logging.getLogger(__name__)
@@ -418,7 +426,7 @@ class ConversationRepository:
             payload = _json_load(row["output_json"], {}) if row["output_json"] else {}
             payload["_recovery"] = recovery
             connection.execute(
-                "UPDATE conversation_turns SET output_json=?, kind=CASE WHEN ?=1 THEN 'dynamic' ELSE kind END WHERE conversation_id=? AND request_id=?",
+                "UPDATE conversation_turns SET output_json=?, kind=CASE WHEN ?>=1 THEN 'dynamic' ELSE kind END WHERE conversation_id=? AND request_id=?",
                 (json.dumps(payload, ensure_ascii=False), recovery.get("version", 0), conversation_id, request_id),
             )
 
@@ -1172,6 +1180,10 @@ class ConversationRepository:
     ) -> ProblemRecord:
         """插入新题或纠正版本，并让旧活动题目让位。不结束轮次。"""
 
+        connection.execute(
+            "UPDATE question_selections SET active = 0 WHERE conversation_id = ?",
+            (conversation_id,),
+        )
         problem_id = str(uuid.uuid4())
         if problem.root_problem_id is None:
             root_id = problem_id
@@ -2000,6 +2012,10 @@ class ConversationRepository:
         composite_results = []
         assistant_message = None
         suggestions = []
+        question_results: list[QuestionCard] = []
+        question_result_status: str | None = None
+        question_result_message: str | None = None
+        question: QuestionCard | None = None
         recovery = {}
 
         if row["output_json"]:
@@ -2036,6 +2052,15 @@ class ConversationRepository:
                         if "tutoring" in raw_payload and raw_payload["tutoring"]:
                             with suppress(Exception):
                                 tutoring = _TUTORING_ADAPTER.validate_python(raw_payload["tutoring"])
+                        if "question_results" in raw_payload and raw_payload["question_results"]:
+                            for item in raw_payload["question_results"]:
+                                with suppress(Exception):
+                                    question_results.append(QuestionCard.model_validate(item))
+                        question_result_status = raw_payload.get("question_result_status")
+                        question_result_message = raw_payload.get("question_result_message")
+                        if raw_payload.get("question"):
+                            with suppress(Exception):
+                                question = QuestionCard.model_validate(raw_payload["question"])
             except (TypeError, ValueError, ValidationError) as exc:
                 raise ConversationStorageError(_CORRUPT_MESSAGE) from exc
 
@@ -2106,6 +2131,10 @@ class ConversationRepository:
                 tutoring=tutoring,
                 exercise=exercise,
                 evaluation=evaluation,
+                question_results=question_results,
+                question_result_status=question_result_status,  # type: ignore[arg-type]
+                question_result_message=question_result_message,
+                question=question,
                 composite_results=composite_results,
                 assistant_message=assistant_message,
                 suggestions=suggestions,
@@ -2304,6 +2333,46 @@ class ConversationRepository:
         ):
             raise ConversationNotFoundError("会话不存在。")
 
+    def update_turn_reply(
+        self,
+        conversation_id: str,
+        request_id: str,
+        *,
+        assistant_message: str,
+        reply_meta: dict[str, Any],
+        reply_input: dict[str, Any] | None = None,
+    ) -> None:
+        """只替换某一轮的正文与回复元数据，不触碰已保存的业务结果。
+
+        用于“回复生成失败/被截断后只重做正文”：工具调用不会再次执行，
+        因此不会重复保存错题、重复生成练习或重复写入作答。
+        """
+
+        with self._write() as connection:
+            row = connection.execute(
+                """
+                SELECT output_json FROM conversation_turns
+                WHERE conversation_id = ? AND request_id = ?
+                """,
+                (conversation_id, request_id),
+            ).fetchone()
+            if row is None:
+                raise ConversationConflictError("该轮次不存在，无法重新生成回复。")
+            payload = json.loads(row["output_json"] or "{}")
+            payload["assistant_message"] = assistant_message
+            recovery = payload.get("_recovery") or {}
+            recovery["reply"] = reply_meta
+            if reply_input is not None:
+                recovery["reply_input"] = reply_input
+            payload["_recovery"] = recovery
+            connection.execute(
+                """
+                UPDATE conversation_turns SET output_json = ?
+                WHERE conversation_id = ? AND request_id = ?
+                """,
+                (json.dumps(payload, ensure_ascii=False), conversation_id, request_id),
+            )
+
     def complete_dynamic_turn(
         self,
         conversation_id: str,
@@ -2317,8 +2386,13 @@ class ConversationRepository:
         composite_results: list[ActionResultItem] | None = None,
         assistant_message: str | None = None,
         suggestions: list[SuggestionItem] | None = None,
+        question_results: list[QuestionCard] | None = None,
+        question_result_status: str | None = None,
+        question_result_message: str | None = None,
+        question: QuestionCard | None = None,
         problem_id: str | None = None,
         exercise_id: str | None = None,
+        question_context: dict[str, Any] | None = None,
     ) -> None:
         result_json = None
         if result is not None:
@@ -2341,6 +2415,23 @@ class ConversationRepository:
             output_payload["suggestions"] = [
                 it.model_dump(mode="json") for it in suggestions
             ]
+        if question_results:
+            output_payload["question_results"] = [
+                it.model_dump(mode="json", exclude=QUESTION_ANSWER_FIELDS)
+                for it in question_results
+            ]
+        if question_result_status is not None:
+            output_payload["question_result_status"] = question_result_status
+        if question_result_message is not None:
+            output_payload["question_result_message"] = question_result_message
+        if question is not None:
+            output_payload["question"] = question.model_dump(
+                mode="json", exclude=QUESTION_ANSWER_FIELDS
+            )
+        if question_context:
+            # 当前试卷 / 题型 / 总数 / 浏览位置：下一轮“刚刚那张卷”“继续”的依据。
+            # 只随成功的查题/浏览写入，空结果不覆盖上一次的有效事实。
+            output_payload["question_context"] = question_context
 
         output_json = (
             json.dumps(output_payload, ensure_ascii=False) if output_payload else None
@@ -3253,6 +3344,7 @@ class ConversationRepository:
             revealed_solution_at=revealed_at,
             answered_after_revealed=flag,
             evaluation=parsed_eval,
+            source_question=self.get_exercise_question_source(exercise.id),
             reference_solution_text=ref_sol,
             attachments=attachments_view(attachments_source),
             attempts=attempts,
@@ -3365,6 +3457,464 @@ class ConversationRepository:
                 "UPDATE problems SET self_reported_understood = ?, updated_at = ? WHERE id = ?",
                 (1 if understood else 0, now, problem_id),
             )
+
+    # ------------------------------------------------------------------
+    # 真题选中与来源（F007 P4）
+    # ------------------------------------------------------------------
+
+    def create_question_selection(
+        self,
+        *,
+        conversation_id: str,
+        request_id: str,
+        source_request_id: str,
+        card: QuestionCard,
+        build_id: str,
+        source_version: str,
+        problem_id: str | None = None,
+        activate: bool = True,
+    ) -> QuestionSelection:
+        """记录一次真题选中，并把同会话其它选中置为非当前。
+
+        同一 (conversation, request, question) 重放时幂等返回原记录，避免重试
+        产生重复选中。
+        """
+
+        now = _now()
+        snapshot_json = json.dumps(card.public_snapshot(), ensure_ascii=False)
+        with self._write() as connection:
+            self._check_conversation_exists(connection, conversation_id)
+            existing = connection.execute(
+                """
+                SELECT * FROM question_selections
+                WHERE conversation_id = ? AND request_id = ? AND question_id = ?
+                """,
+                (conversation_id, request_id, card.question_id),
+            ).fetchone()
+            if existing is not None:
+                if activate and not existing["active"]:
+                    connection.execute(
+                        "UPDATE question_selections SET active = 0, updated_at = ? "
+                        "WHERE conversation_id = ? AND active = 1",
+                        (now, conversation_id),
+                    )
+                    connection.execute(
+                        "UPDATE question_selections SET active = 1, updated_at = ? "
+                        "WHERE id = ?",
+                        (now, existing["id"]),
+                    )
+                row = connection.execute(
+                    "SELECT * FROM question_selections WHERE id = ?",
+                    (existing["id"],),
+                ).fetchone()
+                return self._row_to_question_selection(row)
+
+            # 同一道题已在本会话出现过时复用原选中：保留已绑定题目、首次
+            # 开放答案的时间与来源，避免“看答案/再选一次”把绑定冲掉。
+            reusable = connection.execute(
+                """
+                SELECT * FROM question_selections
+                WHERE conversation_id = ? AND question_id = ?
+                  AND build_id = ? AND content_sha256 = ?
+                ORDER BY active DESC, created_at DESC
+                LIMIT 1
+                """,
+                (
+                    conversation_id,
+                    card.question_id,
+                    build_id,
+                    card.content_sha256,
+                ),
+            ).fetchone()
+            if reusable is not None:
+                if activate:
+                    connection.execute(
+                        "UPDATE question_selections SET active = 0, updated_at = ? "
+                        "WHERE conversation_id = ? AND active = 1 AND id <> ?",
+                        (now, conversation_id, reusable["id"]),
+                    )
+                    connection.execute(
+                        "UPDATE question_selections SET active = 1, updated_at = ? "
+                        "WHERE id = ?",
+                        (now, reusable["id"]),
+                    )
+                row = connection.execute(
+                    "SELECT * FROM question_selections WHERE id = ?",
+                    (reusable["id"],),
+                ).fetchone()
+                return self._row_to_question_selection(row)
+
+            if activate:
+                connection.execute(
+                    "UPDATE question_selections SET active = 0, updated_at = ? "
+                    "WHERE conversation_id = ? AND active = 1",
+                    (now, conversation_id),
+                )
+            selection_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO question_selections (
+                    id, conversation_id, request_id, source_request_id,
+                    question_id, paper_id, build_id, source_version, content_sha256,
+                    question_type, number_label, snapshot_json, problem_id,
+                    active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    selection_id,
+                    conversation_id,
+                    request_id,
+                    source_request_id,
+                    card.question_id,
+                    card.source.paper_id,
+                    build_id,
+                    source_version,
+                    card.content_sha256,
+                    card.question_type,
+                    card.number_label,
+                    snapshot_json,
+                    problem_id,
+                    int(activate),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM question_selections WHERE id = ?",
+                (selection_id,),
+            ).fetchone()
+            return self._row_to_question_selection(row)
+
+    def get_active_question(self, conversation_id: str) -> QuestionSelection | None:
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT * FROM question_selections "
+                "WHERE conversation_id = ? AND active = 1",
+                (conversation_id,),
+            ).fetchone()
+        return None if row is None else self._row_to_question_selection(row)
+
+    def find_question_context(
+        self, conversation_id: str, *, require_paper: bool = True
+    ) -> dict[str, Any] | None:
+        """最近一次查题/浏览留下的试卷与浏览位置。
+
+        只认成功的记录：失败的查询不会写这个字段，所以“查无结果”不会把
+        “刚刚那张卷”的指向清掉。刷新、重启后同样从库里恢复。
+        ``require_paper=False`` 时也接受只带检索条件（关键词、题型）的记录，
+        供“换一道”继承上一次的检索条件。
+        """
+
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT output_json FROM conversation_turns "
+                "WHERE conversation_id = ? AND output_json IS NOT NULL "
+                "ORDER BY seq DESC, rowid DESC LIMIT 50",
+                (conversation_id,),
+            ).fetchall()
+        for row in rows:
+            payload = _json_load(row["output_json"], {})
+            context = payload.get("question_context") if isinstance(payload, dict) else None
+            if not isinstance(context, dict):
+                continue
+            if context.get("paper_id") or (
+                not require_paper
+                and (context.get("query") or context.get("question_type"))
+            ):
+                return context
+        return None
+
+    def get_question_selection(
+        self, conversation_id: str, question_id: str, *, build_id: str | None = None
+    ) -> QuestionSelection | None:
+        with self._read() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM question_selections
+                WHERE conversation_id = ? AND question_id = ?
+                  AND (? IS NULL OR build_id = ?)
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """,
+                (conversation_id, question_id, build_id, build_id),
+            ).fetchone()
+        return None if row is None else self._row_to_question_selection(row)
+
+    def get_question_selection_by_id(
+        self, conversation_id: str, selection_id: str
+    ) -> QuestionSelection | None:
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT * FROM question_selections WHERE id = ? AND conversation_id = ?",
+                (selection_id, conversation_id),
+            ).fetchone()
+        return None if row is None else self._row_to_question_selection(row)
+
+    def find_question_selection_for_card(
+        self,
+        conversation_id: str,
+        question_id: str,
+        build_id: str,
+        content_sha256: str,
+    ) -> QuestionSelection | None:
+        """按历史卡片的 build + 内容哈希找当时的选中事实。
+
+        旧轮次可能没有 selection_id；不能用“同题号的最新选择”代替，否则
+        历史题干会被新版本替换。
+        """
+
+        with self._read() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM question_selections
+                WHERE conversation_id = ? AND question_id = ?
+                  AND build_id = ? AND content_sha256 = ?
+                ORDER BY created_at ASC, rowid ASC LIMIT 1
+                """,
+                (conversation_id, question_id, build_id, content_sha256),
+            ).fetchone()
+        return None if row is None else self._row_to_question_selection(row)
+
+    def activate_question_selection(
+        self, conversation_id: str, selection_id: str
+    ) -> QuestionSelection | None:
+        now = _now()
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM question_selections WHERE id = ? AND conversation_id = ?",
+                (selection_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE question_selections SET active = 0, updated_at = ? "
+                "WHERE conversation_id = ? AND active = 1",
+                (now, conversation_id),
+            )
+            connection.execute(
+                "UPDATE question_selections SET active = 1, updated_at = ? WHERE id = ?",
+                (now, selection_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM question_selections WHERE id = ?", (selection_id,)
+            ).fetchone()
+            return self._row_to_question_selection(row)
+
+    def reveal_question_answer(
+        self,
+        conversation_id: str,
+        question_id: str,
+        *,
+        source: str,
+        selection_id: str | None = None,
+    ) -> QuestionSelection | None:
+        """只记录首次开放答案的事实；重复查看不覆盖首次时间与来源。"""
+
+        now = _now()
+        with self._write() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM question_selections
+                WHERE conversation_id = ? AND question_id = ?
+                  AND (? IS NULL OR id = ?)
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """,
+                (conversation_id, question_id, selection_id, selection_id),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE question_selections
+                SET answer_revealed_at = COALESCE(answer_revealed_at, ?),
+                    answer_reveal_source = COALESCE(answer_reveal_source, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, source, now, row["id"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM question_selections WHERE id = ?", (row["id"],)
+            ).fetchone()
+            return self._row_to_question_selection(row)
+
+    def bind_question_problem(self, selection_id: str, problem_id: str) -> None:
+        now = _now()
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE question_selections SET problem_id = ?, updated_at = ? WHERE id = ?",
+                (problem_id, now, selection_id),
+            )
+
+    def record_question_source_view(
+        self, selection_id: str, *, kind: str, page: int, may_show_answer: bool
+    ) -> None:
+        """来源查看事实存入已有选择快照，不改变题面、活动目标或数据库版本。"""
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json FROM question_selections WHERE id = ?", (selection_id,)
+            ).fetchone()
+            if row is None:
+                raise ConversationStorageError(_STORAGE_MESSAGE)
+            snapshot = json.loads(row["snapshot_json"])
+            views = snapshot.setdefault("source_views", [])
+            if not any(view["kind"] == kind and view["page"] == page for view in views):
+                views.append({"kind": kind, "page": page, "viewed_at": _now(),
+                              "may_show_answer": may_show_answer})
+                connection.execute(
+                    "UPDATE question_selections SET snapshot_json = ? WHERE id = ?",
+                    (json.dumps(snapshot, ensure_ascii=False), selection_id),
+                )
+
+    def save_exercise_question_source(
+        self,
+        *,
+        exercise_id: str,
+        card: QuestionCard,
+        build_id: str,
+        source_version: str,
+    ) -> ExerciseSourceView:
+        now = _now()
+        snapshot_json = json.dumps(card.public_snapshot(), ensure_ascii=False)
+        with self._write() as connection:
+            connection.execute(
+                """
+                INSERT INTO exercise_question_sources (
+                    exercise_id, question_id, paper_id, build_id, source_version,
+                    content_sha256, snapshot_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(exercise_id) DO UPDATE SET
+                    question_id = excluded.question_id,
+                    paper_id = excluded.paper_id,
+                    build_id = excluded.build_id,
+                    source_version = excluded.source_version,
+                    content_sha256 = excluded.content_sha256,
+                    snapshot_json = excluded.snapshot_json
+                """,
+                (
+                    exercise_id,
+                    card.question_id,
+                    card.source.paper_id,
+                    build_id,
+                    source_version,
+                    card.content_sha256,
+                    snapshot_json,
+                    now,
+                ),
+            )
+        return ExerciseSourceView(
+            question_id=card.question_id,
+            paper_id=card.source.paper_id,
+            paper_title=card.source.paper_title,
+            number_label=card.number_label,
+            question_type=card.question_type,
+            build_id=build_id,
+            source_version=source_version,
+            content_sha256=card.content_sha256,
+        )
+
+    def get_exercise_question_source(
+        self, exercise_id: str
+    ) -> ExerciseSourceView | None:
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT * FROM exercise_question_sources WHERE exercise_id = ?",
+                (exercise_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        snapshot: dict[str, Any] = {}
+        with suppress(Exception):
+            snapshot = json.loads(row["snapshot_json"])
+        source = snapshot.get("source") or {}
+        return ExerciseSourceView(
+            question_id=row["question_id"],
+            paper_id=row["paper_id"],
+            paper_title=source.get("paper_title"),
+            number_label=snapshot.get("number_label"),
+            question_type=snapshot.get("question_type"),
+            build_id=row["build_id"],
+            source_version=row["source_version"],
+            content_sha256=row["content_sha256"],
+        )
+
+    def save_record_question_source(
+        self,
+        *,
+        record_id: str,
+        card: QuestionCard,
+        build_id: str,
+        source_version: str,
+    ) -> None:
+        now = _now()
+        with self._write() as connection:
+            connection.execute(
+                """
+                INSERT INTO record_question_sources (
+                    record_id, question_id, paper_id, build_id, source_version,
+                    content_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_id) DO UPDATE SET
+                    question_id = excluded.question_id,
+                    paper_id = excluded.paper_id,
+                    build_id = excluded.build_id,
+                    source_version = excluded.source_version,
+                    content_sha256 = excluded.content_sha256
+                """,
+                (
+                    record_id,
+                    card.question_id,
+                    card.source.paper_id,
+                    build_id,
+                    source_version,
+                    card.content_sha256,
+                    now,
+                ),
+            )
+
+    def get_record_question_source(self, record_id: str) -> RecordSourceView | None:
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT * FROM record_question_sources WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return RecordSourceView(
+            question_id=row["question_id"],
+            paper_id=row["paper_id"],
+            build_id=row["build_id"],
+            source_version=row["source_version"],
+            content_sha256=row["content_sha256"],
+        )
+
+    @staticmethod
+    def _row_to_question_selection(row: sqlite3.Row) -> QuestionSelection:
+        try:
+            snapshot = json.loads(row["snapshot_json"])
+            if not isinstance(snapshot, dict):
+                raise ValueError("快照不是对象")
+            return QuestionSelection(
+                id=row["id"],
+                conversation_id=row["conversation_id"],
+                request_id=row["request_id"],
+                source_request_id=row["source_request_id"],
+                question_id=row["question_id"],
+                paper_id=row["paper_id"],
+                build_id=row["build_id"],
+                source_version=row["source_version"],
+                content_sha256=row["content_sha256"],
+                question_type=row["question_type"],
+                number_label=row["number_label"],
+                snapshot=snapshot,
+                problem_id=row["problem_id"],
+                answer_revealed_at=row["answer_revealed_at"],
+                answer_reveal_source=row["answer_reveal_source"],
+                active=bool(row["active"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+        except (ValueError, TypeError) as exc:
+            raise ConversationStorageError(_CORRUPT_MESSAGE) from exc
 
     @staticmethod
     def _row_to_context(row: sqlite3.Row) -> ContextRecord:

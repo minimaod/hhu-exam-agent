@@ -52,6 +52,18 @@ def _isolate_study_db(
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_question_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认测试不加载真实题库/Qdrant；需要真题的用例自行替换运行时。"""
+
+    from app.questions.runtime import QuestionRuntime
+
+    monkeypatch.setattr(
+        "app.main.build_question_runtime",
+        lambda: QuestionRuntime(None, error="测试环境未启用题目库"),
+    )
+
+
 @pytest.fixture
 def study_db_path(tmp_path: Path) -> Path:
     """当前用例使用的隔离数据库路径；多次启动应用会复用同一个文件。"""

@@ -1,11 +1,17 @@
-"""本地学习数据库的结构与迁移（当前 v4）。
+"""本地学习数据库的结构与迁移（当前 v5）。
 
 只有两种数据库允许写入：真正的空库，或结构与目标版本完全兼容的库。旧版
-数据库在单个事务中逐级迁移到 v4；任何未知结构、损坏或迁移失败都只返回
+数据库在单个事务中逐级迁移到 v5；任何未知结构、损坏或迁移失败都只返回
 ConversationStorageError，不删除、不清空、不覆盖原文件。
 
 v4 在 v3 基础上增加练习的“作答尝试”历史：首次作答、补充和订正分别保存为
 不可变尝试行，评价只写回对应尝试，不覆盖旧答案与旧评价。
+
+v5（F007 P4）只追加三张表，不改旧列：
+- question_selections：会话当前选中的真题、公开快照与答案开放事实；
+- exercise_question_sources：练习到真题的稳定关联；
+- record_question_sources：正式错题到真题的稳定关联。
+答案正文不进入本库；读取时按 build 从只读题库取。
 
 迁移步骤：
 1. 校验来源版本的表、列、主键、唯一约束和运行中唯一索引；
@@ -24,7 +30,7 @@ from app.conversations.inputs import query_input
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _STORAGE_MESSAGE = "本地学习数据暂时不可用，请稍后再试。"
 _UPGRADE_MESSAGE = "本地学习数据的结构版本不兼容，请保留原文件并联系维护者。"
@@ -370,6 +376,85 @@ _V4_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = {
     ),
     "exercise_attempt_attachments": (
         "rolein('student_solution','student_answer')",
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# v5 结构（F007 P4：真题选中、练习来源、错题来源）
+# ---------------------------------------------------------------------------
+
+_V5_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V4_COLUMNS,
+    "question_selections": (
+        "id",
+        "conversation_id",
+        "request_id",
+        "source_request_id",
+        "question_id",
+        "paper_id",
+        "build_id",
+        "source_version",
+        "content_sha256",
+        "question_type",
+        "number_label",
+        "snapshot_json",
+        "problem_id",
+        "answer_revealed_at",
+        "answer_reveal_source",
+        "active",
+        "created_at",
+        "updated_at",
+    ),
+    "exercise_question_sources": (
+        "exercise_id",
+        "question_id",
+        "paper_id",
+        "build_id",
+        "source_version",
+        "content_sha256",
+        "snapshot_json",
+        "created_at",
+    ),
+    "record_question_sources": (
+        "record_id",
+        "question_id",
+        "paper_id",
+        "build_id",
+        "source_version",
+        "content_sha256",
+        "created_at",
+    ),
+}
+
+_V5_TABLES = frozenset(_V5_COLUMNS)
+_V5_INDEXES = frozenset(
+    _V4_INDEXES
+    | {
+        "question_selections_one_active",
+        "question_selections_conversation",
+    }
+)
+
+_V5_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V4_PRIMARY_KEYS,
+    "question_selections": ("id",),
+    "exercise_question_sources": ("exercise_id",),
+    "record_question_sources": ("record_id",),
+}
+
+_V5_UNIQUE_SETS = {
+    *_V4_UNIQUE_SETS,
+    ("conversation_id", "request_id", "question_id"),
+}
+
+_V5_FOREIGN_KEYS = set(_V4_FOREIGN_KEYS)
+
+_V5_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = {
+    **_V4_REQUIRED_CHECKS,
+    "question_selections": (
+        "question_typein('choice','fill','code')",
+        "answer_reveal_sourcein('view','explain')",
+        "activein(0,1)",
     ),
 }
 
@@ -873,12 +958,97 @@ def _v4_migration_statements() -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
+# v5 DDL（F007 P4）
+# ---------------------------------------------------------------------------
+
+_QUESTION_SELECTIONS = """
+CREATE TABLE IF NOT EXISTS question_selections (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    source_request_id TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    paper_id TEXT NOT NULL,
+    build_id TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    question_type TEXT NOT NULL CHECK (question_type IN ('choice', 'fill', 'code')),
+    number_label TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    problem_id TEXT REFERENCES problems(id) ON DELETE SET NULL,
+    answer_revealed_at TEXT,
+    answer_reveal_source TEXT CHECK (answer_reveal_source IN ('view', 'explain')),
+    active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (conversation_id, request_id, question_id)
+)
+"""
+
+_QUESTION_SELECTIONS_ONE_ACTIVE = """
+CREATE UNIQUE INDEX IF NOT EXISTS question_selections_one_active
+    ON question_selections(conversation_id) WHERE active = 1
+"""
+
+_QUESTION_SELECTIONS_CONVERSATION = """
+CREATE INDEX IF NOT EXISTS question_selections_conversation
+    ON question_selections(conversation_id, created_at)
+"""
+
+_EXERCISE_QUESTION_SOURCES = """
+CREATE TABLE IF NOT EXISTS exercise_question_sources (
+    exercise_id TEXT PRIMARY KEY REFERENCES exercises(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    paper_id TEXT NOT NULL,
+    build_id TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+_RECORD_QUESTION_SOURCES = """
+CREATE TABLE IF NOT EXISTS record_question_sources (
+    record_id TEXT PRIMARY KEY REFERENCES mistake_records(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    paper_id TEXT NOT NULL,
+    build_id TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+_CREATE_V5_STATEMENTS = (
+    *_CREATE_V4_STATEMENTS,
+    _QUESTION_SELECTIONS,
+    _QUESTION_SELECTIONS_ONE_ACTIVE,
+    _QUESTION_SELECTIONS_CONVERSATION,
+    _EXERCISE_QUESTION_SOURCES,
+    _RECORD_QUESTION_SOURCES,
+)
+
+_V5_MIGRATION_STATEMENTS = (
+    _QUESTION_SELECTIONS,
+    _QUESTION_SELECTIONS_ONE_ACTIVE,
+    _QUESTION_SELECTIONS_CONVERSATION,
+    _EXERCISE_QUESTION_SOURCES,
+    _RECORD_QUESTION_SOURCES,
+)
+
+
+def _v5_migration_statements() -> tuple[str, ...]:
+    return _V5_MIGRATION_STATEMENTS
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
 
 def initialize_database(db_path: Path) -> None:
-    """建库、校验或迁移到 v4，并恢复遗留运行中轮次。"""
+    """建库、校验或迁移到 v5，并恢复遗留运行中轮次。"""
 
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -894,22 +1064,28 @@ def initialize_database(db_path: Path) -> None:
 
         if version == 0:
             if not _user_objects(connection):
-                _create_v4(connection)
+                _create_v5(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v5(connection):
+                _adopt_version(connection, SCHEMA_VERSION)
                 _enable_wal(connection)
             elif _is_compatible_v4(connection):
-                _adopt_version(connection, SCHEMA_VERSION)
+                _migrate_v4_to_v5(connection)
                 _enable_wal(connection)
             elif _is_compatible_v3(connection):
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
                 _enable_wal(connection)
             elif _is_compatible_v2(connection):
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
                 _enable_wal(connection)
             elif _is_compatible_v1(connection):
                 _migrate_v1_to_v2(connection)
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
+                _migrate_v4_to_v5(connection)
                 _enable_wal(connection)
             else:
                 raise ConversationStorageError(_UNKNOWN_MESSAGE)
@@ -919,20 +1095,28 @@ def initialize_database(db_path: Path) -> None:
             _migrate_v1_to_v2(connection)
             _migrate_v2_to_v3(connection)
             _migrate_v3_to_v4(connection)
+            _migrate_v4_to_v5(connection)
             _enable_wal(connection)
         elif version == 2:
             if not _is_compatible_v2(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v2_to_v3(connection)
             _migrate_v3_to_v4(connection)
+            _migrate_v4_to_v5(connection)
             _enable_wal(connection)
         elif version == 3:
             if not _is_compatible_v3(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v3_to_v4(connection)
+            _migrate_v4_to_v5(connection)
+            _enable_wal(connection)
+        elif version == 4:
+            if not _is_compatible_v4(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v4_to_v5(connection)
             _enable_wal(connection)
         elif version == SCHEMA_VERSION:
-            if not _is_compatible_v4(connection):
+            if not _is_compatible_v5(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _enable_wal(connection)
         else:
@@ -1089,6 +1273,49 @@ def _is_compatible_v4(connection: sqlite3.Connection) -> bool:
             connection,
             table="problems",
             name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
+def _is_compatible_v5(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V5_TABLES) | set(_V5_INDEXES):
+        return False
+    if objects.get("turns_one_running") != "index":
+        return False
+    if objects.get("problems_one_active") != "index":
+        return False
+    if objects.get("question_selections_one_active") != "index":
+        return False
+    return (
+        _check_common(
+            connection,
+            columns=_V5_COLUMNS,
+            primary_keys=_V5_PRIMARY_KEYS,
+            unique_sets=_V5_UNIQUE_SETS,
+            foreign_keys=_V5_FOREIGN_KEYS,
+            required_checks=_V5_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
             column="conversation_id",
             where="whereactive=1",
         )
@@ -1272,6 +1499,19 @@ def _create_v4(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _CREATE_V4_STATEMENTS:
             connection.execute(statement)
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _create_v5(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V5_STATEMENTS:
+            connection.execute(statement)
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         connection.commit()
     except sqlite3.Error as exc:
@@ -1349,12 +1589,28 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
             connection.execute(statement)
         connection.execute(_V4_BACKFILL_ATTEMPTS)
         connection.execute(_V4_BACKFILL_ATTEMPT_ATTACHMENTS)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 4")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
             connection.rollback()
         logger.warning("本地学习数据库 v3→v4 迁移失败：%s", exc)
+        raise ConversationStorageError(_MIGRATION_MESSAGE) from exc
+
+
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """单事务升级：只追加真题选中、练习来源和错题来源三张表。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _v5_migration_statements():
+            connection.execute(statement)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        logger.warning("本地学习数据库 v4→v5 迁移失败：%s", exc)
         raise ConversationStorageError(_MIGRATION_MESSAGE) from exc
 
 

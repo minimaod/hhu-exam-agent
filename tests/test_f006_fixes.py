@@ -10,6 +10,7 @@
 """
 
 import json
+import logging
 from pathlib import Path
 from uuid import uuid4
 import pytest
@@ -55,8 +56,9 @@ def make_dummy_request() -> Request:
 class FakeAIMessage:
     """模拟 LangChain AIMessage，附带 usage_metadata 与 response_metadata。"""
 
-    def __init__(self, content: str):
+    def __init__(self, content: str, tool_calls: list[dict] | None = None):
         self.content = content
+        self.tool_calls = tool_calls or []
         self.response_metadata = {"model_name": "deepseek-chat", "finish_reason": "stop"}
         self.usage_metadata = {
             "input_tokens": 12,
@@ -68,13 +70,18 @@ class FakeAIMessage:
 class FakeChatModel:
     """模拟 LangChain ChatDeepSeek，接受 prompt 返回 FakeAIMessage。"""
 
-    def __init__(self, response_text: str):
+    def __init__(self, response_text: str, tool_calls: list[dict] | None = None):
         self._text = response_text
+        self._tool_calls = tool_calls
         self.invocations: list[list] = []
+
+    def bind_tools(self, tools, **kwargs):  # pragma: no cover - 仅保持接口一致
+        self.bound_tools = tools
+        return self
 
     async def ainvoke(self, messages, **kwargs):
         self.invocations.append(messages)
-        return FakeAIMessage(self._text)
+        return FakeAIMessage(self._text, self._tool_calls)
 
 
 def setup_service(tmp_path: Path):
@@ -165,36 +172,40 @@ async def test_deepseek_exercise_agent_usage_logging_with_real_structure():
 
 
 @pytest.mark.anyio
-async def test_scheduler_agent_usage_logging_with_real_structure():
-    """验证 SchedulerAgent 调用真实结构响应时不报 log_usage 参数错误。"""
-    decision_json = json.dumps(
+async def test_scheduler_agent_usage_logging_with_real_structure(caplog):
+    """验证 SchedulerAgent 调用真实结构响应（原生 tool_calls）时不报 log_usage 错误。"""
+    tool_calls = [
         {
-            "confirmed_course": "Python",
-            "actions": [{"action": "introduce", "parameters": {}, "reason": "初次介绍"}],
-            "assistant_reply": "已确认 Python，可以查卷或讲题。",
-            "suggested_actions": ["查期末卷"],
+            "id": "call_introduce_1",
+            "name": "confirm_course",
+            "args": {"course": "Python"},
+            "type": "tool_call",
         }
-    )
-    model = FakeChatModel(decision_json)
+    ]
+    model = FakeChatModel("", tool_calls=tool_calls)
     scheduler = SchedulerAgent(model=model)
 
-    dec = await scheduler.plan("我想复习 Python")
+    with caplog.at_level(logging.INFO, logger="app.llm"):
+        dec = await scheduler.plan("我想复习 Python")
+
     assert dec.confirmed_course == "Python"
-    assert dec.actions[0].action == "introduce"
+    assert [plan.action for plan in dec.actions] == ["introduce"]
+    assert dec.actions[0].tool_call_id == "call_introduce_1"
+    assert any("deepseek usage" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.anyio
 async def test_scheduler_overrides_category_with_detected_course():
     """模型把“转专业考试”误当成“通识选修课程”时，用确定性识别纠正。"""
-    decision_json = json.dumps(
+    tool_calls = [
         {
-            "confirmed_course": "通识选修课程",
-            "actions": [{"action": "introduce", "parameters": {}, "reason": "初次介绍"}],
-            "assistant_reply": "您要复习哪门课程？",
-            "suggested_actions": [],
+            "id": "call_introduce_2",
+            "name": "confirm_course",
+            "args": {"course": "通识选修课程"},
+            "type": "tool_call",
         }
-    )
-    scheduler = SchedulerAgent(model=FakeChatModel(decision_json))
+    ]
+    scheduler = SchedulerAgent(model=FakeChatModel("", tool_calls=tool_calls))
 
     dec = await scheduler.plan("我要复习转专业考试")
 
@@ -335,7 +346,9 @@ async def test_completed_dynamic_turn_is_fully_replayed(tmp_path: Path):
     prepared = svc.prepare_turn(c.id, t_input)
     events = [e async for e in svc.stream_prepared(prepared, make_dummy_request())]
     res1 = next(e for e in events if e.type == "result")
-    assert res1.assistant_message == "欢迎复习！"
+    # F008：工具决策阶段的散文不再作为正文；正文由真实执行结果生成，
+    # 回放必须与首次完全一致（下面比对）。
+    assert res1.assistant_message
 
     # 重复提交该 request_id，触发回放
     prep_replay = svc.prepare_turn(c.id, t_input)
@@ -343,7 +356,7 @@ async def test_completed_dynamic_turn_is_fully_replayed(tmp_path: Path):
     assert len(replay_events) == 1
     replay_res = replay_events[0]
     assert isinstance(replay_res, TurnResultEvent)
-    assert replay_res.assistant_message == "欢迎复习！"
+    assert replay_res.assistant_message == res1.assistant_message
     assert [s.label for s in replay_res.suggestions] == ["查试卷"]
 
 

@@ -8,6 +8,7 @@ import type {
   ExerciseAttemptView,
   ExerciseEvaluation,
   ExerciseView,
+  QuestionCard,
 } from "../lib/conversationsApi";
 
 function evaluation(overrides: Partial<ExerciseEvaluation> = {}): ExerciseEvaluation {
@@ -93,7 +94,66 @@ function renderTurn(props: Partial<ComponentProps<typeof ConversationTurn>> = {}
   );
 }
 
+function questionCard(overrides: Partial<QuestionCard> = {}): QuestionCard {
+  return {
+    question_id: "q-choice-1", build_id: "iv-0123456789abcdef", question_type: "choice",
+    number_label: "1", statement: "原卷 Python 特点题", content_sha256: "a".repeat(64),
+    options: [{ label: "A", text: "支持中文" }, { label: "B", text: "执行高效" }],
+    code_lines: [], blank_marks: [], formulas: [], assets: [], knowledge_points: [],
+    pages: { statement: [3], answer: [11] }, answer: { state: "original", available: true },
+    review: { status: "approved", approved: true, stale: false },
+    source: { paper_id: "paper", question_number: "1", may_show_answer: true }, content_issues: [],
+    ...overrides,
+  };
+}
+
 describe("会话轮次的展示修正", () => {
+  test("后续轮次只显示同版本题目引用，保留已查看事实和回主卡动作", () => {
+    const question = questionCard({ selected: true, answer_revealed: true,
+      answer_detail: { state: "original", text: "ANSWER-ONCE" } });
+    const key = `${question.question_id}:${question.build_id}:${question.content_sha256}`;
+    const jump = vi.fn();
+    renderTurn({ turn: turn({ request_id: "followup", question }),
+      questionOwners: new Map([[key, "owner"]]), questionSnapshots: new Map([[key, question]]),
+      onJumpToQuestion: jump });
+    expect(screen.queryByText(question.statement)).toBeNull();
+    expect(screen.queryByText("ANSWER-ONCE")).toBeNull();
+    expect(screen.getByText("答案已查看")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "查看题目主卡" }));
+    expect(jump).toHaveBeenCalledWith(key);
+  });
+
+  test("跨轮主卡合并最新答案状态时仍保留原卡动作来源", () => {
+    const original = questionCard({ selected: true, source_request_id: "original-search" });
+    const key = `${original.question_id}:${original.build_id}:${original.content_sha256}`;
+    const onQuestionAction = vi.fn();
+    renderTurn({ turn: turn({ request_id: "owner", question: original }),
+      questionOwners: new Map([[key, "owner"]]),
+      questionSnapshots: new Map([[key, { ...original, source_request_id: "later-search",
+        answer_revealed: true, answer_detail: { state: "original", text: "A" } }]]), onQuestionAction });
+    fireEvent.click(screen.getByRole("button", { name: "保存到错题本" }));
+    expect(onQuestionAction.mock.calls[0][1].source_request_id).toBe("original-search");
+    expect(screen.getByText("参考答案（已查看，点击展开）")).toBeTruthy();
+  });
+  test("检索结果和自动选中同一版本时只显示一张，并可在这张卡提交答案", () => {
+    const candidate = questionCard();
+    const selected = questionCard({ selected: true });
+    const onQuestionAction = vi.fn();
+    renderTurn({ turn: turn({ question_results: [candidate], question: selected,
+      question_result_status: "ok" }), onQuestionAction });
+    expect(screen.getAllByText("原卷 Python 特点题")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "选第 1 道题" })).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "B. 执行高效" }));
+    fireEvent.click(screen.getByRole("button", { name: "提交并讲解" }));
+    expect(onQuestionAction).toHaveBeenCalledWith("answer", selected, "B");
+  });
+
+  test("同号不同版本不会被误合并", () => {
+    renderTurn({ turn: turn({ question_results: [questionCard()],
+      question: questionCard({ build_id: "iv-fedcba9876543210", statement: "另一版本题面" }) }) });
+    expect(screen.getByText("原卷 Python 特点题")).toBeTruthy();
+    expect(screen.getByText("另一版本题面")).toBeTruthy();
+  });
   test("内部动作名转成中文，重复的动作消息只出现一次", () => {
     const { container } = renderTurn({
       turn: turn({
@@ -301,5 +361,59 @@ describe("会话轮次的展示修正", () => {
     expect(onJump).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "回到题目并订正" }));
     expect(onCorrect).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("真题讲解正文与讲解卡片不重复展开", () => {
+  function explanationTurn(message: string) {
+    const problem = {
+      id: "problem-1",
+      root_problem_id: "root-1",
+      version: 1,
+      status: "explained",
+      clarity: "clear",
+      statement_text: "原卷 Python 特点题",
+      student_answer_text: null,
+      solution_text: null,
+      attachments: [],
+      source: { type: "none" as const },
+      self_reported_understood: false,
+      created_at: "2026-10-25T12:00:00+00:00",
+      updated_at: "2026-10-25T12:00:00+00:00",
+    };
+    return turn({
+      kind: "explain_question",
+      assistant_message: message,
+      tutoring: {
+        kind: "explanation" as const,
+        problem,
+        knowledge_points: [{ name: "列表推导", explanation: "先循环再收集" }],
+        steps: [{ index: 1, title: "识别形式", content: "这是列表推导式的固定写法" }],
+        final_answer: "B",
+        error_analysis: null,
+        uncertainties: [],
+        self_reported_understood: false,
+        record_id: null,
+      },
+    } as Partial<StoredTurn>);
+  }
+
+  test("正文已经讲完时，讲解卡片默认收起而不是再展开一遍", () => {
+    const body =
+      "这道题考的是列表推导式，先看循环范围，再看条件过滤，最后才是取值表达式。" +
+      "第一步把 for 的范围写对，第二步补上 if 条件，第三步把结果放进方括号里。" +
+      "注意不要在方括号里写 return，也不要把结果拼成字符串。" +
+      "最后确认一下变量名，题目里给的变量叫 nums 和 limit，不要自己另起名字，" +
+      "也不要漏掉 if 后面的比较符号，很多同学会在这里丢分。";
+    renderTurn({ turn: explanationTurn(body) });
+    expect(screen.getByText(/正文已经完整讲解，需要时展开讲解卡片/)).toBeTruthy();
+    // 卡片里的步骤默认不展开，避免和正文重复。
+    expect(screen.queryByText("解题步骤")).toBeNull();
+  });
+
+  test("正文很短时仍然直接展示讲解卡片", () => {
+    renderTurn({ turn: explanationTurn("已讲解。") });
+    expect(screen.getByText("解题步骤")).toBeTruthy();
+    expect(screen.queryByText(/正文已经完整讲解/)).toBeNull();
   });
 });

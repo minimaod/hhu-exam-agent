@@ -195,7 +195,7 @@ export default function App() {
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_15%_0%,rgba(15,107,92,0.12),transparent_42%),radial-gradient(circle_at_95%_10%,rgba(180,134,56,0.12),transparent_38%)]"
       />
 
-      <main className="relative mx-auto flex h-full w-full max-w-6xl flex-col px-4 py-3 sm:px-6 sm:py-4">
+      <main className="relative mx-auto flex h-full w-full max-w-[1600px] flex-col px-3 py-2 sm:px-5 sm:py-3">
         <header className="flex shrink-0 flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2.5">
             <span className="grid h-9 w-9 place-items-center rounded-xl bg-river text-[11px] font-bold tracking-wide text-white shadow-sm">

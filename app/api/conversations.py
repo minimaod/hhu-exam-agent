@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from typing import Annotated, Callable, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.api.query import get_query_config
@@ -25,6 +25,7 @@ from app.conversations.models import (
     ExerciseView,
     TurnKind,
 )
+from app.conversations.reply import StreamingReply
 from app.conversations.service import (
     ConversationService,
     ConversationStoreState,
@@ -35,6 +36,8 @@ from app.mistakes.service import MistakeRecordService
 from app.papers.service import PaperService, get_paper_service
 from app.querying.llm import DeepSeekUnderstanding
 from app.querying.service import SSE_HEADERS, QueryService
+from app.questions.models import QuestionCard
+from app.questions.runtime import QuestionRuntime
 from app.sse import encode_sse_event
 from app.tutoring.llm import DeepSeekTutor
 from app.tutoring.models import Source
@@ -79,6 +82,11 @@ class TurnRequest(BaseModel):
     retry_of: UUID | None = None
     # 订正/补充是练习作答的增量行为；不指定时由服务端按现有尝试推断。
     attempt_kind: Literal["supplement", "correction"] | None = None
+    # 真题轮次：题目来自某次查题轮次的 question_results。
+    question_id: str | None = Field(default=None, max_length=200)
+    question_source_turn: UUID | None = None
+    # 卡片按钮的确定性动作；只允许针对 question_id 指定的题，避免串到当前题。
+    question_action: Literal["exercise", "record"] | None = None
 
     @field_validator("query")
     @classmethod
@@ -119,9 +127,31 @@ class TurnRequest(BaseModel):
             if (self.kind is not None or self.query or self.attachments or self.student_answer
                 or self.solution_text or self.problem_id or self.exercise_id
                 or self.start_new or self.source.type != "none"
-                or self.attempt_kind is not None):
+                or self.attempt_kind is not None or self.question_id
+                or self.question_source_turn is not None
+                or self.question_action is not None):
                 raise ValueError("重试只需提供 request_id 和 retry_of，原输入由服务端恢复。")
             return self
+        if self.question_action is not None:
+            if self.kind not in (None, "auto"):
+                raise ValueError("真题动作只能用于自动轮次。")
+            if not self.question_id or self.question_source_turn is None:
+                raise ValueError("真题动作必须提供 question_id 和 question_source_turn。")
+            if (self.attachments or self.student_answer or self.solution_text
+                    or self.problem_id or self.start_new
+                    or self.source.type != "none"):
+                raise ValueError("真题动作不能携带作答、图片或另一个题目引用。")
+            return self
+        if self.kind in ("select_question", "explain_question", "view_question_answer"):
+            if not self.question_id or self.question_source_turn is None:
+                raise ValueError("真题轮次必须提供 question_id 和 question_source_turn。")
+            if self.solution_text or self.attachments or (
+                self.student_answer and self.kind != "explain_question"
+            ):
+                raise ValueError("仅真题讲解可以携带所选答案；不支持附带图片或解题过程。")
+            return self
+        if self.question_id or self.question_source_turn is not None:
+            raise ValueError("只有真题轮次可以携带题目引用。")
         if self.kind in ("exercise", "exercise_answer") and (self.student_answer or self.solution_text):
             return self
         if self.query or self.attachments:
@@ -162,6 +192,7 @@ def get_conversation_service_state(
     make_router: Callable[[], DeepSeekIntentRouter] | None = None
     make_exercise_agent: Callable[[], DeepSeekExerciseAgent] | None = None
     make_scheduler: Callable[[], SchedulerAgent] | None = None
+    make_reply: Callable[[], StreamingReply] | None = None
     if settings is not None:
 
         def _make_query() -> QueryService:
@@ -182,11 +213,15 @@ def get_conversation_service_state(
         def _make_scheduler() -> SchedulerAgent:
             return SchedulerAgent(settings)
 
+        def _make_reply() -> StreamingReply:
+            return StreamingReply(settings)
+
         make_query = _make_query
         make_tutor = _make_tutor
         make_router = _make_router
         make_exercise_agent = _make_exercise_agent
         make_scheduler = _make_scheduler
+        make_reply = _make_reply
 
     records = MistakeRecordService(
         state.repository,
@@ -194,6 +229,9 @@ def get_conversation_service_state(
         make_tutor=make_tutor,
         tutoring_error=config.error,
         attachments_root=images.ATTACHMENTS_ROOT,
+    )
+    runtime: QuestionRuntime | None = getattr(
+        request.app.state, "question_runtime", None
     )
     return ConversationServiceState(
         service=ConversationService(
@@ -205,9 +243,11 @@ def get_conversation_service_state(
             make_router=make_router,
             make_exercise_agent=make_exercise_agent,
             make_scheduler=make_scheduler,
+            make_reply=make_reply,
             papers=papers,
             records=records,
             attachments_root=images.ATTACHMENTS_ROOT,
+            question_runtime=runtime,
         ),
         error=None,
     )
@@ -287,7 +327,7 @@ async def create_turn(
     data = TurnInput(
         request_id=str(payload.request_id),
         kind=None if payload.kind == "auto" else payload.kind,
-        dispatch=payload.kind == "auto",
+        dispatch=payload.kind == "auto" or payload.question_action is not None,
         text=payload.query,
         attachments=tuple(
             (str(item.id), item.role) for item in payload.attachments
@@ -304,6 +344,13 @@ async def create_turn(
         ),
         retry_of=str(payload.retry_of) if payload.retry_of is not None else None,
         attempt_kind=payload.attempt_kind,
+        question_id=payload.question_id,
+        question_source_turn=(
+            str(payload.question_source_turn)
+            if payload.question_source_turn is not None
+            else None
+        ),
+        question_action=payload.question_action,
     )
     prepared = service.prepare_turn(str(conversation_id), data)
 
@@ -316,6 +363,22 @@ async def create_turn(
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+
+
+@router.post(
+    "/conversations/{conversation_id}/turns/{request_id}/reply",
+    summary="只重新生成某一轮的正文，不重跑已完成的工具操作",
+)
+async def regenerate_turn_reply(
+    conversation_id: UUID,
+    request_id: UUID,
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> dict[str, object]:
+    service = require_service(state)
+    return await service.regenerate_reply(str(conversation_id), str(request_id))
 
 
 @router.post(
@@ -336,3 +399,77 @@ def reveal_exercise_solution(
         str(exercise_id), conversation_id=str(conversation_id)
     )
     return service._build_exercise_view(ex, allow_solution=True)
+
+
+_QUESTION_HEADERS = {
+    "Cache-Control": "private, no-store",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
+@router.get("/conversations/{conversation_id}/questions/{question_id}/source")
+def read_question_source(
+    conversation_id: UUID,
+    question_id: str,
+    build: Annotated[str, Query(min_length=1, max_length=100)],
+    kind: Literal["statement", "answer"],
+    page: Annotated[int, Query(ge=1)],
+    state: Annotated[ConversationServiceState, Depends(get_conversation_service_state)],
+    download: bool = False,
+) -> FileResponse:
+    payload = require_service(state).question_source(
+        str(conversation_id), question_id, build, kind, page
+    )
+    return FileResponse(
+        payload.path, media_type="application/pdf", filename="source.pdf",
+        content_disposition_type="attachment" if download else "inline", headers=_QUESTION_HEADERS,
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/questions/{question_id}/assets/{asset_id}",
+    summary="读取已选中真题的题面图片",
+)
+def read_question_asset(
+    conversation_id: UUID,
+    question_id: str,
+    asset_id: str,
+    build: Annotated[str, Query(min_length=1, max_length=100)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> Response:
+    """只允许本会话已选中的题目、且 build 与选中时一致。"""
+
+    payload = require_service(state).question_asset(
+        str(conversation_id), question_id, asset_id, build
+    )
+    return Response(
+        content=payload.path.read_bytes(),
+        media_type=payload.mime,
+        headers=_QUESTION_HEADERS,
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/questions/{question_id}/answer",
+    summary="读取已开放的真题答案",
+)
+def read_question_answer(
+    conversation_id: UUID,
+    question_id: str,
+    build: Annotated[str, Query(min_length=1, max_length=100)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> JSONResponse:
+    """未开放答案时 409；来源变化时 409/410，不返回答案正文。"""
+
+    card: QuestionCard = require_service(state).question_answer(
+        str(conversation_id), question_id, build
+    )
+    return JSONResponse(
+        content=card.model_dump(mode="json"), headers=_QUESTION_HEADERS
+    )

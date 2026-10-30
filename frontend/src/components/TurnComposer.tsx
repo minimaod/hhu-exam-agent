@@ -1,4 +1,4 @@
-import { useRef, type ChangeEvent, type ClipboardEvent, type KeyboardEvent } from "react";
+import { useLayoutEffect, useRef, type ChangeEvent, type ClipboardEvent, type KeyboardEvent } from "react";
 import type {
   AttachmentRole,
   ProblemView,
@@ -11,8 +11,6 @@ export type PendingFile = {
   role: AttachmentRole;
 };
 
-export type ComposerMode = "auto" | "supplement" | "correction" | "new";
-
 type TurnComposerProps = {
   value: string;
   running: boolean;
@@ -20,14 +18,12 @@ type TurnComposerProps = {
   disabledReason?: "no-conversation" | "loading" | null;
   confirmedCourse?: string | null;
   activeProblem: ProblemView | null;
-  mode: ComposerMode;
   files: PendingFile[];
   studentAnswer: string;
   solutionText: string;
   sourcePaperId: string;
   sourceOptions: PaperItem[];
   onChange: (value: string) => void;
-  onModeChange: (mode: ComposerMode) => void;
   onAddFiles: (files: File[], role: AttachmentRole) => void;
   onRemoveFile: (index: number) => void;
   onStudentAnswerChange: (value: string) => void;
@@ -64,14 +60,12 @@ export default function TurnComposer({
   disabledReason = null,
   confirmedCourse = null,
   activeProblem,
-  mode,
   files,
   studentAnswer,
   solutionText,
   sourcePaperId,
   sourceOptions,
   onChange,
-  onModeChange,
   onAddFiles,
   onRemoveFile,
   onStudentAnswerChange,
@@ -102,6 +96,13 @@ export default function TurnComposer({
   }
 
   const composingRef = useRef(false);
+  const textRef = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const element = textRef.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${Math.max(40, Math.min(160, element.scrollHeight))}px`;
+  }, [value]);
   const examples = examplesFor(confirmedCourse);
   const canSend = !running && !disabled && (value.trim().length > 0 || files.length > 0);
 
@@ -120,15 +121,11 @@ export default function TurnComposer({
   }
 
   const placeholder = activeProblem
-    ? mode === "correction"
-      ? "写出纠正后的完整题干，或只写改动部分"
-      : mode === "supplement"
-        ? "补充模糊的符号、条件，或换一张更清楚的图片"
-        : "围绕当前题目继续追问"
+    ? "围绕当前题目继续追问，或直接写出补充/纠正后的题干"
     : "输入完整题干、题目图片，或一句话复习需求";
 
   return (
-    <div className="rounded-2xl border border-river/20 bg-white/95 p-3 shadow-card backdrop-blur">
+    <div className="rounded-2xl border border-river/20 bg-white/95 p-2 shadow-card backdrop-blur">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-medium text-ink">
@@ -137,29 +134,9 @@ export default function TurnComposer({
               : "输入题目或复习需求"}
           </span>
           {activeProblem && (
-            <div className="flex flex-wrap gap-1">
-              {(
-                [
-                  ["auto", "追问"],
-                  ["supplement", "补充"],
-                  ["correction", "纠正"],
-                  ["new", "新题"],
-                ] as const
-              ).map(([key, label]) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => onModeChange(key)}
-                  className={`rounded-full border px-2 py-0.5 text-[10px] font-medium transition ${
-                    mode === key
-                      ? "border-river bg-river/10 text-river"
-                      : "border-slate-200 bg-slate-50 text-slate-600 hover:border-river/40"
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
+            <span className="text-[10px] text-slate-400">
+              说清补充、纠正或追问即可，不需要切换模式
+            </span>
           )}
         </div>
         <span className="text-[10px] text-slate-400">
@@ -168,7 +145,7 @@ export default function TurnComposer({
       </div>
 
       <form
-        className="mt-2"
+        className="mt-1"
         onSubmit={(event) => {
           event.preventDefault();
           if (!running && !disabled) {
@@ -177,7 +154,7 @@ export default function TurnComposer({
         }}
       >
         <div className="max-h-[34dvh] overflow-y-auto pr-1">
-          {!value.trim() && !running && !disabled && (
+          {!activeProblem && !value.trim() && !running && !disabled && (
             <div className="mb-2 flex flex-wrap items-center gap-1.5">
               <span className="text-[10px] text-slate-400">示例（固定）</span>
               {examples.map((example) => (
@@ -194,6 +171,7 @@ export default function TurnComposer({
           )}
 
           <textarea
+            ref={textRef}
             value={value}
             onChange={(event) => onChange(event.target.value)}
             onPaste={handlePaste}
@@ -204,7 +182,7 @@ export default function TurnComposer({
             onCompositionEnd={() => {
               composingRef.current = false;
             }}
-            rows={2}
+            rows={1}
             maxLength={2000}
             placeholder={placeholder}
             aria-keyshortcuts="Control+Enter Meta+Enter"
@@ -239,6 +217,10 @@ export default function TurnComposer({
             </div>
           )}
 
+          <details className="mt-1 rounded-lg border border-slate-200 bg-slate-50/50 px-2.5 py-1">
+          <summary className="cursor-pointer text-[11px] text-slate-600">
+            附件与补充信息{studentAnswer.trim() || solutionText.trim() || sourcePaperId ? "（有补充草稿）" : ""}
+          </summary>
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
             <label className="cursor-pointer rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50">
               题干图
@@ -288,11 +270,11 @@ export default function TurnComposer({
               />
             </div>
           </details>
-          {mode === "auto" && (studentAnswer.trim() || solutionText.trim() || sourcePaperId) && (
+          {studentAnswer.trim() || solutionText.trim() || sourcePaperId ? (
             <p role="status" className="mt-2 rounded-lg bg-amber-50 p-2 text-xs leading-5 text-amber-900">
-              已保留附加草稿；普通聊天不会发送这些答案、过程或来源，上方已选图片仍会随本条消息发送。需要提交答案或过程时，请明确选择新题、补充或纠正；练习作答请使用对应练习卡片。
+              已保留附加草稿；普通聊天不会自动发送这些答案、过程或来源。需要提交作答时请用当前练习卡片的提交入口，需要补充或纠正题干时直接在输入框说明。
             </p>
-          )}
+          ) : null}
 
           {activeProblem && sourceOptions.length > 0 && (
             <label className="mt-2 flex items-center gap-2 text-[11px] text-slate-500">
@@ -311,9 +293,10 @@ export default function TurnComposer({
               </select>
             </label>
           )}
+          </details>
         </div>
 
-        <div className="mt-2 flex items-center justify-between gap-2 border-t border-slate-100 pt-2">
+        <div className="mt-1 flex items-center justify-between gap-2 border-t border-slate-100 pt-1">
           <span className="text-[10px] text-slate-400">
             {running
               ? "正在处理，请稍候…"
@@ -338,7 +321,7 @@ export default function TurnComposer({
               disabled={running || disabled || (!value.trim() && files.length === 0)}
               className="inline-flex items-center rounded-lg bg-river px-4 py-1.5 text-xs font-medium text-white transition hover:bg-river/90 disabled:cursor-not-allowed disabled:bg-slate-400"
             >
-              {running ? "处理中…" : mode === "new" ? "开始新题" : "发送"}
+              {running ? "处理中…" : "发送"}
             </button>
           </div>
         </div>

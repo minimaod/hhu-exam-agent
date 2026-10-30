@@ -17,6 +17,10 @@ const ACTION_LABELS: Record<string, string> = {
   record_mistake: "保存到错题本",
   record_feedback: "记录理解情况",
   clarify_or_reply: "说明与确认",
+  search_questions: "查找真题",
+  select_question: "选择真题",
+  view_question_answer: "查看真题答案",
+  explain_question: "讲解真题",
 };
 
 export type ActionStatus = "success" | "failed" | "clarification";
