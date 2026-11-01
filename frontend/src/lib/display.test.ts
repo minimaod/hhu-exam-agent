@@ -11,10 +11,13 @@ import {
   formatExamDate,
   isCoveredText,
   isDuplicateText,
+  memoryValidityLabel,
+  memoryVerdictLabel,
   normalizeText,
 } from "./display.ts";
 
 test("内部动作名只显示中文，未知动作不原样泄露", () => {
+  assert.equal(actionLabel("list_paper_questions"), "浏览真题");
   assert.equal(actionLabel("query_papers"), "查找试卷");
   assert.equal(actionLabel("introduce"), "介绍可用能力");
   assert.equal(actionLabel("generate_exercise"), "生成练习");
@@ -22,6 +25,18 @@ test("内部动作名只显示中文，未知动作不原样泄露", () => {
   assert.equal(actionStatusLabel("failed"), "未完成");
   assert.equal(attemptKindLabel("correction"), "订正");
   assert.equal(attemptKindLabel(null), "本次作答");
+});
+
+test("学习记忆动作与证据等级只显示中文说明", () => {
+  assert.equal(actionLabel("review_memory"), "查看学习记忆");
+  assert.equal(actionLabel("correct_memory"), "纠正学习记忆");
+  assert.equal(actionLabel("delete_memory"), "移除学习记忆");
+  assert.equal(memoryVerdictLabel("wrong_independent"), "独立作答错误");
+  assert.equal(memoryVerdictLabel("after_reveal"), "看答案后作答");
+  assert.equal(memoryVerdictLabel("unclear"), "独立性未确认");
+  assert.equal(memoryVerdictLabel("something_new"), "记录待核对");
+  assert.equal(memoryValidityLabel("superseded"), "已被订正");
+  assert.equal(memoryValidityLabel(undefined), "待核对");
 });
 
 test("重复文案按全半角、空白和标点归一化后判断", () => {

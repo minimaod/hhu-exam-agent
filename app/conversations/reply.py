@@ -73,6 +73,8 @@ class ReplyMaterial:
     # 已在卡片里展示给学生、因此可以在正文里完整讲述的讲解内容。
     # 未授权的答案（练习参考解答、未查看的真题答案）不会进入这里。
     teaching: str | None = None
+    # F009：程序统计好的学习记忆事实。只描述记录，不含答案，也不含“掌握”结论。
+    learning_memory: str | None = None
 
     def describe(self) -> str:
         lines: list[str] = [f"【学生本轮发言】{self.user_text}"]
@@ -80,6 +82,9 @@ class ReplyMaterial:
             lines.append(f"【当前课程】{self.course}")
         if self.context_summary:
             lines.append(f"【最近对话】{self.context_summary[:600]}")
+        if self.learning_memory:
+            lines.append("【学习记忆（程序统计，只描述已有记录）】")
+            lines.append(self.learning_memory[:1200])
         if self.results:
             lines.append("【本轮工具执行结果】")
             for item in self.results:
@@ -156,9 +161,15 @@ _ACTION_LABELS = {
     "select_question": "选择真题",
     "view_question_answer": "查看真题答案",
     "clarify_or_reply": "澄清",
+    "review_memory": "查看学习记忆",
+    "correct_memory": "纠正学习记忆",
+    "delete_memory": "移除学习记忆",
 }
 
 _STATUS_LABELS = {"success": "成功", "failed": "未完成", "clarification": "待学生确认"}
+# 工具结果里的记忆附注：条数与总字数双重上限，避免提示被单类细节占满。
+_MEMORY_NOTE_LIMIT = 40
+_MEMORY_NOTE_CHARS = 1000
 
 
 def action_label(action: str) -> str:
@@ -185,6 +196,9 @@ def _describe_details(details: dict[str, Any]) -> str:
         parts.append("还有未显示的题目")
     if details.get("paper_title"):
         parts.append(f"试卷 {details['paper_title']}")
+    if details.get("download_url"):
+        # 正文只允许使用这里给出的真实链接；没有这个字段时不能自己拼。
+        parts.append(f"下载入口 {details['download_url']}")
     if details.get("course"):
         parts.append(f"课程 {details['course']}")
     if details.get("exam_type"):
@@ -193,8 +207,54 @@ def _describe_details(details: dict[str, Any]) -> str:
         parts.append(f"题目 {len(details['question_ids'])} 道")
     if details.get("record_id"):
         parts.append("已写入错题本")
+    if details.get("feedback_saved"):
+        parts.append("备注已实际保存：" + str(details.get("user_feedback") or ""))
+    elif details.get("record_id"):
+        parts.append("本次没有写入新备注，不得声称已保存备注")
+    if details.get("solution_image_count") is not None:
+        count = int(details["solution_image_count"])
+        parts.append(f"本次评价已读取 {count} 张解法图" if count else "本次评价未附解法图")
+    if details.get("followup_target"):
+        parts.append("追问对象：" + ("当前练习" if details["followup_target"] == "exercise" else "原题"))
     if details.get("exercise_id"):
-        parts.append("已生成练习")
+        parts.append("已关联练习")
+    if details.get("memory_course"):
+        parts.append(f"记忆课程 {details['memory_course']}")
+    if details.get("memory_entry_id"):
+        parts.append(f"记忆条目 {details['memory_entry_id']}")
+    if details.get("memory_removed") is not None:
+        parts.append("已从学习记忆移除" if details["memory_removed"] else "之前已移除过")
+    if details.get("memory_message"):
+        parts.append(str(details["memory_message"])[:200])
+    # 学习记忆的附注必须能进入正文提示：材料区有预算，工具结果里的附注不能
+    # 因为条目多就被丢掉。按条数与总字数双重上限，超出时如实说明还有多少条。
+    entries = details.get("memory_entries")
+    if isinstance(entries, list):
+        rendered = 0
+        used = 0
+        skipped = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            note = entry.get("note")
+            if not isinstance(note, str) or not note.strip():
+                continue
+            line = f"记忆条目 {entry.get('entry_id')} 附注 {note.strip()[:60]}"
+            if rendered >= _MEMORY_NOTE_LIMIT or used + len(line) > _MEMORY_NOTE_CHARS:
+                skipped += 1
+                continue
+            parts.append(line)
+            rendered += 1
+            used += len(line)
+        if skipped:
+            parts.append(f"另有 {skipped} 条记忆附注未列出")
+    single = details.get("memory_entry")
+    if isinstance(single, dict):
+        note = single.get("note")
+        if isinstance(note, str) and note.strip():
+            parts.append(
+                f"记忆条目 {single.get('entry_id')} 附注 {note.strip()[:60]}"
+            )
     if details.get("skipped"):
         parts.append("该步骤已跳过")
     if details.get("error_code"):
@@ -206,7 +266,7 @@ REPLY_SYSTEM_PROMPT = """你是河海大学考试复习助手的对话撰写者�
 题目卡片、来源、作答区只是附件，不能代替你把话讲清楚。
 
 规则：
-1. 只使用材料里的事实（数量、课程、题号、题型、保存结果、失败原因）；没有的事实不要编造，也不要输出下载链接。
+1. 只使用材料里的事实（数量、课程、题号、题型、保存结果、失败原因）；没有的事实不要编造。下载入口只写材料里给出的那一个，材料没有给出时不要自己拼链接，也不要说“下载按钮在卡片上”这类空话。
 2. 如果【本轮讲解】有内容，正文就是讲解本身：先用一两句说清思路，再按步骤讲关键推导，最后给出结论和易错点。不要只写“已生成讲解，请看卡片”。
 3. 没有讲解材料时，用一到三句话说明结果和下一步该做什么；不要空泛客套。
 4. 绝对不要泄露材料以外的答案、参考解答或关键步骤；学生没有主动查看答案时，连暗示都不行。
@@ -216,7 +276,10 @@ REPLY_SYSTEM_PROMPT = """你是河海大学考试复习助手的对话撰写者�
 8. 有【整卷浏览】时必须说清总数和本次范围（例如“这份卷的选择题一共 40 道，这次列出第 1 到第 10 道，还有 30 道没显示”），并告诉学生说“继续”就能看下一批；已经全部列出时明确说“已经列完”。不能把本次条数说成题目总数。
 9. 有【本轮题目材料】且学生问考点、题意或某个选项时，直接用材料里的题干、选项和已确认知识点回答；可以说“这道题主要考……”。知识点里标注为候选/未审核的要说明是题库待审核标签还是你的推断，不能把推断说成已审核结论。不要要求学生先作答才能听解释。
 10. 学生明确说“先自己做、不给答案”时，只确认题意范围或作答方式，不透露答案与关键步骤。
-11. 有【回答范围】时以它为准：只给提示时必须给出与题干相关的具体提示（考点方向、该看哪个条件、下一步先算什么），不能只用“你先试试”“加油”这类空话；只回答考点时说明考查的知识点及理由，不写完整解法、不给答案。"""
+11. 有【回答范围】时以它为准：只给提示时必须给出与题干相关的具体提示（考点方向、该看哪个条件、下一步先算什么），不能只用“你先试试”“加油”这类空话；只回答考点时说明考查的知识点及理由，不写完整解法、不给答案。
+12. 已完成的图片批改结果优先于旧对话里“没收到图片”的说法。评价阶段已读取图片时，依据其点评回答，不得因正文阶段没有图片而否认已收到；备注保存与否只按本轮实际写入结果说明。
+13. 本轮是查试卷时：唯一命中就说出卷名（含学年、学期、卷别，如“已找到 2024-2025 学年第一学期的《…期末试卷（A卷）》”）并给出下载入口；材料里已经有学年、学期、卷别时，不得再要求学生补充或确认这些条件。结果为空时如实说明哪个条件没有匹配，不要改列其他学年或学期的试卷；有多份候选时只问学生缺少的那个区分条件（例如 A 卷还是 B 卷）。
+14. 有【学习记忆】时：只用里面给出的知识点、次数和日期说事，按“独立作答被判错 > 看过解答后作答 > 独立性未确认 > 过程不足 > 还没作答 > 自述理解 > 独立做对（只提醒再确认）”的顺序给建议，最多三条。判错要说材料给的具体日期，不要说成“最近”如果材料标明“早于本窗口”或“只作历史回看”；旧版本依据不能当成当前结论。不要计算掌握率或用百分比，不要因为一次答对就说“你已经掌握”，要说“还需要再确认”；看过解答后的作答不能算独立掌握。学生问起课程归属或记录不对时，说明可以纠正或从记忆里移除；说明移除时原样说“从学习记忆和复习建议中移除，原会话记录保留。”。学习记忆暂时读不到时如实说读不到，不能说“没有记录”。"""
 
 
 class StreamingReply:
@@ -333,6 +396,7 @@ def build_material(
     suggestions: list[str] | None = None,
     context_summary: str | None = None,
     teaching: str | None = None,
+    learning_memory: str | None = None,
 ) -> ReplyMaterial:
     """把执行结果过滤成正文材料。
 
@@ -361,6 +425,7 @@ def build_material(
         suggestions=tuple(suggestions or ()),
         context_summary=context_summary,
         teaching=teaching,
+        learning_memory=learning_memory,
     )
 
 
@@ -387,6 +452,7 @@ def material_to_payload(material: ReplyMaterial) -> dict[str, Any]:
         "suggestions": list(material.suggestions),
         "context_summary": material.context_summary,
         "teaching": material.teaching,
+        "learning_memory": material.learning_memory,
     }
 
 
@@ -413,4 +479,5 @@ def material_from_payload(payload: dict[str, Any]) -> ReplyMaterial:
         suggestions=tuple(payload.get("suggestions") or ()),
         context_summary=payload.get("context_summary"),
         teaching=payload.get("teaching"),
+        learning_memory=payload.get("learning_memory"),
     )

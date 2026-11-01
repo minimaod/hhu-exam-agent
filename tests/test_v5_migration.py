@@ -62,7 +62,7 @@ def test_v4_migrates_to_v5_additively(tmp_path: Path) -> None:
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         tables = {
             row[0]
             for row in connection.execute(
@@ -106,7 +106,7 @@ def test_v4_migrates_to_v5_additively(tmp_path: Path) -> None:
 def test_newer_schema_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA user_version = 6")
+    connection.execute("PRAGMA user_version = 99")
     connection.close()
     with pytest.raises(ConversationStorageError):
         schema.initialize_database(path)

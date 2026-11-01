@@ -34,6 +34,7 @@ type ConversationTurnProps = {
   onRegenerateReply?: (turn: StoredTurn) => void;
   regeneratingReply?: boolean;
   exerciseDrafts?: Record<string, { answer: string; solution: string }>;
+  solutionImageNames?: string[];
   onExerciseDraftChange?: (exerciseId: string, draft: { answer: string; solution: string }) => void;
   onFeedback: (problem: ProblemView) => void;
   onRecord: (problem: ProblemView) => void;
@@ -189,6 +190,7 @@ export default function ConversationTurn({
   correctionToken = 0,
   busy,
   exerciseDrafts,
+  solutionImageNames,
   onExerciseDraftChange,
 }: ConversationTurnProps) {
   const tutoring = turn.tutoring;
@@ -237,7 +239,10 @@ export default function ConversationTurn({
   // 一次查题可同时返回候选和选中对象；同一版本只保留一张，选中快照优先。
   const questionKey = (card: NonNullable<StoredTurn["question"]>) =>
     `${card.question_id}:${card.build_id}:${card.content_sha256}`;
-  const questionRows = new Map((turn.question_results ?? []).map((card) => [questionKey(card), card]));
+  const selectedThisTurn = Boolean(turn.question?.selected && compositeItems.some((item) =>
+    item.status === "success" && item.action === "select_question"));
+  const candidates = selectedThisTurn && turn.question ? [turn.question] : (turn.question_results ?? []);
+  const questionRows = new Map(candidates.map((card) => [questionKey(card), card]));
   const selectedInResults = Boolean(turn.question && questionRows.has(questionKey(turn.question)));
   if (turn.question && selectedInResults) questionRows.set(questionKey(turn.question), turn.question);
   const references = new Map<string, QuestionCard>();
@@ -416,6 +421,7 @@ export default function ConversationTurn({
               onSubmitAnswer={onSubmitExerciseAnswer}
               onRevealSolution={onRevealExerciseSolution}
               draft={exerciseDrafts?.[exercise.id]}
+              solutionImageNames={solutionImageNames}
               onDraftChange={(draft) => onExerciseDraftChange?.(exercise.id, draft)}
             />
           )}

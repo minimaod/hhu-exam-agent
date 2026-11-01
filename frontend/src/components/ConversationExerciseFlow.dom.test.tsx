@@ -18,6 +18,11 @@ const { listConversations, getConversation, streamTurn, revealExerciseSolution }
     revealExerciseSolution: vi.fn(),
   }));
 
+const { uploadAttachment } = vi.hoisted(() => ({ uploadAttachment: vi.fn() }));
+vi.mock("../lib/attachmentsApi", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../lib/attachmentsApi")>(), uploadAttachment,
+}));
+
 vi.mock("../lib/conversationsApi", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/conversationsApi")>();
   return {
@@ -104,6 +109,38 @@ function turn(overrides: Partial<ConversationTurn>): ConversationTurn {
 }
 
 describe("练习展示：一张题目主卡 + 每次作答回执", () => {
+  test.each([false, true])("卡片提交解法图，保留主输入和题干图草稿（提交失败=%s）", async (fail) => {
+    URL.createObjectURL = vi.fn(() => "blob:exercise-image");
+    URL.revokeObjectURL = vi.fn();
+    const pending = exercise({ status: "pending_answer", student_answer_text: null,
+      student_solution_text: null, evaluation: null, attempts: [] });
+    const detail: ConversationDetail = { conversation: A, active_problem: null, record: null,
+      active_exercise: pending, turns: [turn({ exercise: pending })] };
+    listConversations.mockResolvedValue({ items: [A], total: 1 });
+    getConversation.mockResolvedValue(detail);
+    uploadAttachment.mockResolvedValue({ id: "solution-image", mime: "image/png", width: 100,
+      height: 100, size_bytes: 10, created_at: A.created_at });
+    if (fail) streamTurn.mockRejectedValueOnce(new Error("提交失败"));
+    else streamTurn.mockResolvedValueOnce({ type: "result", conversation_id: A.id,
+      request_id: "answer", kind: "exercise", business_status: "succeeded" });
+    render(<ConversationWorkspace onOpenRecord={vi.fn()} onDownload={vi.fn()} downloads={{}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /会话 A/ }));
+    await screen.findByLabelText("最终答案");
+    const composer = document.querySelector("textarea[maxlength='2000']") as HTMLTextAreaElement;
+    fireEvent.change(composer, { target: { value: "保留的主输入草稿" } });
+    fireEvent.change(screen.getByLabelText("解法图"), { target: { files: [new File(["image"], "solution.png", { type: "image/png" })] } });
+    fireEvent.change(screen.getByLabelText("题干图"), { target: { files: [new File(["image"], "statement.png", { type: "image/png" })] } });
+    expect(await screen.findByText(/本次提交将附上解法图：solution.png/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "提交作答并评价" }));
+    await waitFor(() => expect(streamTurn).toHaveBeenLastCalledWith(expect.objectContaining({
+      exerciseId: "exercise-1", kind: "exercise", attachments: [{ id: "solution-image", role: "solution" }],
+    })));
+    await waitFor(() => expect((screen.getByRole("button", { name: "提交作答并评价" }) as HTMLButtonElement).disabled).toBe(fail ? false : true));
+    expect((composer as HTMLTextAreaElement).value).toBe("保留的主输入草稿");
+    expect(screen.getByAltText("待上传题干图")).toBeTruthy();
+    expect(Boolean(screen.queryByAltText("待上传解法图"))).toBe(fail);
+  });
+
   test("生成轮保留主卡，作答轮只显示本次回执，订正回到主卡", async () => {
     const shared = exercise();
     const detail: ConversationDetail = {

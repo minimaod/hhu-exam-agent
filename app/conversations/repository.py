@@ -71,6 +71,9 @@ DEFAULT_TITLE = "新会话"
 TITLE_MAX_LENGTH = 30
 CONNECT_TIMEOUT_SECONDS = 5.0
 _VALID_ROLES = frozenset({"statement", "solution", "supplement"})
+# 明确的试卷状态：未定位（换卷失败）与待澄清（A/B 卷等）。它们优先于更早的
+# 成功记录，避免“旧卷复活”和“澄清条件丢失”。
+_PAPER_STATE_STATUSES = frozenset({"unlocated", "clarify_paper"})
 
 _STORAGE_MESSAGE = "本地学习数据暂时不可用，请稍后再试。"
 _CORRUPT_MESSAGE = "已保存的会话记录不完整，暂时无法恢复。"
@@ -3594,6 +3597,37 @@ class ConversationRepository:
             ).fetchone()
         return None if row is None else self._row_to_question_selection(row)
 
+    def _recent_question_contexts(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT output_json FROM conversation_turns "
+                "WHERE conversation_id = ? AND output_json IS NOT NULL "
+                "ORDER BY seq DESC, rowid DESC LIMIT 50",
+                (conversation_id,),
+            ).fetchall()
+        contexts: list[dict[str, Any]] = []
+        for row in rows:
+            payload = _json_load(row["output_json"], {})
+            context = payload.get("question_context") if isinstance(payload, dict) else None
+            if isinstance(context, dict) and context:
+                contexts.append(context)
+        return contexts
+
+    def find_paper_state(self, conversation_id: str) -> dict[str, Any] | None:
+        """最近一次“明确未定位/待澄清”的试卷状态（§7.7 R1、R2）。
+
+        这两种状态比更早的成功记录更要紧：换卷失败后不能悄悄回到旧卷，
+        歧义澄清也必须接着上一轮的候选范围继续。
+        """
+
+        for context in self._recent_question_contexts(conversation_id):
+            if context.get("status") in _PAPER_STATE_STATUSES:
+                return context
+            if context.get("paper_id"):
+                # 更新的成功定位已经覆盖了更早的未定位/待澄清标记。
+                return None
+        return None
+
     def find_question_context(
         self, conversation_id: str, *, require_paper: bool = True
     ) -> dict[str, Any] | None:
@@ -3603,20 +3637,14 @@ class ConversationRepository:
         “刚刚那张卷”的指向清掉。刷新、重启后同样从库里恢复。
         ``require_paper=False`` 时也接受只带检索条件（关键词、题型）的记录，
         供“换一道”继承上一次的检索条件。
+
+        例外是明确的试卷状态（未定位、待澄清）：它一旦出现就停止回退，
+        否则换卷失败后下一轮指代会读回更早的旧卷。
         """
 
-        with self._read() as connection:
-            rows = connection.execute(
-                "SELECT output_json FROM conversation_turns "
-                "WHERE conversation_id = ? AND output_json IS NOT NULL "
-                "ORDER BY seq DESC, rowid DESC LIMIT 50",
-                (conversation_id,),
-            ).fetchall()
-        for row in rows:
-            payload = _json_load(row["output_json"], {})
-            context = payload.get("question_context") if isinstance(payload, dict) else None
-            if not isinstance(context, dict):
-                continue
+        for context in self._recent_question_contexts(conversation_id):
+            if context.get("status") in _PAPER_STATE_STATUSES:
+                return None
             if context.get("paper_id") or (
                 not require_paper
                 and (context.get("query") or context.get("question_type"))

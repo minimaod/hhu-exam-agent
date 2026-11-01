@@ -32,16 +32,30 @@ EXPECTED_ACTIONS = {
     "save_mistake": "record_mistake",
     "record_feedback": "record_feedback",
     "ask_user": "clarify_or_reply",
+    "review_learning_memory": "review_memory",
+    "correct_learning_memory": "correct_memory",
+    "delete_learning_memory": "delete_memory",
 }
 
 
-def test_fourteen_tools_and_one_to_one_action_mapping() -> None:
-    """工具集合固定为 14 个，且与内部动作一一对应（不重复、不缺项）。"""
+def test_note_and_followup_target_are_typed_and_validated():
+    plan, error = parse_tool_call("save_mistake", {"user_feedback": "注意边界"}, tool_call_id="note")
+    assert error is None and plan.parameters["user_feedback"] == "注意边界"
+    _, error = parse_tool_call("save_mistake", {"user_feedback": "x" * 2001}, tool_call_id="long")
+    assert error is not None
+    plan, error = parse_tool_call("answer_followup", {"question": "为什么加一", "target": "exercise"}, tool_call_id="followup")
+    assert error is None and plan.parameters["target"] == "exercise"
+    _, error = parse_tool_call("answer_followup", {"question": "为什么", "target": "other"}, tool_call_id="invalid")
+    assert error is not None
 
-    assert len(TOOL_SPECS) == 14
+
+def test_seventeen_tools_and_one_to_one_action_mapping() -> None:
+    """工具集合固定为 17 个（F009 新增 3 个记忆工具），且与内部动作一一对应。"""
+
+    assert len(TOOL_SPECS) == 17
     assert {spec.name for spec in TOOL_SPECS} == set(EXPECTED_ACTIONS)
     assert {spec.action for spec in TOOL_SPECS} == set(EXPECTED_ACTIONS.values())
-    assert len({spec.action for spec in TOOL_SPECS}) == 14
+    assert len({spec.action for spec in TOOL_SPECS}) == 17
     for spec in TOOL_SPECS:
         assert spec.description.strip(), spec.name
         assert spec.args_model.model_json_schema()["type"] == "object"
@@ -51,7 +65,7 @@ def test_openai_schema_is_flat_and_declares_all_parameters() -> None:
     """工具定义可直接交给 bind_tools；参数模型字段与描述全部出现在 schema 中。"""
 
     payload = openai_tools()
-    assert len(payload) == 14
+    assert len(payload) == 17
     for item in payload:
         assert item["type"] == "function"
         function = item["function"]
@@ -158,5 +172,5 @@ def test_public_details_whitelist_blocks_answer_material() -> None:
 
 def test_tool_lookup_table_matches_specs() -> None:
     assert set(TOOLS_BY_NAME) == {spec.name for spec in TOOL_SPECS}
-    assert len(TOOLS_BY_NAME) == 14
+    assert len(TOOLS_BY_NAME) == 17
     assert TOOLS_BY_NAME["query_papers"].action == "query_papers"

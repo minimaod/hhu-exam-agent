@@ -11,6 +11,7 @@ type ExerciseCardProps = {
   exercise: ExerciseView;
   busy?: boolean;
   draft?: { answer: string; solution: string };
+  solutionImageNames?: string[];
   /** 已在别处（对应作答轮次）展示的尝试，不在本题主卡里重复。 */
   hiddenAttemptIds?: string[];
   /** 这些作答回执所在的轮次，用于告诉学生评价去哪里看。 */
@@ -126,6 +127,7 @@ export default function ExerciseCard({
   exercise,
   busy = false,
   draft,
+  solutionImageNames = [],
   hiddenAttemptIds,
   receiptSeqs,
   anchorId,
@@ -228,7 +230,7 @@ export default function ExerciseCard({
     if (!onSubmitAnswer || busy) return;
     const trimmedAns = answerInput.trim();
     const trimmedSol = solutionInput.trim();
-    if (!trimmedAns && !trimmedSol) return;
+    if (!trimmedAns && !trimmedSol && !solutionImageNames.length) return;
     onSubmitAnswer(exercise.id, trimmedAns, trimmedSol, attemptKind);
   };
 
@@ -424,10 +426,15 @@ export default function ExerciseCard({
             />
           </div>
 
+          <p className="text-xs text-slate-500">
+            {solutionImageNames.length
+              ? `本次提交将附上解法图：${solutionImageNames.join("、")}`
+              : "可在底部“附件与补充信息”添加解法图，再点击这里提交。"}
+          </p>
           <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
             <button
               type="submit"
-              disabled={busy || (!answerInput.trim() && !solutionInput.trim())}
+              disabled={busy || (!answerInput.trim() && !solutionInput.trim() && !solutionImageNames.length)}
               className="inline-flex items-center rounded-xl bg-indigo-600 px-4 py-2 text-xs font-medium text-white shadow-sm hover:bg-indigo-700 disabled:opacity-40"
             >
               {submitLabel}

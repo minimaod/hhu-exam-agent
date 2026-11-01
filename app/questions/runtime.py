@@ -207,7 +207,8 @@ class QuestionRuntime:
                     message="题目库暂时不可用，请稍后重试；仍可查看或下载原卷。",
                 )
             build_id = (response.build.build_id if response.build else None) or self.build_id or ""
-            paper_id, paper_title = _paper_of(response)
+            # 检索的试卷范围来自请求；单条命中的来源不能冒充整批筛选条件。
+            paper_id, paper_title = _paper_of(response) if request.paper_id else (None, None)
             paging = {
                 "total": response.matched_total,
                 "offset": response.offset,

@@ -40,6 +40,15 @@ function card(overrides: Partial<QuestionCard> = {}): QuestionCard {
 }
 
 describe("QuestionCardView", () => {
+  test("编程题参考代码保留正文和页码，隐藏 main 与内部列号", () => {
+    render(<QuestionCardView card={card({ question_type: "code", answer_revealed: true,
+      answer_detail: { state: "original", text: "原卷代码" },
+      code_blocks: [{ text: "print(12)", kind: "main", column: 0, page: 2, pages: [2], depends_on: [] }] })} />);
+    expect(screen.getByText("print(12)")).toBeTruthy();
+    expect(screen.queryByText("类型：main")).toBeNull();
+    expect(screen.queryByText("第 0 列")).toBeNull();
+  });
+
   test("已查看的参考答案默认折叠，候选卡不会重复展示答案正文", () => {
     const revealed = card({ answer_revealed: true, answer_detail: { state: "original", text: "ANSWER-BODY-ONCE" } });
     const { rerender } = render(<QuestionCardView card={revealed} />);

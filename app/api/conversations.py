@@ -33,6 +33,7 @@ from app.conversations.service import (
 )
 from app import images
 from app.mistakes.service import MistakeRecordService
+from app.memory.service import LearningMemoryService
 from app.papers.service import PaperService, get_paper_service
 from app.querying.llm import DeepSeekUnderstanding
 from app.querying.service import SSE_HEADERS, QueryService
@@ -233,6 +234,7 @@ def get_conversation_service_state(
     runtime: QuestionRuntime | None = getattr(
         request.app.state, "question_runtime", None
     )
+    memory = LearningMemoryService(state.repository.db_path, papers=papers)
     return ConversationServiceState(
         service=ConversationService(
             repository=state.repository,
@@ -246,6 +248,7 @@ def get_conversation_service_state(
             make_reply=make_reply,
             papers=papers,
             records=records,
+            memory=memory,
             attachments_root=images.ATTACHMENTS_ROOT,
             question_runtime=runtime,
         ),

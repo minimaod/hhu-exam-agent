@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import ConversationWorkspace from "./components/ConversationWorkspace";
+import LearningMemory from "./components/LearningMemory";
 import MistakeBook from "./components/MistakeBook";
 import PaperCard from "./components/PaperCard";
 import PaperFilters from "./components/PaperFilters";
@@ -13,7 +14,7 @@ import {
 } from "./lib/papersApi";
 import type { DownloadState, DownloadStates } from "./lib/display";
 
-type View = "conversations" | "mistakes" | "papers";
+type View = "conversations" | "memory" | "mistakes" | "papers";
 
 type PapersState =
   | { phase: "loading" }
@@ -36,6 +37,9 @@ const INITIAL_QUERY: SubmittedQuery = { course: "", examType: "all", seq: 0 };
 export default function App() {
   const [view, setView] = useState<View>("conversations");
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
+  const [openConversationId, setOpenConversationId] = useState<string | null>(
+    null,
+  );
 
   const [courseInput, setCourseInput] = useState("");
   const [examTypeInput, setExamTypeInput] = useState<ExamTypeFilter>("all");
@@ -186,6 +190,11 @@ export default function App() {
     setView("mistakes");
   }, []);
 
+  const openConversationFromMemory = useCallback((conversationId: string) => {
+    setOpenConversationId(conversationId);
+    setView("conversations");
+  }, []);
+
   const isLoading = papersState.phase === "loading";
 
   return (
@@ -213,6 +222,7 @@ export default function App() {
             {(
               [
                 ["conversations", "学习会话"],
+                ["memory", "学习记忆"],
                 ["mistakes", "错题本"],
                 ["papers", "试卷库"],
               ] as const
@@ -271,7 +281,14 @@ export default function App() {
               downloads={downloads}
               onDownload={handleDownload}
               onOpenRecord={openRecord}
+              openConversationId={openConversationId}
             />
+          )}
+
+          {view === "memory" && (
+            <div className="h-full min-h-0 overflow-y-auto pr-1">
+              <LearningMemory onOpenConversation={openConversationFromMemory} />
+            </div>
           )}
 
           {view === "mistakes" && (

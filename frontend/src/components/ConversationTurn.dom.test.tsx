@@ -108,6 +108,16 @@ function questionCard(overrides: Partial<QuestionCard> = {}): QuestionCard {
 }
 
 describe("会话轮次的展示修正", () => {
+  test("同轮成功锁定目标题后收起中间候选", () => {
+    const selected = questionCard({ selected: true });
+    const other = questionCard({ question_id: "q-choice-2", number_label: "2", statement: "中间候选不铺开" });
+    renderTurn({ turn: turn({ question_results: [selected, other], question: selected,
+      composite_results: [{ action: "search_questions", status: "success", message: "查到候选", details: {} },
+        { action: "select_question", status: "success", message: "已选中", details: {} }] }) });
+    expect(screen.getByText(selected.statement)).toBeTruthy();
+    expect(screen.queryByText(other.statement)).toBeNull();
+  });
+
   test("后续轮次只显示同版本题目引用，保留已查看事实和回主卡动作", () => {
     const question = questionCard({ selected: true, answer_revealed: true,
       answer_detail: { state: "original", text: "ANSWER-ONCE" } });

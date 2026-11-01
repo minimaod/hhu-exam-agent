@@ -18,9 +18,13 @@ const ACTION_LABELS: Record<string, string> = {
   record_feedback: "记录理解情况",
   clarify_or_reply: "说明与确认",
   search_questions: "查找真题",
+  list_paper_questions: "浏览真题",
   select_question: "选择真题",
   view_question_answer: "查看真题答案",
   explain_question: "讲解真题",
+  review_memory: "查看学习记忆",
+  correct_memory: "纠正学习记忆",
+  delete_memory: "移除学习记忆",
 };
 
 export type ActionStatus = "success" | "failed" | "clarification";
@@ -189,6 +193,32 @@ export function classifySuggestion(label: string): SuggestionIntent {
     return "practice";
   }
   return "chat";
+}
+
+/** 学习记忆的证据等级：只描述这一次记录，不换算成掌握率。 */
+const VERDICT_LABELS: Record<string, string> = {
+  wrong_independent: "独立作答错误",
+  correct_independent: "独立作答正确",
+  after_reveal: "看答案后作答",
+  insufficient: "证据不足",
+  unclear: "独立性未确认",
+  self_report: "学生自述",
+  no_attempt: "尚未作答",
+};
+
+export function memoryVerdictLabel(verdict: string | null | undefined): string {
+  return VERDICT_LABELS[verdict ?? ""] ?? "记录待核对";
+}
+
+const VALIDITY_LABELS: Record<string, string> = {
+  ok: "有效",
+  superseded: "已被订正",
+  unverified: "无法核对",
+  unavailable: "暂时读不到",
+};
+
+export function memoryValidityLabel(validity: string | null | undefined): string {
+  return VALIDITY_LABELS[validity ?? ""] ?? "待核对";
 }
 
 export type DownloadPhase = "downloading" | "triggered" | "error";

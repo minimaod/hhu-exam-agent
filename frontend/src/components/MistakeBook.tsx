@@ -198,7 +198,7 @@ export default function MistakeBook({ selectedId, onSelectRecord }: MistakeBookP
                       </p>
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] text-slate-500">
-                          第 {item.problem_version} 版
+                          来源题干第 {item.problem_version} 版
                         </span>
                         <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] text-slate-500">
                           {sourceLabel(item.source)}
@@ -773,7 +773,7 @@ function MistakeDetail({
           <h3 className="text-base font-semibold text-ink">{detail.title}</h3>
           <div className="flex flex-wrap gap-2">
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-500">
-              第 {detail.problem_version} 版
+              记录第 {detail.revisions.length + 1} 版 · 来源题干第 {detail.problem_version} 版
             </span>
             <SourceBadge source={detail.source} />
           </div>

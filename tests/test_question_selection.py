@@ -43,7 +43,7 @@ def test_v5_schema_creates_selection_tables_and_partial_index(
     repository.initialize()
 
     with sqlite3.connect(study_db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         tables = {
             row[0]
             for row in connection.execute(
@@ -74,13 +74,15 @@ def test_v4_database_migrates_to_v5_without_touching_old_rows(
         connection.execute("DROP TABLE question_selections")
         connection.execute("DROP TABLE exercise_question_sources")
         connection.execute("DROP TABLE record_question_sources")
+        connection.execute("DROP TABLE memory_corrections")
+        connection.execute("DROP TABLE memory_exclusions")
         connection.execute("PRAGMA user_version = 4")
         connection.commit()
 
     repository.initialize()
 
     with sqlite3.connect(study_db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert connection.execute(
             "SELECT title FROM conversations WHERE id = ?", (conversation.id,)
         ).fetchone()[0]
@@ -97,6 +99,8 @@ def test_v5_migration_failure_rolls_back(
         connection.execute("DROP TABLE question_selections")
         connection.execute("DROP TABLE exercise_question_sources")
         connection.execute("DROP TABLE record_question_sources")
+        connection.execute("DROP TABLE memory_corrections")
+        connection.execute("DROP TABLE memory_exclusions")
         connection.execute("PRAGMA user_version = 4")
         connection.commit()
 

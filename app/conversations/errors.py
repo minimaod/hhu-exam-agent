@@ -87,3 +87,11 @@ class MistakeRecordConflictError(Exception):
     def __init__(self, message: str, *, record_id: str | None = None) -> None:
         super().__init__(message)
         self.record_id = record_id
+
+
+class MemoryEntryNotFoundError(Exception):
+    """学习记忆条目不存在（或已随原记录删除）；对应 404。"""
+
+
+class MemoryCorrectionUnsupportedError(Exception):
+    """单次作答只能整体移除，不能单独纠正归属；对应 422。"""

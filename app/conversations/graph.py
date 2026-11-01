@@ -86,12 +86,15 @@ TOOLING_SYSTEM_PROMPT = """\
 9. 如果某个工具的结果是 failed 或要求用户补充，不要重复同一个调用，也不要调用依赖它成功的工具；这时应调用 ask_user 如实说明，或直接结束本轮。
 10. 课程名必须是学生本轮说出的课程或已确认课程（如“高等数学”“Python”“转专业”），不能写成“通识选修课程”“专业课”等类别。
 11. 本地目录与题库事实必须来自工具真实返回。未调用 query_papers 前不能声称某课程没有资料；未调用 search_questions 前不能声称有真题。查询失败或没有结果时，不得假装看到了题目，也不能编造题干、答案或参考代码。
-12. 查题与浏览是中间事实，不是“必须结束本轮”的信号。学生指定了试卷和题型（“这张卷的选择题”“所有单选”“前五题”）时用 list_paper_questions；有明确内容主题（“考循环的那几道”）时用 search_questions 并带上 query；“第 5 题”“第五小题”是原卷题号，用 number_label 精确定位，与当前展示到第几道无关。
+12. 查题与浏览是中间事实，不是“必须结束本轮”的信号。学生指定了试卷和题型（“这张卷的选择题”“所有单选”“前五题”）时用 list_paper_questions；有明确内容主题（“考循环的那几道”）时用 search_questions 并带上 query；“第 5 题”“第五小题”是原卷题号，用 number_label 精确定位，与当前展示到第几道无关。反过来，学生只是点名一份试卷（“2024-2025学年第一学期……期末试卷（A卷）”）时，只用 query_papers 给出卷名和下载入口就结束本轮，不要顺手列题、解题或出题；学生说“这张卷的选择题”时再列。
 13. 学生问考点、题意、某个选项的含义，或要讲解：先按上一句定位到具体题目（必要时先查题或选题），然后可以用 explain_problem 讲解；只问考点时也可以根据已返回的公开题干直接回答。不要要求学生先作答，也不要要求学生说“讲解”“直接”这类口令。只有学生明确表示“先自己做、不给答案”时，才展示题目并等他作答。
 14. 真题讲解用 explain_problem；基于当前真题生成变式用 generate_exercise 并带 from_question=true；保存真题到错题本用 save_mistake。
 15. 学生没有主动查看答案前，不能调用 show_question_answer 或 reveal_solution，也不要在回复里泄露答案或参考代码。
 16. 确实需要学生补充信息、或学生要求自己先做时，调用 ask_user 或在结果里说明，然后停止新增工具调用。
 17. 如果这一轮只需要自然语言回复（例如学生在闲聊或你已经拿到全部结果），不要调用任何工具。
+18. 学习记忆：学生问“先补什么”“最近学得怎么样”“从哪开始复习”时调用 review_learning_memory，用真实返回的知识点、次数和日期组织建议。不要算掌握率或用百分比，不要因为一次答对就说“已掌握”；返回里没有记录就直说没有，不能编造经历。看解答后作答、独立性未确认、过程不足、还没作答都要如实区分；材料标明“早于本窗口”或“只作历史回看”的记录不能说成近期表现。
+19. 纠正归属：学生指出记忆里的课程、知识点或描述不对时，调用 correct_learning_memory，entry_id 只能用 review_learning_memory 真实返回过的编号；一次只纠正被指出的那一项。学生只是不同意某次评价、要它别计入复习建议时，用 delete_learning_memory。
+20. 移除记忆：学生明确要求“这条别算”“从我记录里删掉”时才调用 delete_learning_memory，并原样告诉学生“从学习记忆和复习建议中移除，原会话记录保留”；不要替学生批量删除。
 
 调用风格：
 - 一次响应最多 3 个工具调用；总体不超过 4 次工具尝试。
@@ -155,6 +158,7 @@ class ReviewState(TypedDict, total=False):
     active_exercise_status: str | None
     active_exercise_needs_supplement: bool
     question_context: str | None
+    memory_context: str | None
     last_suggestions: list[str]
     recent_turns_summary: str
     has_attachments: bool
@@ -180,6 +184,9 @@ ACTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     # 同一轮里先查真题再讲解/看答案时，查题失败就不允许假装讲题。
     "explain_problem": ("search_questions",),
     "view_question_answer": ("search_questions",),
+    # 纠正/移除的 entry_id 只能来自本轮真实返回的记忆条目。
+    "correct_memory": ("review_memory",),
+    "delete_memory": ("review_memory",),
 }
 
 # 这些动作在一轮内最多尝试一次，避免重新决策时重复副作用。
@@ -204,6 +211,8 @@ _ACTION_LABELS = {
     "reveal_solution": "查看解答", "record_mistake": "保存错题", "record_feedback": "记录反馈",
     "search_questions": "查找真题", "select_question": "选择真题", "view_question_answer": "查看真题答案",
     "clarify_or_reply": "澄清提问",
+    "review_memory": "查看学习记忆", "correct_memory": "纠正学习记忆",
+    "delete_memory": "移除学习记忆",
 }
 
 
@@ -268,6 +277,7 @@ class SchedulerAgent:
         active_exercise_status: str | None = None,
         active_exercise_needs_supplement: bool = False,
         question_context: str | None = None,
+        memory_context: str | None = None,
         last_suggestions: list[str] | None = None,
         recent_turns_summary: str | None = None,
         has_attachments: bool = False,
@@ -329,6 +339,9 @@ class SchedulerAgent:
                     context_parts.append("当前练习还需要学生补充解题过程。")
             if question_context:
                 context_parts.append(question_context[:200])
+            if memory_context:
+                # 学习记忆事实由程序算好再交给模型，避免模型自己“总结”出掌握结论。
+                context_parts.append(memory_context[:400])
             if last_suggestions:
                 context_parts.append(f"上次助手提出的建议选项：{', '.join(last_suggestions)}")
             if recent_turns_summary:
@@ -567,6 +580,7 @@ class DynamicReviewGraph:
                     state.get("active_exercise_needs_supplement")
                 ),
                 question_context=state.get("question_context"),
+                memory_context=state.get("memory_context"),
                 last_suggestions=state.get("last_suggestions") or [],
                 recent_turns_summary=state.get("recent_turns_summary"),
                 has_attachments=bool(state.get("has_attachments")),

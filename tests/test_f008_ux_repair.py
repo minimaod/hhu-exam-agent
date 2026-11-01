@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -1035,3 +1036,177 @@ async def test_swap_keeps_previous_query_and_type(tmp_path: Path) -> None:
     assert follow_up.question_type == original.question_type
     assert [card.number_label for card in second.question_results] == ["2"]
     assert first.question_results[0].number_label == "1"
+
+
+# 2026-11-01：深度体验的附件、跨卷上下文、练习追问与口头备注。
+@pytest.mark.parametrize("prefix", ["换成", "改看", "切换到"])
+@pytest.mark.anyio
+async def test_switch_verb_keeps_locator_free_of_keywords(tmp_path, prefix):
+    scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[ActionPlan(
+        action="select_question", parameters={"paper_id": PAPER, "number_label": "5"})])])
+    service, repo, runtime = build_service(tmp_path, scheduler=scheduler)
+    old, new = two_papers(service, runtime)
+    cid = service.create_conversation().id
+    seed_page(repo, cid, cards=[old], returned=1)
+    result = result_of(await run(service, cid, turn_input(text=(
+        prefix + " 2023-2024 学年第一学期 Python 期末试卷的选择题第 5 题"))))
+    assert result.question.question_id == new.question_id
+    assert runtime.search_calls[-1]["request"].query == ""
+    assert result.question.answer_revealed is False
+
+
+@pytest.mark.parametrize("variant", ["A卷", "A 卷", "（A卷）", "(a 卷)"])
+def test_variant_is_metadata_not_a_content_keyword(variant):
+    from app.questions.intent import extract_intent
+    text = f"给出 2024-2025 第一学期 Python 期末 {variant}的全部选择题"
+    intent = extract_intent(text, confirmed_course=COURSE, papers=[paper_item().model_dump()],
+                            planned={"query": text})
+    assert intent.paper_id == PAPER
+    assert intent.query == ""
+    wrong = extract_intent(text.replace(variant, "B 卷"), confirmed_course=COURSE,
+                           papers=[paper_item().model_dump()])
+    assert wrong.paper_id is None and wrong.paper_unresolved
+
+
+@pytest.mark.anyio
+async def test_recent_browse_beats_previous_selected_paper(tmp_path):
+    scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[ActionPlan(
+        action="select_question", parameters={"paper_id": "py-2023-2024-s1-final"})])])
+    service, repo, runtime = build_service(tmp_path, scheduler=scheduler)
+    old, new = two_papers(service, runtime)
+    cid = service.create_conversation().id
+    old_turn = seed_page(repo, cid, cards=[new], returned=1)
+    service._select_question_card(cid, old_turn, old_turn, new)
+    seed_page(repo, cid, cards=[old], returned=1)
+    result = result_of(await run(service, cid, turn_input(
+        text="给出刚刚那张试卷的选择题第五题，说明它考什么")))
+    assert result.question.question_id == old.question_id
+    assert not result.question.answer_revealed
+
+
+@pytest.mark.anyio
+async def test_cross_paper_search_does_not_claim_first_paper_or_exhaustion(tmp_path):
+    scheduler = FakeScheduler(decisions=[search_decision(query="循环", limit=1)])
+    factory = ReplyFactory(["按循环知识点找到一道选择真题。"])
+    service, repo, runtime = build_service(tmp_path, scheduler=scheduler, reply_factory=factory)
+    two_papers(service, runtime)
+    cid = service.create_conversation().id
+    result = result_of(await run(service, cid, turn_input(text="找一道 Python 循环的选择真题")))
+    outcome = result.composite_results[0]
+    assert outcome.details["paper_id"] is None
+    assert outcome.details["paper_title"] is None
+    assert "全部列出" not in outcome.message
+    assert TITLE not in outcome.message
+    assert repo.find_question_context(cid, require_paper=False).get("paper_id") is None
+
+
+@pytest.mark.anyio
+async def test_query_papers_observation_includes_real_titles_and_ids(tmp_path):
+    scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[ActionPlan(
+        action="query_papers", parameters={"course": COURSE})])])
+    service, _, _ = build_service(tmp_path, scheduler=scheduler)
+    cid = service.create_conversation().id
+    result = result_of(await run(service, cid, turn_input(text="给我 Python 期末试卷")))
+    papers = result.composite_results[0].details["papers"]
+    assert papers[0]["paper_id"] == PAPER and papers[0]["title"] == TITLE
+
+
+@pytest.mark.parametrize("target,revealed", [("auto", True), ("exercise", True), ("exercise", False), ("problem", True)])
+@pytest.mark.anyio
+async def test_followup_binds_exercise_and_respects_solution_visibility(tmp_path, target, revealed):
+    from tests.test_f006_review_fixes import setup_service, create_problem_with_exercise
+    from app.tutoring.models import FollowupAnswer
+    svc, repo, _, _, tutor = setup_service(tmp_path, followups=[FollowupAnswer(answer="已按对应题目回答。", related_steps=[])],
+        scheduler_decisions=[ScheduleDecision(actions=[ActionPlan(action="followup_problem", parameters={"target": target})])])
+    cid = repo.create_conversation().id
+    problem, exercise = create_problem_with_exercise(repo, conversation_id=cid,
+        statement="母题：统计奇偶数", exercise_statement="练习：用 int(n**0.5) 判断素数", reference_solution="PRIVATE-SQRT-SOLUTION")
+    if revealed:
+        repo.reveal_exercise_solution(exercise.id)
+    viewed_at = repo.get_exercise(exercise.id).revealed_solution_at
+    await run(svc, cid, turn_input(text="请问 int(n**0.5) + 1 为什么要加一？"))
+    call = tutor.followup_calls[0]
+    if target == "problem":
+        assert call["statement"] == problem.statement_text
+        assert "PRIVATE-SQRT-SOLUTION" not in call["explanation"].model_dump_json()
+    else:
+        assert exercise.statement_text in call["statement"]
+        assert "母题：统计奇偶数" not in call["statement"]
+        assert ("PRIVATE-SQRT-SOLUTION" in call["explanation"].model_dump_json()) == revealed
+    assert repo.get_exercise(exercise.id).revealed_solution_at == viewed_at
+
+
+@pytest.mark.anyio
+async def test_spoken_note_is_saved_for_new_and_existing_record(tmp_path):
+    from tests.test_f006_review_fixes import setup_service, create_problem_with_exercise
+    svc, repo, scheduler, _, _ = setup_service(tmp_path, scheduler_decisions=[ScheduleDecision(actions=[ActionPlan(action="record_mistake")])])
+    cid = repo.create_conversation().id
+    create_problem_with_exercise(repo, conversation_id=cid)
+    first = result_of(await run(svc, cid, turn_input(text="把这道题保存到错题本，备注：注意循环边界")))
+    record_id = first.composite_results[0].details["record_id"]
+    assert svc.records.build_detail(record_id).feedback.text == "注意循环边界"
+    scheduler.push(ScheduleDecision(actions=[ActionPlan(action="record_mistake", parameters={"user_feedback": "改用平方根边界"})]))
+    second = result_of(await run(svc, cid, turn_input(text="保存这题，备注改为平方根边界")))
+    assert second.composite_results[0].details["feedback_saved"] is True
+    assert svc.records.build_detail(record_id).feedback.text == "改用平方根边界"
+    assert svc.records.list_records(limit=20, offset=0).total == 1
+
+
+@pytest.mark.parametrize("dispatch", [False, True])
+@pytest.mark.anyio
+async def test_image_evaluation_reply_and_regeneration_do_not_repeat_business(tmp_path, dispatch):
+    from app.images import validate_image, save_attachment
+    from app.tutoring.exercise_llm import AnswerEvaluation
+    from tests.tutoring_fakes import png_bytes
+    from tests.test_f006_review_fixes import setup_service, create_problem_with_exercise
+    svc, repo, _, agent, _ = setup_service(tmp_path,
+        scheduler_decisions=[ScheduleDecision(actions=[ActionPlan(action="evaluate_exercise")])],
+        evaluations=[AnswerEvaluation(is_correct=True, final_answer_assessment="图中代码正确。",
+            step_by_step_analysis="已检查 abundant(k) 的除数累加和边界。", guidance="保留此过程。", needs_supplement=False)])
+    factory = ReplyFactory(["本轮正文失败"], fail_after=0)
+    svc._make_reply = factory
+    cid = repo.create_conversation().id
+    _, exercise = create_problem_with_exercise(repo, conversation_id=cid)
+    image = validate_image(png_bytes())
+    attachment_id = str(uuid4())
+    stored = save_attachment(tmp_path / "attachments", cid, attachment_id, image)
+    repo.create_attachment(conversation_id=cid, attachment_id=attachment_id, stored_name=stored,
+        mime=image.mime, width=image.width, height=image.height, size_bytes=len(image.data), sha256=image.sha256)
+    data = replace(turn_input(text="请根据解法图评价当前练习作答"),
+        kind=None if dispatch else "exercise", dispatch=dispatch, exercise_id=exercise.id,
+        student_answer_text="见解法图", attachments=((attachment_id, "solution"),))
+    result = result_of(await run(svc, cid, data))
+    assert len(agent.evaluate_calls[0]["images"]) == 1
+    assert result.exercise.evaluation.is_correct is True
+    saved = repo.find_turn(cid, data.request_id)
+    prompt = material_from_payload(saved.recovery["reply_input"]).describe()
+    assert "已读取 1 张" in prompt and "abundant(k)" in prompt
+    assert "参考解答（学生已主动查看）" not in prompt
+    before = len(repo.list_turns(cid))
+    svc._make_reply = ReplyFactory(["已经收到解法图，图中的除数累加与边界正确。"])
+    reply = await svc.regenerate_reply(cid, data.request_id)
+    assert "已经收到解法图" in reply["assistant_message"]
+    assert len(repo.list_turns(cid)) == before
+    assert len(agent.evaluate_calls) == 1
+    assert len(repo.get_exercise(exercise.id).attempts) == 1
+
+
+@pytest.mark.anyio
+async def test_long_exercise_solution_is_not_truncated_or_rejected_in_followup(tmp_path):
+    from tests.test_f006_review_fixes import setup_service, create_problem_with_exercise
+    from app.tutoring.models import FollowupAnswer
+    svc, repo, _, _, tutor = setup_service(tmp_path, followups=[FollowupAnswer(answer="解释末尾步骤。", related_steps=[])],
+        scheduler_decisions=[ScheduleDecision(actions=[ActionPlan(action="followup_problem", parameters={"target": "exercise"})])])
+    cid = repo.create_conversation().id
+    _, exercise = create_problem_with_exercise(repo, conversation_id=cid, reference_solution="解题步骤" * 900 + "TAIL-SQRT-BOUND")
+    repo.reveal_exercise_solution(exercise.id)
+    await run(svc, cid, turn_input(text="练习最后的边界为什么加一"))
+    assert "TAIL-SQRT-BOUND" in tutor.followup_calls[0]["explanation"].model_dump_json()
+
+
+def test_new_reveal_material_is_not_replaced_by_an_old_evaluation():
+    from types import SimpleNamespace
+    from app.conversations.service import _DynamicContext
+    ex = SimpleNamespace(reference_solution_text="PUBLIC-REFERENCE", evaluation=object())
+    ctx = _DynamicContext(conversation_id="c", exercise_view=ex)
+    assert "PUBLIC-REFERENCE" in ConversationService._teaching_material(ctx)

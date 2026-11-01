@@ -30,6 +30,9 @@ ActionType = Literal[
     "select_question",
     "view_question_answer",
     "clarify_or_reply",
+    "review_memory",
+    "correct_memory",
+    "delete_memory",
 ]
 
 ActionStatus = Literal["success", "failed", "clarification"]

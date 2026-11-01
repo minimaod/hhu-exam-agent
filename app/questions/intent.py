@@ -7,6 +7,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.papers.courses import detect_course, normalize_course
+from app.papers.locator import (
+    PaperLocation,
+    paper_exam_type,
+    paper_key,
+    paper_term,
+    paper_variant,
+    title_key,
+)
 from app.question_bank.config import MAX_BROWSE_LIMIT, MAX_LIMIT
 
 _TYPE_WORDS = {
@@ -14,21 +22,38 @@ _TYPE_WORDS = {
     "fill": r"填空",
     "code": r"编程|代码题|程序题|程序设计|写程序|写代码",
 }
-_TERM_PATTERNS = {
-    "s1": r"第一学期|上学期|秋季|秋学期|\bs1\b|上卷",
-    "s2": r"第二学期|下学期|春季|春学期|\bs2\b|下卷",
+# 学年、学期、卷别的写法统一由 app.papers.locator 维护：
+# 查卷和查题如果各写一套，学生换个写法就会一边命中、一边漏。
+_YEAR_LIKE = re.compile(r"(20\d{2})\s*[-–—~至]\s*(20\d{2})")
+_TERM_LIKE = {
+    "s1": re.compile(r"第一学期|上学期|秋季|秋学期|\bs1\b|上卷", re.IGNORECASE),
+    "s2": re.compile(r"第二学期|下学期|春季|春学期|\bs2\b|下卷", re.IGNORECASE),
 }
-_YEAR = re.compile(r"(20\d{2})\s*[-–—~至]\s*(20\d{2})")
 _TARGET_PRONOUN = re.compile(
     r"这(道|个|一)?题|该题|那道题|刚才那题|上面那题|前面那题|它|第\s*([0-9一二三四五六七八九十]+)\s*(道|个)?题"
 )
+# “去试卷库/题库里找”明确是跨卷检索：不能悄悄沿用当前试卷，否则范围被
+# 锁死在一份卷里，还可能把学生刚做过的那道原题再返回一次。
+_CROSS_PAPER = re.compile(
+    r"试卷库|题库|所有试卷|全部试卷|各个试卷|每份卷|跨卷|其他试卷|其它试卷|别的试卷|别的卷"
+)
 _NEW_PROBLEM_HINT = re.compile(r"新题|另一道|换一道|上传|拍照|下面这道")
+
+
+def _mentions_term(value: str) -> bool:
+    return any(pattern.search(value) for pattern in _TERM_LIKE.values())
+
+
+def asks_across_papers(text: str) -> bool:
+    """学生是否明确要求在试卷库/题库范围内跨卷检索。"""
+
+    return bool(_CROSS_PAPER.search(_clean(text or "")))
 
 
 def is_question_lookup(text: str) -> bool:
     value = _clean(text)
     return bool(re.search(r"(?:找|查|搜|给|来|出).{0,40}真题|(?:找|查|搜).{0,12}(?:一道|一题|道题|题练)", value)
-                or (_YEAR.search(value) and re.search(r"第[0-9一二三四五六七八九十]+(?:小|道)?题", value)))
+                or (_YEAR_LIKE.search(value) and re.search(r"第[0-9一二三四五六七八九十]+(?:小|道)?题", value)))
 
 
 def question_answer_requested(text: str) -> bool:
@@ -136,20 +161,7 @@ def _question_type(text: str) -> str | None:
 
 
 def _exam_type(text: str) -> str | None:
-    if re.search(r"不限|不区分|全部类型|所有类型|不要只查|别只查|不只查", text):
-        return None
-    mentioned = {
-        kind
-        for kind, pattern in {
-            "midterm": r"期中|期终?中|\bmidterm\b",
-            "final": r"期末|期终|\bfinal\b",
-            "other": r"其[他它]类型|其[他它]考试|\bother\b",
-        }.items()
-        if re.search(pattern, text, re.IGNORECASE)
-    }
-    if len(mentioned) == 1:
-        return next(iter(mentioned))
-    return None
+    return paper_exam_type(text)
 
 
 def _paper_id(
@@ -171,81 +183,91 @@ def _paper_id(
 
     if not papers:
         normalized = _clean(text)
-        explicit = bool(
-            _YEAR.search(normalized)
-            or any(re.search(pattern, normalized) for pattern in _TERM_PATTERNS.values())
-        )
+        explicit = bool(_YEAR_LIKE.search(normalized) or _mentions_term(normalized))
         if current_paper_id and not explicit:
             return current_paper_id, False
         return None, explicit
     normalized = _clean(text)
-    years = _YEAR.search(normalized)
-    year_pair = f"{years.group(1)}-{years.group(2)}" if years else None
-    term = next(
-        (key for key, pattern in _TERM_PATTERNS.items() if re.search(pattern, normalized)),
-        None,
+    location = PaperLocation(
+        year=(
+            f"{match.group(1)}-{match.group(2)}"
+            if (match := _YEAR_LIKE.search(normalized))
+            else None
+        ),
+        term=next(
+            (key for key, pattern in _TERM_LIKE.items() if pattern.search(normalized)),
+            None,
+        ),
+        variant=paper_variant(text),
     )
     exam = _exam_type(text)
-    variant = next(
-        (match.upper() for match in re.findall(r"[（(]\s*([ABab])\s*卷\s*[)）]", text)), None
-    )
-    # 只有年份/学期才构成“限定到某份卷”的强条件；考试类型只缩小检索范围。
-    explicit = year_pair is not None or term is not None
+    # 只有年份/学期/卷别才构成“限定到某份卷”的强条件；考试类型只缩小检索范围。
+    explicit = location.explicit
 
     def _matches(paper: dict) -> bool:
-        title = str(paper.get("title") or "")
-        return (
-            (year_pair is None or str(paper.get("academic_year")) == year_pair)
-            and (term is None or f"-{term}-" in str(_paper_key(paper) or ""))
-            and (exam in (None, "other") or paper.get("exam_type") == exam)
-            # 目录项没有卷名时无法用 A/B 卷区分，不能因此把唯一候选排除掉。
-            and (variant is None or not title or variant in title.upper())
-        )
+        if location.year and str(paper.get("academic_year")) != location.year:
+            return False
+        if location.term and paper_term(paper) != location.term:
+            return False
+        if exam not in (None, "other") and paper.get("exam_type") != exam:
+            return False
+        # 目录项没有卷名时无法用 A/B 卷区分，不能因此把唯一候选排除掉。
+        if location.variant:
+            own = paper_variant(str(paper.get("title") or ""))
+            if own is not None and own != location.variant:
+                return False
+        return True
 
     named = _named_paper(normalized, papers)
     if named is not None:
         # 本轮直接点名了某份卷（整段卷名出现在句子里），这是最强的换卷信号。
-        if _matches(next(paper for paper in papers if _paper_key(paper) == named)):
+        if _matches(next(paper for paper in papers if paper_key(paper) == named)):
             return named, False
         return None, True
 
     candidates = [paper for paper in papers if _matches(paper)]
-    all_keys = {_paper_key(paper) for paper in papers}
-    if isinstance(planned, str):
-        planned = planned.strip()
-        if planned and planned in all_keys:
-            if not explicit:
-                return planned, False
-            if any(_paper_key(paper) == planned for paper in candidates):
-                return planned, False
-            return None, True
+    planned_key = (
+        planned.strip()
+        if isinstance(planned, str) and planned.strip() in {paper_key(p) for p in papers}
+        else None
+    )
+    if planned_key is not None:
+        if not explicit:
+            return planned_key, False
+        if any(paper_key(paper) == planned_key for paper in candidates):
+            return planned_key, False
+        return None, True
     if not explicit:
         # 本轮没有给年份/学期：既不换卷，也不扩大范围。“期末真题”这类只给考试
         # 类型的请求按 exam_type 过滤，不因此要求学生补年份；只有什么都没说时
         # 才继承最近一次已确定的试卷。
-        if exam is None and variant is None and current_paper_id in all_keys:
+        # 但“去试卷库/题库里找类似的题”明确要求跨卷，继承当前卷会把检索锁死
+        # 在一份卷里，甚至把学生刚做过的那道原题再返回一次。
+        if (
+            exam is None
+            and location.variant is None
+            and not _CROSS_PAPER.search(normalized)
+            and current_paper_id in {paper_key(p) for p in papers}
+        ):
             return current_paper_id, False
         return None, False
     if len(candidates) == 1:
-        return _paper_key(candidates[0]), False
+        return paper_key(candidates[0]), False
     return None, True
 
 
 def _named_paper(normalized_text: str, papers: list[dict]) -> str | None:
-    """整段卷名（去掉空白后）出现在句子里时直接命中，唯一才算数。"""
+    """整段卷名（去掉空白/书名号后）出现在句子里时直接命中，唯一才算数。"""
 
+    haystack = title_key(normalized_text)
     hits = [
-        _paper_key(paper)
+        paper_key(paper)
         for paper in papers
-        if _clean(str(paper.get("title") or "")) and _clean(str(paper.get("title"))) in normalized_text
+        if (key := paper_key(paper))
+        and (title := title_key(str(paper.get("title") or "")))
+        and title in haystack
     ]
-    hits = [key for key in hits if key]
     return hits[0] if len(hits) == 1 else None
-
-
-def _paper_key(paper: dict) -> str | None:
-    value = paper.get("id") or paper.get("paper_id")
-    return str(value) if value else None
 
 
 def _knowledge_points(planned: Any, text: str) -> tuple[str, ...]:
@@ -306,20 +328,21 @@ def _locator_keywords(text: str) -> str:
     只保留“题目内容”词：卷名、年份学期、题型、题号、数量词和口语动词都不是
     检索内容。去掉后为空，就说明这是“整卷浏览”，而不是相关性查询。
     """
-    value = _YEAR.sub(" ", text)
+    value = re.sub(r"换成|改看|换为|切换到|只(?:解释|说明|分析|讲解)", " ", text)
+    value = _YEAR_LIKE.sub(" ", value)
     value = re.sub(r"《[^》]*》", " ", value)
     # 先去掉“题目/小题”这类词，避免“第一个题目”被题号规则切成“第一个题+目”。
     value = re.sub(r"题目|试题|小题", " ", value)
     value = re.sub(r"python(?:语言程序设计)?", " ", value, flags=re.IGNORECASE)
-    for pattern in _TERM_PATTERNS.values():
-        value = re.sub(pattern, " ", value, flags=re.IGNORECASE)
+    for pattern in _TERM_LIKE.values():
+        value = pattern.sub(" ", value)
     value = re.sub(r"第\s*(?:[0-9]+|[一二三四五六七八九十]+)\s*(?:道|个|小)?题", " ", value)
     # “第一道选择题”里的“第一道”指列表位置，同样不是题干内容。
     value = re.sub(r"第\s*(?:[0-9]+|[一二三四五六七八九十]+)\s*(?:道|个|小)", " ", value)
     value = _HEAD_COUNT.sub(" ", value)
     value = _BARE_COUNT.sub(" ", value)
     value = _ALL_WORDS.sub(" ", value)
-    value = re.sub(r"[（(]\s*[ABab]\s*卷\s*[)）]", " ", value)
+    value = re.sub(r"[（(]?\s*(?<![a-zA-Z0-9])[ABab]\s*卷\s*[)）]?", " ", value)
     value = re.sub(r"选择题|单选题|多选题|填空题|编程题|代码题|程序题|程序设计题|大题|期末|期中|期终|试卷|试题|题目|真题|学年", " ", value)
     value = re.sub(r"请|帮我|麻烦|给我|我要|我想|查找|搜索|查|搜|找|看看|看|讲解|讲讲|讲|解释|分析|一下", " ", value)
     value = _FILLER_PHRASES.sub(" ", value)

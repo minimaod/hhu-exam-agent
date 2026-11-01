@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from app.api.attachments import router as attachments_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.api.memory import router as memory_router
 from app.api.mistakes import router as mistakes_router
 from app.api.papers import router as papers_router
 from app.api.query import router as query_router
@@ -31,6 +32,8 @@ from app.conversations.errors import (
     ConversationQueryUnavailableError,
     ConversationStorageError,
     InvalidImageError,
+    MemoryCorrectionUnsupportedError,
+    MemoryEntryNotFoundError,
     MistakeRecordConflictError,
     MistakeRecordNotFoundError,
     ProblemNotFoundError,
@@ -80,6 +83,7 @@ app.include_router(query_router, prefix="/api")
 app.include_router(conversations_router, prefix="/api")
 app.include_router(attachments_router, prefix="/api")
 app.include_router(mistakes_router, prefix="/api")
+app.include_router(memory_router, prefix="/api")
 
 
 def _detail_response(status_code: int, message: str) -> JSONResponse:
@@ -259,6 +263,26 @@ async def handle_mistake_record_conflict(
     if exc.record_id is not None:
         content["record_id"] = exc.record_id
     return JSONResponse(status_code=409, content=content)
+
+
+@app.exception_handler(MemoryEntryNotFoundError)
+async def handle_memory_entry_not_found(
+    request: Request,
+    exc: MemoryEntryNotFoundError,
+) -> JSONResponse:
+    """学习记忆条目不存在（或原记录已删）：404。"""
+
+    return _detail_response(404, str(exc))
+
+
+@app.exception_handler(MemoryCorrectionUnsupportedError)
+async def handle_memory_correction_unsupported(
+    request: Request,
+    exc: MemoryCorrectionUnsupportedError,
+) -> JSONResponse:
+    """单次作答只能整体移除，或纠正内容为空：422。"""
+
+    return _detail_response(422, str(exc))
 
 
 @app.exception_handler(QuestionError)

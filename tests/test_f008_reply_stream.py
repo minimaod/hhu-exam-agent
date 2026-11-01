@@ -34,6 +34,21 @@ from tests.tool_fakes import ReplyFactory
 from tests.tutoring_fakes import FakeExerciseAgent, FakeScheduler, FakeTutor, sample_explanation
 
 
+def test_disputed_answer_note_is_bound_to_verified_content_and_keeps_original():
+    from app.questions.cards import compose_material
+    from app.questions.models import AnswerDetail, EvidenceBundle
+    from tests.question_fakes import sample_card
+    card = sample_card("py-2023-2024-s1-final-choice-34", number="34").model_copy(update={
+        "content_sha256": "5baa3a20fee7193085c5535a774b0a27244ef447dbf61b647fb7bcd1c1550d3b"})
+    evidence = EvidenceBundle(status="ok", answer_detail=AnswerDetail(state="original", text="B"))
+    material = compose_material(card, evidence)
+    assert "原卷答案：B" in material
+    assert "导师语义核对" in material and "不得据此直接判学生选 C 错误" in material
+    assert "导师语义核对" not in compose_material(card.model_copy(update={"content_sha256": "0" * 64}), evidence)
+    # 说明只在答案阶段的私有讲解材料中，不会进入公开题卡。
+    assert "导师语义核对" not in card.model_dump_json()
+
+
 def make_dummy_request() -> Request:
     return Request(
         {

@@ -18,7 +18,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.conversations.protocol import ActionPlan
 
@@ -37,6 +37,9 @@ ToolName = Literal[
     "save_mistake",
     "record_feedback",
     "ask_user",
+    "review_learning_memory",
+    "correct_learning_memory",
+    "delete_learning_memory",
 ]
 
 ExamType = Literal["midterm", "final", "other"]
@@ -77,6 +80,28 @@ _PUBLIC_DETAIL_KEYS = frozenset(
         "has_more",
         "paper_id",
         "paper_title",
+        "papers",
+        # 查卷唯一命中的下载入口与定位条件：正文只写这里给出的链接。
+        "download_url",
+        "academic_year",
+        "term",
+        "solution_image_count",
+        "feedback_saved",
+        "user_feedback",
+        "followup_target",
+        # 学习记忆：只放公开事实与可追溯标识，不放答案正文。
+        "memory_entry_id",
+        "memory_entry",
+        "memory_entries",
+        "memory_course",
+        "memory_source",
+        "memory_range",
+        "memory_counts",
+        "memory_groups",
+        "memory_suggestions",
+        "memory_pending",
+        "memory_removed",
+        "memory_message",
     }
 )
 
@@ -127,6 +152,11 @@ class ExplainProblemArgs(_Strict):
 
 class AnswerFollowupArgs(_Strict):
     question: str = Field(min_length=1, max_length=500)
+    target: Literal["auto", "problem", "exercise"] = "auto"
+
+
+class SaveMistakeArgs(_Strict):
+    user_feedback: str | None = Field(default=None, max_length=2000)
 
 
 class GenerateExerciseArgs(_Strict):
@@ -144,6 +174,33 @@ class RecordFeedbackArgs(_Strict):
 class AskUserArgs(_Strict):
     question: str = Field(min_length=1, max_length=300)
     options: list[str] | None = Field(default=None, max_length=5)
+
+
+class ReviewMemoryArgs(_Strict):
+    course: str | None = Field(default=None, max_length=40)
+    days: int = Field(default=30, ge=1, le=365)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class CorrectMemoryArgs(_Strict):
+    entry_id: str = Field(min_length=6, max_length=80)
+    course: str | None = Field(default=None, max_length=40)
+    knowledge_point: str | None = Field(default=None, max_length=120)
+    note: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _require_change(self) -> "CorrectMemoryArgs":
+        if all(
+            value is None
+            for value in (self.course, self.knowledge_point, self.note)
+        ):
+            raise ValueError("至少要说明要纠正的课程、知识点或补充说明")
+        return self
+
+
+class DeleteMemoryArgs(_Strict):
+    entry_id: str = Field(min_length=6, max_length=80)
+    reason: str | None = Field(default=None, max_length=200)
 
 
 @dataclass(frozen=True)
@@ -324,14 +381,15 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="answer_followup",
         action="followup_problem",
-        description="回答学生针对当前已讲解题目提出的追问。",
+        description="回答学生对母题或当前变式练习的追问。追问练习题或其解答时 target=exercise；明确问原题时 target=problem；不明确时 auto。",
         args_model=AnswerFollowupArgs,
         schema=_object(
             {
                 "question": {
                     "type": "string",
                     "description": "把学生的追问原话整理后放进来",
-                }
+                },
+                "target": {"type": "string", "enum": ["auto", "problem", "exercise"]},
             },
             required=("question",),
         ),
@@ -383,8 +441,13 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=(
             "把当前题目保存到错题本。只有学生明确要求保存、或确认了清晰的保存建议时才调用。"
         ),
-        args_model=NoArgs,
-        schema=_object({}),
+        args_model=SaveMistakeArgs,
+        schema=_object({
+            "user_feedback": {
+                "type": ["string", "null"], "maxLength": 2000,
+                "description": "学生明确要求保存的备注原文；未要求备注时省略，不自行编写。",
+            }
+        }),
     ),
     ToolSpec(
         name="record_feedback",
@@ -416,7 +479,93 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             required=("question",),
         ),
     ),
+    ToolSpec(
+        name="review_learning_memory",
+        action="review_memory",
+        description=(
+            "查看学生自己的学习记忆并给出有依据的复习建议：只统计真实练习与作答记录，"
+            "按知识点汇总“独立作答被判错 / 看过解答后作答 / 过程不足 / 还没作答 / 自述理解”，"
+            "并返回可追溯的条目编号。学生问“先补什么”“最近学得怎么样”“从哪开始复习”时使用。"
+            "不给掌握率，不把一次答对说成已掌握；没有记录就直说没有。"
+        ),
+        args_model=ReviewMemoryArgs,
+        schema=_object(
+            {
+                "course": {
+                    "type": ["string", "null"],
+                    "description": "课程名；不填就用当前会话已确认的课程",
+                },
+                "days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 365,
+                    "description": "回看多少天，默认 30",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "最多返回多少条证据，默认 20",
+                },
+            }
+        ),
+    ),
+    ToolSpec(
+        name="correct_learning_memory",
+        action="correct_memory",
+        description=(
+            "学生指出学习记忆里的课程归属、知识点或描述不对时，纠正指定条目。"
+            "必须传 review_learning_memory 返回的 entry_id；至少给出课程、知识点、"
+            "补充说明中的一项。只改记忆，不改原会话记录。"
+        ),
+        args_model=CorrectMemoryArgs,
+        schema=_object(
+            {
+                "entry_id": {
+                    "type": "string",
+                    "description": "形如 exercise:<uuid> 的条目编号，来自学习记忆结果",
+                },
+                "course": {
+                    "type": ["string", "null"],
+                    "description": "纠正后的课程名",
+                },
+                "knowledge_point": {
+                    "type": ["string", "null"],
+                    "description": "纠正后的知识点（只写一个）",
+                },
+                "note": {
+                    "type": ["string", "null"],
+                    "description": "学生补充的说明，如“这题我当时看错条件了”",
+                },
+            },
+            required=("entry_id",),
+        ),
+    ),
+    ToolSpec(
+        name="delete_learning_memory",
+        action="delete_memory",
+        description=(
+            "学生明确要求把某条学习记忆从复习建议里移除时使用。必须传 entry_id。"
+            "移除只影响学习记忆和复习建议，原会话、练习与错题记录都保留；"
+            "说明时必须原样告诉学生这一点。"
+        ),
+        args_model=DeleteMemoryArgs,
+        schema=_object(
+            {
+                "entry_id": {
+                    "type": "string",
+                    "description": "要移除的条目编号，来自学习记忆结果",
+                },
+                "reason": {
+                    "type": ["string", "null"],
+                    "description": "学生给出的原因原文；没说明就留空",
+                },
+            },
+            required=("entry_id",),
+        ),
+    ),
 )
+
 
 TOOLS_BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOL_SPECS}
 
@@ -576,4 +725,7 @@ def tool_label(tool: str | None) -> str:
         "save_mistake": "保存错题",
         "record_feedback": "记录反馈",
         "ask_user": "澄清提问",
+        "review_learning_memory": "查看学习记忆",
+        "correct_learning_memory": "纠正学习记忆",
+        "delete_learning_memory": "移除学习记忆",
     }.get(tool, tool)

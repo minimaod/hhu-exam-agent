@@ -93,8 +93,7 @@ function CodeBlocks({
             <div key={block.block_id ?? block.text.slice(0, 40)}>
               <div className="mb-1 flex flex-wrap gap-2 text-[11px] text-emerald-700">
                 {block.name ? <span>{block.name}</span> : null}
-                {block.kind ? <span>类型：{block.kind}</span> : null}
-                {block.column != null ? <span>第 {block.column} 列</span> : null}
+                {block.kind && block.kind !== "main" ? <span>类型：{({ helper: "辅助函数", function: "函数", example: "示例" } as Record<string, string>)[block.kind] ?? "参考代码"}</span> : null}
                 {block.pages?.length || block.page != null ? (
                   <span>{pageLabel(block.pages) ?? `第 ${block.page} 页`}</span>
                 ) : null}

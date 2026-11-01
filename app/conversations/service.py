@@ -63,6 +63,8 @@ from app.conversations.errors import (
     ConversationQueryUnavailableError,
     ConversationStorageError,
     InvalidImageError,
+    MemoryCorrectionUnsupportedError,
+    MemoryEntryNotFoundError,
     MistakeRecordConflictError,
     ProblemNotFoundError,
     ProblemNotReadyError,
@@ -109,13 +111,24 @@ from app.images import (
     delete_attachment,
 )
 from app.mistakes.service import MistakeRecordService
+from app.memory.models import MemoryCorrectionRequest, MemoryEntryView, parse_entry_id
+from app.memory.summary import context_line, material_block
 from app.papers.errors import CatalogUnavailableError
+from app.papers.locator import (
+    RANK_AMBIGUOUS,
+    RANK_UNIQUE,
+    PaperLocation,
+    cancels_exam_type,
+    describe_location,
+    extract_location,
+    locate_papers,
+)
 from app.papers.service import PaperService
 from app.querying.errors import QueryError
 from app.querying.models import ErrorEvent, ProgressEvent, ResultEvent
 from app.querying.service import QueryService
 from app.question_bank.models import SearchRequest
-from app.papers.courses import normalize_course
+from app.papers.courses import detect_course, normalize_course
 from app.questions.cards import answer_url as answer_url_for
 from app.questions.cards import attach_answer, compose_statement
 from app.questions.errors import (
@@ -129,6 +142,7 @@ from app.questions.errors import (
 )
 from app.questions.intent import (
     SearchIntent,
+    asks_across_papers,
     candidate_number,
     detect_question_type,
     extract_intent,
@@ -156,6 +170,8 @@ from app.tutoring.models import (
     RecordCreatedResult,
     RecordExistsResult,
     Source,
+    KnowledgePoint,
+    Step,
     TutoringResult,
 )
 from app.tutoring.service import (
@@ -202,6 +218,14 @@ _PRACTICE_REQUEST_RE = re.compile(
     r"(再来|来一道|来道|出一道|出题|练|类似题|变式|做题|刷题)"
 )
 _SAVE_REQUEST_RE = re.compile(r"(保存|存起来|存一下|记录|错题|收藏|加入)")
+# 会真正展开题目内容的动作。学生只点名一份试卷时，这些动作必须由学生先开口。
+_QUESTION_CONTENT_ACTIONS = frozenset({"list_paper_questions", "search_questions"})
+# “要题目/题型/题号/考点/讲解/答案”的显式信号；“试卷”两个字本身不算（“试”不是“题”）。
+_QUESTION_CONTENT_REQUEST_RE = re.compile(
+    r"题|考点|考啥|考什么|讲解|讲讲|解释|解析|答案|练习|列一下|列出来"
+)
+# “再来一道类似的”：要的是另一道题，原题必须排除。
+_SIMILAR_QUESTION_RE = re.compile(r"类似|相似|同类型|同一类|换一道|另一道|别的题|其他题|其它题")
 _AFFIRMATIVE_ONLY = frozenset(
     {
         "好",
@@ -414,6 +438,15 @@ class _DynamicContext:
     # 本轮回答范围：hint=只给提示，topic=只问考点。都由学生的话决定，
     # 用来阻止模型把“提示/考点”当成完整讲解，并约束正文范围。
     answer_scope: str | None = None
+    # F009：本轮的学习记忆上下文。由程序统计后交给决策与正文；读取失败时
+    # 用“暂时无法读取”如实说明，不能变成“没有记录”。
+    memory_course: str | None = None
+    memory_text: str | None = None
+    memory_status: str | None = None
+    memory_view: Any = None
+    memory_entry_ids: set[str] = field(default_factory=set)
+    # 本轮学生明确提到/操作的记忆条目：正文材料优先展开它们的附注与作答序列。
+    memory_focus_entry_ids: set[str] = field(default_factory=set)
     recovery: dict[str, Any] = field(default_factory=dict)
     action_index: int = -1
 
@@ -433,6 +466,7 @@ class ConversationService:
         make_reply: Callable[[], Any] | None = None,
         papers: PaperService | None = None,
         records: MistakeRecordService | None = None,
+        memory: Any | None = None,
         attachments_root: Path = ATTACHMENTS_ROOT,
         question_runtime: QuestionRuntime | None = None,
     ) -> None:
@@ -447,6 +481,7 @@ class ConversationService:
         self._make_reply = make_reply
         self._papers = papers
         self._records = records
+        self._memory = memory
         self._attachments_root = attachments_root
         self._owns_question_runtime = question_runtime is None
         self.questions = question_runtime or QuestionRuntime(
@@ -1155,6 +1190,9 @@ class ConversationService:
         text, meta = await self._stream_reply(self._make_reply(), material)
         if not text:
             raise ConversationConflictError("这次仍然没能生成回复，请稍后再试。")
+        notice = self._memory_notice_from_material(material)
+        if notice and notice not in text:
+            text = text + "\n\n" + notice
 
         recovery["reply"] = meta
         self._repository.update_turn_reply(
@@ -3056,6 +3094,7 @@ class ConversationService:
                         for it in json.loads(ctx_record.last_suggestions_json)
                     ]
             recent_summary = self._recent_turns_summary(prepared.conversation_id)
+            memory_context = self._prepare_memory_context(prepared, ctx)
 
             capability = self.questions.capability(
                 ctx.confirmed_course or "Python语言程序设计"
@@ -3104,6 +3143,7 @@ class ConversationService:
                         ctx.active_exercise
                     ),
                     "question_context": question_context,
+                    "memory_context": memory_context,
                     "last_suggestions": last_sugs,
                     "recent_turns_summary": recent_summary,
                     "has_attachments": bool(prepared.input.attachments),
@@ -3125,7 +3165,7 @@ class ConversationService:
             suggestions = self._dynamic_suggestions(final_state, composite_results)
             # 先算好正文材料并落盘，再开始流式输出：客户端中断或进程重启时，
             # 业务结果和“只重做正文”的材料都已经在库里。
-            fallback_text = self._dynamic_reply(final_state, composite_results)
+            fallback_text = self._dynamic_reply(final_state, composite_results, ctx)
             material = self._build_reply_material(
                 prepared, ctx, composite_results, suggestions, recent_summary
             )
@@ -3139,6 +3179,10 @@ class ConversationService:
                 self._repository.save_recovery(
                     prepared.conversation_id, prepared.request_id, ctx.recovery
                 )
+            # 历史轮次的题卡只是“上次看到哪”，不能冒充本轮结果：否则学生只查一次
+            # 试卷，界面会把上一轮的整卷题卡再渲染一遍，正文还会照着历史标题
+            # 编出“先列出第 1 到第 5 题”。
+            own_questions = ctx.question_source_turn == prepared.request_id
             self._repository.complete_dynamic_turn(
                 conversation_id=prepared.conversation_id,
                 request_id=prepared.request_id,
@@ -3150,9 +3194,13 @@ class ConversationService:
                 composite_results=composite_results,
                 assistant_message=fallback_text,
                 suggestions=suggestions,
-                question_results=ctx.question_results,
-                question_result_status=ctx.question_result_status,
-                question_result_message=ctx.question_result_message,
+                question_results=ctx.question_results if own_questions else [],
+                question_result_status=(
+                    ctx.question_result_status if own_questions else None
+                ),
+                question_result_message=(
+                    ctx.question_result_message if own_questions else None
+                ),
                 question=ctx.question_card,
                 problem_id=ctx.problem_id,
                 exercise_id=ctx.exercise_id,
@@ -3217,6 +3265,7 @@ class ConversationService:
             )
             return
 
+        own_questions = ctx.question_source_turn == prepared.request_id
         state.saved = True
         queue.put_nowait(
             TurnResultEvent(
@@ -3230,9 +3279,13 @@ class ConversationService:
                 composite_results=composite_results,
                 assistant_message=reply_text,
                 suggestions=suggestions,
-                question_results=ctx.question_results,
-                question_result_status=ctx.question_result_status,  # type: ignore[arg-type]
-                question_result_message=ctx.question_result_message,
+                question_results=ctx.question_results if own_questions else [],
+                question_result_status=(
+                    ctx.question_result_status if own_questions else None  # type: ignore[arg-type]
+                ),
+                question_result_message=(
+                    ctx.question_result_message if own_questions else None
+                ),
                 question=ctx.question_card,
                 exercise_id=ctx.exercise_id,
                 reply_status=reply_status,  # type: ignore[arg-type]
@@ -3271,6 +3324,7 @@ class ConversationService:
     @staticmethod
     def _context_snapshot(ctx: _DynamicContext) -> dict[str, Any]:
         return {"confirmed_course": ctx.confirmed_course, "problem_id": ctx.problem_id,
+                "question_context": ctx.question_context,
                 "exercise_id": ctx.exercise_id,
                 "question": {
                     "selection_id": (
@@ -3321,6 +3375,7 @@ class ConversationService:
             question_source_turn=question.get("source_turn"),
             question_result_status=question.get("status"),
             question_result_message=question.get("message"),
+            question_context=dict(snapshot.get("question_context") or {}),
             result=ResultEvent.model_validate(snapshot["result"]) if snapshot.get("result") else None,
             tutoring=TypeAdapter(TutoringResult).validate_python(snapshot["tutoring"]) if snapshot.get("tutoring") else None,
             exercise_view=ExerciseView.model_validate(snapshot["exercise_view"]) if snapshot.get("exercise_view") else None,
@@ -3398,10 +3453,11 @@ class ConversationService:
             )
         return items
 
-    @staticmethod
     def _dynamic_reply(
+        self,
         final_state: dict[str, Any],
         composite_results: list[ActionResultItem],
+        ctx: "_DynamicContext | None" = None,
     ) -> str:
         all_failed = [it for it in composite_results if it.status == "failed"]
         failed = [it for it in all_failed if not it.details.get("skipped")] or all_failed
@@ -3446,7 +3502,423 @@ class ConversationService:
             return "\n".join(it.message for it in composite_results)
         if assistant_reply:
             return assistant_reply
+        if ctx is not None and ctx.memory_view is not None:
+            # 没有调用工具、只凭本轮记忆上下文作答：用程序统计好的事实兜底，
+            # 不让空回复或“已为您处理完成”盖掉真实记录。
+            view = ctx.memory_view
+            parts = [view.range_text + "。"]
+            if view.suggestions:
+                parts.append("建议先补：" + "；".join(view.suggestions))
+            elif view.counts.evidence == 0:
+                parts.append(view.message)
+            return "".join(parts)
         return "已为您处理完成。"
+
+    # ------------------------------------------------------------------
+    # F009 学习记忆
+    # ------------------------------------------------------------------
+
+    _MEMORY_INTENT = re.compile(
+        r"学习记忆|学习记录|复习建议|先补|补哪|弱项|薄弱|最近学|学到哪|从哪开始|"
+        r"怎么复习|怎么安排|我的记录|记得我|我学过|复习计划|学习情况"
+    )
+    _MEMORY_DELETE_INTENT = re.compile(r"删|移除|去掉|别算|不算|不要算|不参与|别记")
+    _MEMORY_DELETE_MESSAGE = "从学习记忆和复习建议中移除，原会话记录保留。"
+    _MEMORY_DELETE_REPEAT = "这条记忆之前已经移除，原会话记录保留。"
+    _MEMORY_UNAVAILABLE_TEXT = (
+        "【学习记忆】学习记忆暂时无法读取；回复时如实说明读不到，也不要编造复习建议。"
+    )
+
+    def _memory_course(
+        self,
+        ctx: _DynamicContext,
+        action: ActionPlan | None,
+        text: str,
+        confirmed: str | None = None,
+    ) -> str | None:
+        """课程归属：工具参数 > 本轮明说 > 本轮调度确认 > 已存上下文 > 记忆默认课程。
+
+        本轮明确换课时必须压过上一轮的记忆课程，否则学生说“换高数”仍会读到
+        Python 的记录；历史课程的“反推”也在这里被排除。
+        """
+
+        if action is not None:
+            course = action.parameters.get("course")
+            if isinstance(course, str) and course.strip():
+                return normalize_course(course.strip())
+        detected = detect_course(text)
+        if detected:
+            return normalize_course(detected)
+        if confirmed:
+            return normalize_course(confirmed)
+        if ctx.confirmed_course:
+            return normalize_course(ctx.confirmed_course)
+        if ctx.memory_course:
+            return ctx.memory_course
+        return None
+
+    def _prepare_memory_context(
+        self, prepared: ExecuteTurn, ctx: _DynamicContext, *, force: bool = False
+    ) -> str | None:
+        """本轮是否要注入学习记忆；读取失败必须与“没有记录”区分开。
+
+        - 未配置记忆服务：不注入，也不影响其他能力；
+        - 学生本轮没提复习/记忆且还没有上下文：不额外查库，避免每轮都读；
+        - 读取失败：注入“暂时无法读取”，让回复如实说明。
+        """
+
+        if self._memory is None:
+            return None
+        text = prepared.input.text or ""
+        if (
+            not force
+            and ctx.memory_text is None
+            and not self._MEMORY_INTENT.search(text)
+        ):
+            return None
+        course = self._memory_course(ctx, None, text)
+        if course is None:
+            ctx.memory_status = "needs_course"
+            ctx.memory_text = (
+                "【学习记忆】学生还没有确定课程：要给复习建议时先问清楚是哪一门课。"
+            )
+            return ctx.memory_text
+        try:
+            view = self._memory.summary(course, days=30, limit=50)
+        except Exception:
+            logger.warning("学习记忆读取失败", exc_info=True)
+            ctx.memory_view = None
+            ctx.memory_status = "unavailable"
+            ctx.memory_text = self._MEMORY_UNAVAILABLE_TEXT
+            return ctx.memory_text
+        ctx.memory_view = view
+        ctx.memory_course = course
+        ctx.memory_status = view.status
+        ctx.memory_text = context_line(view)
+        return ctx.memory_text
+
+    @staticmethod
+    def _memory_notice(results: list[ActionResultItem]) -> str | None:
+        """成功移除时必须原样告诉学生“原会话记录保留”。"""
+
+        for item in results:
+            if item.action != "delete_memory" or item.status != "success":
+                continue
+            message = (item.details or {}).get("memory_message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        return None
+
+    def _memory_notice_from_material(self, material: ReplyMaterial) -> str | None:
+        """重做正文时也要保留“原会话记录保留”的原话。"""
+
+        for item in material.results:
+            if item.action != "delete_memory":
+                continue
+            if item.message in (
+                self._MEMORY_DELETE_MESSAGE,
+                self._MEMORY_DELETE_REPEAT,
+            ):
+                return item.message
+        return None
+
+    def _memory_material(
+        self, ctx: _DynamicContext, *, text: str | None = None
+    ) -> str | None:
+        if self._memory is None:
+            return None
+        if ctx.memory_status == "unavailable":
+            return self._MEMORY_UNAVAILABLE_TEXT
+        if ctx.memory_view is None:
+            return None
+        focus = set(ctx.memory_focus_entry_ids)
+        if text:
+            focus.update(self._memory_focus_ids(ctx, text))
+        try:
+            return material_block(ctx.memory_view, focus_entry_ids=focus)
+        except Exception:
+            logger.warning("学习记忆材料生成失败", exc_info=True)
+            return self._MEMORY_UNAVAILABLE_TEXT
+
+    @staticmethod
+    def _memory_focus_ids(ctx: _DynamicContext, text: str) -> set[str]:
+        """学生原话里提到的知识点/题干，视为本轮明确询问的条目。"""
+
+        view = ctx.memory_view
+        if view is None:
+            return set()
+        compact = re.sub(r"\s+", "", text or "").casefold()
+        if not compact:
+            return set()
+        found: set[str] = set()
+        for entry in list(view.entries) + list(view.pending_course_entries):
+            needles = [
+                point for point in entry.knowledge_points if len(point.strip()) >= 2
+            ]
+            if entry.statement_excerpt:
+                needles.append(entry.statement_excerpt[:24])
+            for needle in needles:
+                key = re.sub(r"\s+", "", needle).casefold()
+                if len(key) >= 2 and key in compact:
+                    found.add(entry.entry_id)
+                    break
+        return found
+
+    def _memory_review_outcome(
+        self,
+        prepared: ExecuteTurn,
+        action: ActionPlan,
+        ctx: _DynamicContext,
+        text: str,
+        *,
+        confirmed_course: str | None = None,
+    ) -> ActionOutcome:
+        name = action.action
+        if self._memory is None:
+            return ActionOutcome(
+                name,
+                "failed",
+                "学习记忆暂时不可用，请稍后再试。",
+                error_code="MEMORY_UNAVAILABLE",
+                retryable=True,
+            )
+        course = self._memory_course(ctx, action, text, confirmed_course)
+        if course is None:
+            return ActionOutcome(
+                name,
+                "clarification",
+                "要给学习建议，得先知道是哪门课：你现在复习的是哪一门？",
+                needs_user=True,
+            )
+        days = int(action.parameters.get("days") or 30)
+        limit = int(action.parameters.get("limit") or 20)
+        try:
+            view = self._memory.summary(course, days=days, limit=limit)
+        except Exception:
+            logger.warning("学习记忆读取失败", exc_info=True)
+            ctx.memory_status = "unavailable"
+            ctx.memory_text = self._MEMORY_UNAVAILABLE_TEXT
+            return ActionOutcome(
+                name,
+                "failed",
+                "学习记忆暂时无法读取，请稍后再试。",
+                error_code="MEMORY_UNAVAILABLE",
+                retryable=True,
+            )
+
+        ctx.memory_view = view
+        ctx.memory_course = course
+        ctx.memory_status = view.status
+        ctx.memory_text = context_line(view)
+        entries = list(view.entries) + list(view.pending_course_entries)
+        ctx.memory_entry_ids = {entry.entry_id for entry in entries}
+        for entry in entries:
+            ctx.memory_entry_ids.update(
+                f"attempt:{attempt.attempt_id}" for attempt in entry.attempts
+            )
+
+        if view.status == "empty":
+            message = view.message
+        else:
+            message = view.range_text + "。"
+            if view.suggestions:
+                message += "建议先补：" + "；".join(view.suggestions)
+            else:
+                message += "暂时没有需要优先补的知识点。"
+        details = {
+            "status": view.status,
+            "memory_course": course,
+            "memory_range": view.range.model_dump(mode="json"),
+            "memory_counts": view.counts.model_dump(mode="json"),
+            "memory_groups": [
+                group.model_dump(mode="json") for group in view.groups
+            ],
+            "memory_suggestions": list(view.suggestions),
+            "memory_pending": view.counts.pending_course,
+            # 待确认条目也要带编号：否则模型知道“有 11 条待确认”却没法纠正归属。
+            "memory_entries": [self._memory_entry_detail(entry) for entry in entries],
+        }
+        return ActionOutcome(name, "success", message, details)
+
+    @staticmethod
+    def _memory_entry_detail(entry: MemoryEntryView) -> dict[str, Any]:
+        """工具结果里的一条记忆：编号、首末变化、附注和每次作答的编号。"""
+
+        return {
+            "entry_id": entry.entry_id,
+            "kind": entry.kind,
+            "course": entry.course,
+            "course_source": entry.course_source,
+            "pending_course": entry.course is None,
+            "verdict": entry.verdict,
+            "first_verdict": entry.first_verdict,
+            "knowledge_points": entry.knowledge_points,
+            "validity": entry.validity,
+            "validity_note": entry.validity_note,
+            "note": entry.note,
+            "recorded_at": entry.recorded_at.isoformat(),
+            "first_at": entry.first_at.isoformat() if entry.first_at else None,
+            "wrong_at": entry.wrong_at.isoformat() if entry.wrong_at else None,
+            "source": entry.source,
+            "attempts": [
+                {
+                    "attempt_id": attempt.attempt_id,
+                    "attempt_no": attempt.attempt_no,
+                    "kind": attempt.kind,
+                    "verdict": attempt.verdict,
+                    "is_correct": attempt.is_correct,
+                    "independence": attempt.independence,
+                    "recorded_at": attempt.recorded_at.isoformat(),
+                    "excluded": attempt.excluded,
+                }
+                for attempt in entry.attempts
+            ],
+        }
+
+    def _memory_write_target(
+        self, action: ActionPlan, ctx: _DynamicContext
+    ) -> tuple[tuple[str, str] | None, ActionOutcome | None]:
+        """只允许改本轮真实返回过的条目，防止模型凭记忆拼 entry_id。"""
+
+        raw = action.parameters.get("entry_id")
+        parsed = parse_entry_id(raw if isinstance(raw, str) else "")
+        if parsed is None:
+            return None, ActionOutcome(
+                action.action,
+                "failed",
+                "条目编号不合法：先查看学习记忆，再按返回的编号操作。",
+                error_code="INVALID_INPUT",
+                needs_user=True,
+            )
+        entry_id = f"{parsed[0]}:{parsed[1]}"
+        if entry_id not in ctx.memory_entry_ids:
+            return None, ActionOutcome(
+                action.action,
+                "failed",
+                "只能修改本轮学习记忆结果里出现过的条目；我先帮你把记录列出来。",
+                error_code="INVALID_INPUT",
+                needs_user=True,
+            )
+        return parsed, None
+
+    def _memory_correct_outcome(
+        self, prepared: ExecuteTurn, action: ActionPlan, ctx: _DynamicContext
+    ) -> ActionOutcome:
+        name = action.action
+        if self._memory is None:
+            return ActionOutcome(
+                name, "failed", "学习记忆暂时不可用，请稍后再试。",
+                error_code="MEMORY_UNAVAILABLE", retryable=True,
+            )
+        parsed, error = self._memory_write_target(action, ctx)
+        if error is not None:
+            return error
+        assert parsed is not None
+        if parsed[0] == "attempt":
+            return ActionOutcome(
+                name,
+                "failed",
+                "单次作答只能整体移除，不能单独纠正归属。",
+                error_code="INVALID_INPUT",
+                needs_user=True,
+            )
+        request = MemoryCorrectionRequest(
+            course=action.parameters.get("course"),
+            knowledge_point=action.parameters.get("knowledge_point"),
+            note=action.parameters.get("note"),
+        )
+        try:
+            view = self._memory.correct(parsed[0], parsed[1], request)
+        except MemoryEntryNotFoundError:
+            return ActionOutcome(
+                name,
+                "failed",
+                "没有这条学习记忆（原记录可能已经删除）。",
+                error_code="NOT_FOUND",
+                needs_user=True,
+            )
+        except MemoryCorrectionUnsupportedError as exc:
+            return ActionOutcome(
+                name, "failed", str(exc), error_code="INVALID_INPUT", needs_user=True
+            )
+        except Exception:
+            logger.warning("学习记忆纠正失败", exc_info=True)
+            return ActionOutcome(
+                name,
+                "failed",
+                "学习记忆暂时无法更新，请稍后再试。",
+                error_code="MEMORY_UNAVAILABLE",
+                retryable=True,
+            )
+
+        # 纠正后立刻重新汇总：正文和下一轮建议都要读最新状态。
+        ctx.memory_focus_entry_ids.add(f"{parsed[0]}:{parsed[1]}")
+        self._prepare_memory_context(prepared, ctx, force=True)
+        parts = [f"已把这条学习记忆更正为：课程 {view.course or '待确认'}"]
+        if view.knowledge_points:
+            parts.append("知识点 " + "、".join(view.knowledge_points))
+        if view.note:
+            parts.append("补充说明 " + view.note)
+        return ActionOutcome(
+            name,
+            "success",
+            "；".join(parts),
+            {
+                "memory_entry_id": view.entry_id,
+                "memory_course": view.course,
+                "memory_entry": view.model_dump(mode="json"),
+            },
+        )
+
+    def _memory_delete_outcome(
+        self, prepared: ExecuteTurn, action: ActionPlan, ctx: _DynamicContext
+    ) -> ActionOutcome:
+        name = action.action
+        if self._memory is None:
+            return ActionOutcome(
+                name, "failed", "学习记忆暂时不可用，请稍后再试。",
+                error_code="MEMORY_UNAVAILABLE", retryable=True,
+            )
+        parsed, error = self._memory_write_target(action, ctx)
+        if error is not None:
+            return error
+        assert parsed is not None
+        try:
+            removed = self._memory.delete(
+                parsed[0], parsed[1], reason=action.parameters.get("reason")
+            )
+        except MemoryEntryNotFoundError:
+            return ActionOutcome(
+                name,
+                "failed",
+                "没有这条学习记忆（原记录可能已经删除）。",
+                error_code="NOT_FOUND",
+                needs_user=True,
+            )
+        except Exception:
+            logger.warning("学习记忆移除失败", exc_info=True)
+            return ActionOutcome(
+                name,
+                "failed",
+                "学习记忆暂时无法更新，请稍后再试。",
+                error_code="MEMORY_UNAVAILABLE",
+                retryable=True,
+            )
+        self._prepare_memory_context(prepared, ctx, force=True)
+        ctx.memory_focus_entry_ids.add(f"{parsed[0]}:{parsed[1]}")
+        message = (
+            self._MEMORY_DELETE_MESSAGE if removed else self._MEMORY_DELETE_REPEAT
+        )
+        return ActionOutcome(
+            name,
+            "success",
+            message,
+            {
+                "memory_entry_id": f"{parsed[0]}:{parsed[1]}",
+                "memory_removed": removed,
+                "memory_message": message,
+            },
+        )
 
     def _build_reply_material(
         self,
@@ -3470,6 +3942,9 @@ class ConversationService:
             # 但如果这一轮已经完成讲解，就必须先把讲解写进正文（见下）。
             # “只要提示/只问考点”不是纯澄清：正文必须真的给出提示或考点。
             return None
+        # 只有本轮真的查过题，才把题目标题和整卷浏览进度交给正文；否则模型会
+        # 拿着上一轮的题目编“这次先列出第 1 到第 5 题，回复继续看下一批”。
+        own_questions = ctx.question_source_turn == prepared.request_id
         return self._restrict_reply_material(build_material(
             user_text=prepared.input.text,
             course=ctx.confirmed_course,
@@ -3479,15 +3954,28 @@ class ConversationService:
                 if ctx.answer_scope is not None
                 else (clarified[-1].message if clarified else self._waiting_for(composite_results))
             ),
-            question_titles=self._question_titles(ctx.question_results),
-            question_materials=self._question_materials(ctx, prepared.input.text),
+            question_titles=(
+                self._question_titles(ctx.question_results) if own_questions else []
+            ),
+            question_materials=self._question_materials(
+                ctx,
+                prepared.input.text,
+                ctx.question_results if own_questions else [],
+            ),
             question_page=(
-                ctx.question_context if ctx.question_context.get("paper_id") else None
+                ctx.question_context
+                if own_questions
+                and ctx.question_context.get("paper_id")
+                and not ctx.question_context.get("query")
+                else None
             ),
             answer_scope=ctx.answer_scope,
             suggestions=[item.label for item in suggestions],
             context_summary=recent_summary,
             teaching=teaching,
+            learning_memory=self._memory_material(
+                ctx, text=prepared.input.text
+            ),
         ))
 
     @classmethod
@@ -3527,7 +4015,9 @@ class ConversationService:
         return f"已选中《{title}》的{kind}第 {number} 题。"
 
     @staticmethod
-    def _question_materials(ctx: _DynamicContext, text: str = "") -> list[str]:
+    def _question_materials(
+        ctx: _DynamicContext, text: str = "", results: list[Any] | None = None
+    ) -> list[str]:
         """本轮公开题面材料：题干、选项、代码、知识点与来源（不含答案）。
 
         只放本轮真实返回、并且已经在卡片上展示给学生的题；“第 5 题”这类
@@ -3539,7 +4029,7 @@ class ConversationService:
         cards: list[QuestionCard] = []
         if ctx.question_card is not None:
             cards.append(ctx.question_card)
-        for card in ctx.question_results:
+        for card in (ctx.question_results if results is None else results):
             if all(item.question_id != card.question_id for item in cards):
                 cards.append(card)
         wanted = candidate_number(text)
@@ -3605,7 +4095,7 @@ class ConversationService:
         与“程序兜底”，报告不能把兜底算作自然回复验证通过。
         """
 
-        fallback = self._dynamic_reply(final_state, composite_results)
+        fallback = self._dynamic_reply(final_state, composite_results, ctx)
         clarified = [it for it in composite_results if it.status == "clarification"]
         if material is None:
             material = self._build_reply_material(
@@ -3648,6 +4138,14 @@ class ConversationService:
                 text = text + extra
                 meta["deltas"] = seq
         if text:
+            # 移除学习的记忆是程序事实：模型换了说法也不能把“原会话记录保留”说丢。
+            notice = self._memory_notice(composite_results)
+            if notice and notice not in text:
+                seq = int(meta.get("deltas") or 0) + 1
+                extra = "\n\n" + notice
+                on_piece(extra, seq)
+                text = text + extra
+                meta["deltas"] = seq
             return text, meta
         return fallback, dict(meta, mode="fallback")
 
@@ -3794,10 +4292,10 @@ class ConversationService:
         exercise = ctx.exercise_view
         if exercise is not None:
             solution = getattr(exercise, "reference_solution_text", None)
-            if solution:
-                # 只有学生主动“查看参考解答”之后，这里才会有内容。
-                return f"参考解答（学生已主动查看）：{solution[:900]}"
             evaluation = getattr(exercise, "evaluation", None)
+            if solution and getattr(ctx, "evaluation_view", None) is None:
+                # 本轮主动查看解答时，不让旧评价覆盖刚打开的解答。
+                return f"参考解答（已向学生开放）：{solution[:900]}"
             if evaluation is not None:
                 # 判定与“是否需要补步骤”是两件事：判错不等于要补充，
                 # 依据不足也不等于答错。分别表达，正文才不会改写原评价含义。
@@ -3815,7 +4313,15 @@ class ConversationService:
                     f"步骤分析：{evaluation.step_by_step_analysis[:400]}",
                     f"建议：{evaluation.guidance[:300]}",
                 ]
+                attempts = getattr(exercise, "attempts", None) or []
+                attachments = attempts[-1].attachments if attempts else getattr(exercise, "attachments", [])
+                if attachments:
+                    parts.insert(0, f"评价阶段已读取 {len(attachments)} 张过程图片；以下是已完成的批改结果。正文无需重新识图，不得否认评价阶段收到图片。")
+                if solution:
+                    parts.append(f"参考解答（已向学生开放）：{solution[:900]}")
                 return "\n".join(parts)
+            if solution:
+                return f"参考解答（已向学生开放）：{solution[:900]}"
         return None
 
     @staticmethod
@@ -3927,6 +4433,7 @@ class ConversationService:
         return {
             "confirmed_course": ctx.confirmed_course,
             "question_context": self._question_context_line(ctx, review_state),
+            "memory_context": ctx.memory_text,
             "active_problem_text": (
                 active_problem.statement_text
                 if active_problem is not None
@@ -3977,7 +4484,7 @@ class ConversationService:
         returned = context.get("returned") or 0
         if total is not None:
             parts.append(f"共 {total} 道已审核题目")
-        if returned:
+        if returned and not context.get("query"):
             parts.append(
                 f"已展示第 {offset + 1}–{offset + returned} 道"
                 + (f"，下一批从第 {offset + returned + 1} 道开始" if context.get("next_offset") else "，已全部展示")
@@ -3988,9 +4495,8 @@ class ConversationService:
             )
         elif ctx.question_results:
             parts.append("学生还没指定哪一道；他来问考点或要讲解时按题号定位")
-        parts.append(
-            "学生说“刚刚那张卷”“这张卷”时沿用当前试卷；说“继续/下一批”时从上一句的位置往后"
-        )
+        if context.get("paper_id"):
+            parts.append("学生说“刚刚那张卷”“这张卷”时沿用当前试卷；说“继续/下一批”时从上一句的位置往后")
         return "；".join(parts)[:400]
 
     def _guard_dynamic_action(
@@ -4010,7 +4516,52 @@ class ConversationService:
 
         name = action.action
         stripped = (text or "").strip()
-        if not stripped or name not in _RED_LINE_ACTIONS:
+        if not stripped:
+            return None
+
+        # 查卷只负责把试卷定位出来并给下载入口。学生只点名一份试卷（没提题型、
+        # 题号、题目、考点或讲解）时，模型不能顺手把整卷题目展开——这是截图里
+        # “只发卷名却列出 59 道题”的真实原因。同一轮先查卷再列题时一律拦下；
+        # 学生下一轮说“这张卷的选择题”时，本轮并没有新查卷结果，不会被误拦。
+        if name in _QUESTION_CONTENT_ACTIONS and not _QUESTION_CONTENT_REQUEST_RE.search(
+            stripped
+        ):
+            located = ctx.result
+            if (
+                located is not None
+                and located.kind == "found"
+                and located.total == 1
+            ):
+                return ActionOutcome(
+                    name,
+                    "clarification",
+                    f"{located.message}要列这份卷的题目、看某一道或讲解，你说一声我再展开。",
+                    needs_user=True,
+                )
+
+        # 学习记忆的写操作只允许落在本轮真实返回过的条目上；删除还需要学生
+        # 明确表达“移除”的意图，避免模型把“这题我其实会”当成删除指令。
+        if name in ("correct_memory", "delete_memory"):
+            raw = action.parameters.get("entry_id")
+            parsed = parse_entry_id(raw if isinstance(raw, str) else "")
+            if parsed is None or f"{parsed[0]}:{parsed[1]}" not in ctx.memory_entry_ids:
+                return ActionOutcome(
+                    name,
+                    "clarification",
+                    "要先看到这条学习记忆才能改它：我把最近的记录列出来，你再指哪一条。",
+                    needs_user=True,
+                )
+            if name == "delete_memory" and not self._MEMORY_DELETE_INTENT.search(
+                stripped
+            ):
+                return ActionOutcome(
+                    name,
+                    "clarification",
+                    "要把这条从学习记忆和复习建议里移除吗？原会话记录会保留。",
+                    needs_user=True,
+                )
+
+        if name not in _RED_LINE_ACTIONS:
             return None
 
         explicit = bool(
@@ -4153,7 +4704,7 @@ class ConversationService:
             return await self._dynamic_explain(prepared, action, ctx, emit)
 
         if name in ("followup_problem", "followup"):
-            return await self._dynamic_followup(prepared, ctx, emit)
+            return await self._dynamic_followup(prepared, ctx, emit, action.parameters.get("target", "auto"))
 
         if name == "generate_exercise":
             return await self._dynamic_generate_exercise(prepared, ctx, emit)
@@ -4167,7 +4718,7 @@ class ConversationService:
 
         if name == "record_mistake":
             with self._repository.action_write():
-                return self._dynamic_record_mistake(prepared, ctx, emit)
+                return self._dynamic_record_mistake(prepared, ctx, emit, action.parameters.get("user_feedback"))
 
         if name == "record_feedback":
             active = ctx.active_problem
@@ -4191,6 +4742,30 @@ class ConversationService:
                     "已记录“我懂了”反馈",
                     {"problem_id": active.id},
                 ))
+
+        if name == "review_memory":
+            return self._action_result(
+                prepared,
+                ctx,
+                self._memory_review_outcome(
+                    prepared,
+                    action,
+                    ctx,
+                    prepared.input.text,
+                    confirmed_course=review_state.get("confirmed_course"),
+                ),
+            )
+
+        if name == "correct_memory":
+            # 记忆写入走独立连接，不占用会话库的写事务，避免与恢复记录互锁。
+            return self._action_result(
+                prepared, ctx, self._memory_correct_outcome(prepared, action, ctx)
+            )
+
+        if name == "delete_memory":
+            return self._action_result(
+                prepared, ctx, self._memory_delete_outcome(prepared, action, ctx)
+            )
 
         if name == "clarify_or_reply":
             # 原生工具把澄清问题放在 ask_user 的 question 参数里；旧动作记录
@@ -4235,7 +4810,8 @@ class ConversationService:
                 name, "clarification", self._exhausted_text(ctx, intent), needs_user=True
             ))
         result = await self._run_question_search(
-            prepared, ctx, name, intent, emit
+            prepared, ctx, name, intent, emit,
+            exclude_question_id=self._similar_source_question(prepared.input.text, ctx),
         )
         if isinstance(result, ActionOutcome):
             return result
@@ -4261,6 +4837,8 @@ class ConversationService:
         name: str,
         intent: Any,
         emit: Callable[[str, str], None],
+        *,
+        exclude_question_id: str | None = None,
     ) -> Any:
         """执行一次题库检索；失败时返回可以直接回传的 ``ActionOutcome``。"""
 
@@ -4277,7 +4855,7 @@ class ConversationService:
             preview_candidates=False,
         )
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 asyncio.to_thread(
                     self.questions.search,
                     request,
@@ -4299,6 +4877,15 @@ class ConversationService:
                 name, "failed", exc.message, error_code=exc.code,
                 retryable=exc.status_code == 503,
             ))
+        if exclude_question_id and result.cards:
+            # 学生要的是“另一道类似的题”，把刚做过的原题过滤掉；请求时已经
+            # 多要了一条，所以过滤后仍有内容可展示。
+            kept = [c for c in result.cards if c.question_id != exclude_question_id]
+            if len(kept) != len(result.cards):
+                result = result.model_copy(
+                    update={"cards": kept, "returned": len(kept)}
+                )
+        return result
 
     def _question_search_outcome(
         self,
@@ -4357,7 +4944,7 @@ class ConversationService:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name, "clarification", result.message, needs_user=True
             ))
-        paper_id, paper_title = self._result_paper(result)
+        paper_id, paper_title = self._result_paper(result) if intent.paper_id else (None, None)
         if intent.paper_id:
             # 只有本轮真的锁定了某份试卷才记成“当前试卷”。跨卷相关度检索可能
             # 命中不同试卷的题，不能随手把其中一张记成学生选中的卷。
@@ -4378,7 +4965,8 @@ class ConversationService:
         else:
             # 没有锁定试卷的相关度检索也要留下检索条件，供“换一道”继承。
             ctx.question_context = {
-                **ctx.question_context,
+                "paper_id": None,
+                "paper_title": None,
                 "query": intent.query,
                 "question_type": intent.question_type,
                 "number_label": intent.number_label,
@@ -4471,20 +5059,23 @@ class ConversationService:
     def _result_paper(result: QuestionSearchResult) -> tuple[str | None, str | None]:
         if result.paper_id:
             return result.paper_id, result.paper_title
-        for card in result.cards:
-            if card.source.paper_id:
-                return card.source.paper_id, card.source.paper_title
         return None, None
 
     def _range_text(self, result: QuestionSearchResult, intent: Any) -> str:
         """“共 N 道，本次第 a–b 道，还有多少没显示”。"""
 
         kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
-        paper_title = result.paper_title
+        paper_title = result.paper_title if intent.paper_id else None
         scope = f"{paper_title}的" if paper_title else ""
         kind = kinds.get(intent.question_type or "", "")
         label = f"{scope}{kind}" if kind else (f"{scope}题目" if paper_title else "已审核真题")
         total = result.total if result.total is not None else len(result.cards)
+        if intent.query:
+            scope = f"《{paper_title or intent.paper_id}》" if intent.paper_id else f"{intent.course or '当前课程'}题库"
+            return (
+                f"在{scope}中按“{intent.query}”查找{kind or '真题'}，本次展示 {len(result.cards)} 道。"
+                "这是按相关性选出的题目，不表示已经列出所有相关题。"
+            )
         if intent.number_label is not None:
             if intent.question_type is None and len(result.cards) > 1:
                 kinds_all = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
@@ -4526,6 +5117,20 @@ class ConversationService:
             # 旧会话里只有题卡时，不能把任意一次查题都算成“这张卷”。
             current_paper = None
         parameters = dict(action.parameters)
+        # 明确跨卷与“沿用当前卷”互斥：先删模型带来的旧 ID，“这道题”之类的
+        # 指代也不能把旧卷重新写回去（见 §7.7 R3）。
+        cross_paper = asks_across_papers(text)
+        if cross_paper:
+            parameters.pop("paper_id", None)
+        # 最近成功浏览是指代依据；旧选题和模型带来的旧卷 ID 都不能覆盖它。
+        # 新年份/学期等显式条件仍由 extract_intent 优先核对。
+        if current_paper and not cross_paper and self._refers_to_current_paper(text):
+            parameters["paper_id"] = current_paper
+        explicit = extract_intent(text, confirmed_course=confirmed, papers=papers)
+        if explicit.paper_id:
+            # 明确年份/学期/卷名能唯一定位时，在共用入口先消除旧 ID；
+            # 底层解析器仍保留“条件冲突必须澄清”的校验契约。
+            parameters["paper_id"] = explicit.paper_id
         if parameters.get("paper_id"):
             # 模型给的试卷 ID 必须真实存在；不存在就当没给，由上下文或原文决定。
             known = {str(item.get("id")) for item in papers}
@@ -4562,7 +5167,13 @@ class ConversationService:
         auto = bool(parameters.get("auto_explain") or action.parameters.get("auto_explain"))
         auto = auto and self._wants_explanation(text)
         intent = replace(intent, course=course, query=query, auto_explain=auto)
-        return self._apply_page_position(text, intent, context, ctx)
+        intent = self._apply_page_position(text, intent, context, ctx)
+        if self._source_question_id(ctx) is not None and (
+            asks_across_papers(text) or _SIMILAR_QUESTION_RE.search(text or "")
+        ):
+            # 会过滤掉原题，所以多要一条，避免过滤后这一页变空。
+            intent = replace(intent, limit=min(intent.limit + 1, 64))
+        return intent
 
     def _apply_page_position(
         self,
@@ -4648,6 +5259,33 @@ class ConversationService:
         return bool(
             re.search(r"继续|接着|下一批|下一页|下一部分|剩下的|其余的|后面那些|还没(看|显示|列)", text or "")
         )
+
+    def _similar_source_question(self, text: str, ctx: _DynamicContext) -> str | None:
+        """要求学生找“类似的题”时，返回应当排除的原题 ID。
+
+        不排除的话，按相关度检索往往把学生刚做完的那道原题排在第一位，
+        等于把原题又发了一遍。
+        """
+
+        if not (_SIMILAR_QUESTION_RE.search(text or "") or asks_across_papers(text)):
+            return None
+        return self._source_question_id(ctx)
+
+    def _source_question_id(self, ctx: _DynamicContext) -> str | None:
+        """学生此刻在看的题：优先选中的题，否则用当前页码/卷内的那张卡。"""
+
+        if ctx.question_card is not None:
+            return ctx.question_card.question_id
+        pool = list(ctx.question_results)
+        if not pool:
+            return None
+        context = self._question_context(ctx)
+        number = context.get("number_label")
+        if number:
+            for card in pool:
+                if card.number_label == str(number):
+                    return card.question_id
+        return pool[0].question_id
 
     def _course_for_paper(self, paper_id: str | None) -> str | None:
         """按试卷反查课程；目录不可用时返回 None。"""
@@ -4770,8 +5408,13 @@ class ConversationService:
 
         if ctx.question_context:
             return dict(ctx.question_context)
+        state = self._paper_state(ctx)
+        if state is not None:
+            # 明确换卷失败或正在等学生补充卷别：不能用更早的成功记录补位，
+            # 否则“这张卷”会静默指回旧卷（§7.7 R1）。
+            return dict(state) if state.get("status") == "unlocated" else {}
         try:
-            stored = self._repository.find_question_context(ctx.conversation_id)
+            stored = self._repository.find_question_context(ctx.conversation_id, require_paper=False)
         except Exception:  # pragma: no cover - 读取失败不影响本轮
             logger.warning("读取试卷上下文失败", exc_info=True)
             stored = None
@@ -4783,6 +5426,21 @@ class ConversationService:
         elif trace:
             logger.debug("沿用上一次试卷上下文：%s", stored.get("paper_id"))
         return dict(stored or {})
+
+    def _paper_state(self, ctx: _DynamicContext) -> dict[str, Any] | None:
+        """本轮或最近的“未定位 / 待澄清”状态；没有则返回 None。"""
+
+        raw = ctx.question_context or {}
+        if raw.get("status") in {"unlocated", "clarify_paper"}:
+            return dict(raw)
+        repository = getattr(self, "_repository", None)
+        if repository is None:
+            return None
+        try:
+            return repository.find_paper_state(ctx.conversation_id)
+        except Exception:  # pragma: no cover - 读取失败不影响本轮
+            logger.warning("读取试卷状态失败", exc_info=True)
+            return None
 
     def _context_from_cards(self, conversation_id: str) -> dict[str, Any] | None:
         """返修前的记录只有题卡：能唯一确定试卷时补出试卷上下文。"""
@@ -4893,6 +5551,17 @@ class ConversationService:
         if course:
             ctx.confirmed_course = course
 
+    def _stale_target_message(self, state: dict[str, Any]) -> str:
+        """当前目标失效时要求学生指明对象，而不是拿旧题顶上。"""
+
+        if state.get("status") == "clarify_paper":
+            return "刚才那份试卷还没确定是哪一份，请先说明卷别（例如 A 卷还是 B 卷），再说要讲哪一道。"
+        year = str(state.get("academic_year") or "")
+        term = {"s1": "第一学期", "s2": "第二学期"}.get(str(state.get("term") or ""), "")
+        scope = f"{year}学年{term}" if year else ""
+        where = f"{scope}的这份卷" if scope else "刚才那份卷"
+        return f"当前还没有确定试卷：{where}在目录里没有登记记录。请先说明要用哪份试卷，再说要讲哪一道题。"
+
     async def _resolve_question_selection(
         self, prepared: ExecuteTurn, ctx: _DynamicContext,
         parameters: dict[str, Any] | None = None, *, use_active: bool = False,
@@ -4920,6 +5589,22 @@ class ConversationService:
         positional = self._mentions_list_position(text)
         if intent.paper_unresolved and not positional:
             return unresolved("我无法从这些条件唯一确定一份试卷，请补充年份、学期或考试类型；不会改选旧试卷。")
+
+        state = self._paper_state(ctx)
+        stale_target = state is not None and state.get("status") in {
+            "unlocated",
+            "clarify_paper",
+        }
+        if (
+            stale_target
+            and intent.paper_id is None
+            and self._requested_number(parameters, text) is None
+            and not positional
+        ):
+            # 明确换卷失败或还在等卷别时，数据库里的旧已选题不能当成“这道题”：
+            # 否则学生会听到旧卷题目的讲解（§7.9 R1）。点历史题卡走
+            # question_action 分支，不受这里影响。
+            return unresolved(self._stale_target_message(state))
 
         paper_id = intent.paper_id
         wanted_type = detect_question_type(text) or parameters.get("question_type")
@@ -5173,7 +5858,10 @@ class ConversationService:
                 name, "clarification", self._exhausted_text(ctx, intent), needs_user=True
             ))
         intent = replace(intent, query="")
-        result = await self._run_question_search(prepared, ctx, name, intent, emit)
+        result = await self._run_question_search(
+            prepared, ctx, name, intent, emit,
+            exclude_question_id=self._similar_source_question(prepared.input.text, ctx),
+        )
         if isinstance(result, ActionOutcome):
             return result
         return self._question_search_outcome(prepared, ctx, name, intent, result)
@@ -5322,8 +6010,11 @@ class ConversationService:
         emit: Callable[[str, str], None],
     ) -> ActionOutcome:
         name = "query_papers"
+        text = prepared.input.text
         course = action.parameters.get("course") or ctx.confirmed_course
-        exam_type = self._requested_exam_type(prepared.input.text, action.parameters.get("exam_type"))
+        exam_type = self._requested_exam_type(
+            text, action.parameters.get("exam_type")
+        )
         if not course:
             return ActionOutcome(
                 name,
@@ -5341,6 +6032,21 @@ class ConversationService:
         except Exception as exc:
             logger.warning("查卷执行失败：%s", exc)
             return ActionOutcome(name, "failed", "试卷检索失败，请稍后重试。", error_code="QUERY_FAILED", retryable=True)
+
+        # 模型只给“课程＋考试类型”是常态（截图里的真实调用就只有这两个）：
+        # 原文里的学年、学期、卷别必须由服务端自己核对，不能因为工具参数没带
+        # 就静默丢掉，也不能退回全部试卷。
+        location = extract_location(text)
+        candidates: list[str] | None = None
+        state = self._paper_state(ctx)
+        if state is not None and state.get("status") == "clarify_paper":
+            # 上一轮已经问过“A 卷还是 B 卷”：本轮学生只回“B卷”时，
+            # 学年、学期和候选范围要接着上一轮，不能重新在全目录里找。
+            location, candidates = self._merge_clarification(state, location, course, text)
+        if location.explicit:
+            return self._located_query(
+                prepared, ctx, name, course, papers, location, candidates
+            )
 
         scope = {None: "全部类型", "midterm": "期中", "final": "期末", "other": "其他类型"}[exam_type]
         if papers.items:
@@ -5368,7 +6074,225 @@ class ConversationService:
             name,
             "success",
             ctx.result.message,
-            {"total": papers.total, "course": course, "exam_type": exam_type},
+            {"total": papers.total, "course": course, "exam_type": exam_type,
+             "papers": [{"paper_id": item.id, "title": item.title,
+                         "academic_year": item.academic_year, "exam_type": item.exam_type}
+                        for item in papers.items]},
+        )
+
+    def _merge_clarification(
+        self,
+        state: dict[str, Any],
+        location: PaperLocation,
+        course: str | None = None,
+        text: str | None = None,
+    ) -> tuple[PaperLocation, list[str] | None]:
+        """把上一轮的待澄清条件合并进本轮；换了课程或条件就作废旧候选。
+
+        区分四种情况：
+        - 换了课程：旧课程的条件和候选 ID 全部作废（§7.9 R2 场景 A）；
+        - 明确取消考试类型：保留学年/学期，清掉类型限制与旧候选（§7.10 R2b）；
+        - 同一课程里显式改考试类型：学年/学期可以留下，候选必须按新类型重查；
+        - 只补卷别或什么都没说：沿用上一轮的学年、学期与候选范围。
+        """
+
+        state_course = state.get("course")
+        if (
+            state_course
+            and course
+            and normalize_course(state_course) != normalize_course(course)
+        ):
+            return location, None
+        if location.year or location.term:
+            # 明确改了年份或学期：旧候选不再适用，按新范围重新定位。
+            return location, None
+        if cancels_exam_type(text):
+            # “不限期中期末”：题型限制和旧候选都释放，学年学期仍然有效。
+            return (
+                PaperLocation(
+                    year=location.year or state.get("academic_year"),
+                    term=location.term or state.get("term"),
+                    variant=location.variant,
+                    exam_type=None,
+                    exam_type_stated=False,
+                ),
+                None,
+            )
+        stated_exam = location.exam_type if location.exam_type_stated else None
+        if stated_exam and stated_exam != state.get("exam_type"):
+            # 同一课程、显式换考试类型（例如期末澄清期间改看期中）：
+            # 旧的期末候选 ID 不能把合法的期中卷排除掉。
+            return (
+                PaperLocation(
+                    year=location.year or state.get("academic_year"),
+                    term=location.term or state.get("term"),
+                    variant=location.variant,
+                    exam_type=stated_exam,
+                    exam_type_stated=True,
+                ),
+                None,
+            )
+        merged = PaperLocation(
+            year=location.year or state.get("academic_year"),
+            term=location.term or state.get("term"),
+            variant=location.variant,
+            exam_type=(
+                location.exam_type
+                if location.exam_type_stated
+                else (state.get("exam_type") or location.exam_type)
+            ),
+            exam_type_stated=location.exam_type_stated or bool(state.get("exam_type")),
+        )
+        candidates = [str(item) for item in (state.get("candidates") or []) if item]
+        return merged, candidates or None
+
+    def _located_query(
+        self,
+        prepared: ExecuteTurn,
+        ctx: _DynamicContext,
+        name: str,
+        course: str,
+        papers: Any,
+        location: PaperLocation,
+        candidates: list[str] | None = None,
+    ) -> ActionOutcome:
+        """按学年/学期/卷别精确落到一份试卷；0 份与多份都如实返回。"""
+
+        scope = describe_location(location)
+        pool = [
+            item
+            for item in papers.items
+            if not candidates or str(getattr(item, "id", "")) in candidates
+        ]
+        match = locate_papers(
+            prepared.input.text, pool, exam_type=location.exam_type, location=location
+        )
+        if match.rank == RANK_UNIQUE:
+            return self._adopt_located_paper(prepared, ctx, name, course, match.paper, location)
+        if match.rank == RANK_AMBIGUOUS:
+            options = "、".join(f"《{title}》" for title in match.titles[:5])
+            ctx.result = None
+            # 保存待澄清条件与真实候选：下一轮只答“B卷”也能落回这个范围。
+            ctx.question_context = {
+                "status": "clarify_paper",
+                "course": course,
+                "academic_year": location.year,
+                "term": location.term,
+                "exam_type": location.exam_type,
+                "candidates": [
+                    str(getattr(item, "id", "")) for item in match.candidates
+                ],
+                "request_id": prepared.request_id,
+            }
+            return ActionOutcome(
+                name,
+                "clarification",
+                f"{scope}对应 {len(match.candidates)} 份试卷，请说明要哪一份"
+                + (f"：{options}" if options else "")
+                + "。",
+                {"status": "ambiguous"},
+                needs_user=True,
+            )
+        # RANK_NONE：条件明确但目录里没有这一份，不能扩大范围。
+        # 这里必须留下持久状态：只清空本轮上下文的话，下一轮指代会从历史里
+        # 读回上一份成功定位的旧卷（§7.7 R1）。
+        ctx.question_context = {
+            "status": "unlocated",
+            "course": course,
+            "academic_year": location.year,
+            "term": location.term,
+            "exam_type": location.exam_type,
+            "request_id": prepared.request_id,
+        }
+        ctx.result = ResultEvent(
+            type="result",
+            kind="empty",
+            message=(
+                f"本地试卷目录里没有【{course}】{scope}的登记记录。"
+                "不会自动扩大到其他学年或学期；如果考试类型不同，可以说清是期中还是期末。"
+            ),
+            filters={"course": course, "exam_type": location.exam_type},
+            items=[],
+            total=0,
+        )
+        return ActionOutcome(
+            name,
+            "success",
+            ctx.result.message,
+            {
+                "status": "empty",
+                "total": 0,
+                "course": course,
+                "exam_type": location.exam_type,
+                "academic_year": location.year,
+                "term": location.term,
+                "papers": [],
+            },
+        )
+
+    def _adopt_located_paper(
+        self,
+        prepared: ExecuteTurn,
+        ctx: _DynamicContext,
+        name: str,
+        course: str,
+        paper: Any,
+        location: PaperLocation,
+    ) -> ActionOutcome:
+        """唯一命中：只展示这一份，并把试卷身份存进上下文供后续指代。"""
+
+        title = str(getattr(paper, "title", "") or "")
+        paper_id = str(getattr(paper, "id", "") or "")
+        download_url = getattr(paper, "download_url", None) or (
+            f"/api/papers/{paper_id}/download"
+        )
+        year = str(getattr(paper, "academic_year", "") or "")
+        term = location.term
+        term_label = {"s1": "第一学期", "s2": "第二学期"}.get(term or "", "")
+        if year and year in title and (not term_label or term_label in title):
+            # 目录卷名本身已带学年学期（如“2024-2025学年第一学期《…》(A卷)”），
+            # 再套一层会出现“《…《Python语言程序设计》…》”这种嵌套书名号。
+            message = f"已找到{title}，下载入口已备好。"
+        else:
+            condition = f"【{course}】" + (f"{year}学年" if year else "") + term_label
+            message = f"已找到{condition}的《{title}》，下载入口已备好。"
+        ctx.result = ResultEvent(
+            type="result",
+            kind="found",
+            message=message,
+            filters={"course": course, "exam_type": getattr(paper, "exam_type", None)},
+            items=[paper],
+            total=1,
+        )
+        # 唯一命中就是“当前试卷”：“这张卷的选择题”要继承它，而不是再问一遍年份。
+        ctx.question_context = {
+            "paper_id": paper_id,
+            "paper_title": title,
+            "question_type": None,
+            "number_label": None,
+            "total": None,
+            "offset": 0,
+            "returned": 0,
+            "next_offset": 0,
+            "limit": 64,
+            "request_id": prepared.request_id,
+            "query": "",
+        }
+        return ActionOutcome(
+            name,
+            "success",
+            message,
+            {
+                "status": "found",
+                "total": 1,
+                "course": course,
+                "paper_id": paper_id,
+                "paper_title": title,
+                "download_url": download_url,
+                "academic_year": year,
+                "term": term,
+                "exam_type": getattr(paper, "exam_type", None),
+            },
         )
 
     @staticmethod
@@ -5649,6 +6573,7 @@ class ConversationService:
         prepared: ExecuteTurn,
         ctx: _DynamicContext,
         emit: Callable[[str, str], None],
+        target: str = "auto",
     ) -> ActionOutcome:
         name = "followup_problem"
         active = self._question_operation_problem(ctx)
@@ -5669,15 +6594,40 @@ class ConversationService:
         ]
         tutor = self._make_tutor()
         statement = active.statement_text
+        explanation = active.explanation
+        exercise = ctx.active_exercise
+        explicit_problem = bool(re.search(r"母题|原题|原来的题|原来那道", prepared.input.text))
+        if explicit_problem:
+            target = "problem"
+        use_exercise = exercise is not None and exercise.problem_id == active.id and (
+            target == "exercise" or (target == "auto" and not explicit_problem)
+        )
+        if target == "exercise" and not use_exercise:
+            return ActionOutcome(name, "clarification", "当前没有与这道题关联的活跃练习，请说明要追问哪道练习。", needs_user=True)
         if (
             ctx.question_selection is not None
             and ctx.question_card is not None
             and ctx.question_selection.problem_id == active.id
         ):
             statement = compose_statement(ctx.question_card)
+        if use_exercise:
+            statement = "【当前追问对象：变式练习，不是母题】\n" + exercise.statement_text
+            visible = self._build_exercise_view(exercise)
+            solution = visible.reference_solution_text
+            chunks = [solution[i:i + 2000] for i in range(0, len(solution), 2000)] if solution else [
+                "学生尚未查看解答；仅回答题意、考点或一条提示，不给出答案和完整解法。"
+            ]
+            # 未查看/未开放的解答绝不注入追问上下文。这里不改变查看事实。
+            explanation = Explanation(
+                knowledge_points=[KnowledgePoint(name=exercise.knowledge_point, explanation="当前练习考点")],
+                steps=[Step(index=index, title="练习参考解答" if solution else "作答提示", content=chunk)
+                       for index, chunk in enumerate(chunks, 1)],
+                final_answer="完整练习解答见以上材料。" if solution else "参考解答尚未开放，不得公布或推导最终答案。",
+            )
+            recent_followups = []  # 母题的旧追问不能混入练习的回答依据。
         answer = await tutor.answer_followup(
             statement=statement,
-            explanation=active.explanation,
+            explanation=explanation,
             recent_followups=recent_followups,
             question=prepared.input.text,
         )
@@ -5694,6 +6644,7 @@ class ConversationService:
             {
                 "problem_id": active.id,
                 "history_count": len(recent_followups),
+                "followup_target": "exercise" if use_exercise else "problem",
             },
         )
 
@@ -5931,6 +6882,7 @@ class ConversationService:
                         evaluation_view.is_correct if evaluation_view is not None else None
                     ),
                     "answered_after_revealed": attempt.answered_after_revealed,
+                    "solution_image_count": len(images),
                 },
             ))
 
@@ -5968,6 +6920,7 @@ class ConversationService:
         prepared: ExecuteTurn,
         ctx: _DynamicContext,
         emit: Callable[[str, str], None],
+        user_feedback: str | None = None,
     ) -> ActionOutcome:
         name = "record_mistake"
         active = self._question_operation_problem(ctx)
@@ -5982,16 +6935,27 @@ class ConversationService:
             return self._action_result(prepared, ctx, ActionOutcome(name, "failed", "错题记录服务不可用。"))
 
         emit("recording", "正在将本题收录至错题本")
+        explicit_note = re.search(r"备注\s*[:：]\s*(.+)", prepared.input.text, re.DOTALL)
+        feedback = (explicit_note.group(1) if explicit_note else user_feedback or "").strip() or None
+        if feedback and len(feedback) > 2000:
+            return self._action_result(prepared, ctx, ActionOutcome(
+                name, "clarification", "备注超过 2000 字，请缩短后再保存。", needs_user=True))
         try:
-            detail, created, _ = self._records.create_from_problem(
+            detail, created, needs_update = self._records.create_from_problem(
                 request_id=prepared.request_id,
                 conversation_id=prepared.conversation_id,
                 problem_id=active.id,
+                feedback_text=feedback,
             )
         except MistakeRecordConflictError:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name, "success", "该题目已在错题本中。", {"problem_id": active.id}
             ))
+        if not created and feedback is not None:
+            detail = self._records.update_metadata(
+                detail.id, title=None, source=None, feedback_text=feedback,
+                self_reported_understood=None,
+            )
         record_row = self._repository.get_record(detail.id)
         if record_row is None:
             return self._action_result(prepared, ctx, ActionOutcome(name, "failed", "保存结果读取失败，请稍后重试。"))
@@ -6012,12 +6976,17 @@ class ConversationService:
             message = f"已成功加入错题本：{detail.title}"
         else:
             ctx.tutoring = RecordExistsResult(
-                record=summary, message="这道题已经记录过了。"
+                record=summary, message="这道题已经记录过了。", needs_update=needs_update,
             )
             message = f"错题本中已有本题：{detail.title}"
         ctx.problem_id = active.id
+        feedback_saved = feedback is not None and detail.feedback.text == feedback
+        if feedback_saved:
+            message += "；备注已保存。"
         return self._action_result(prepared, ctx, ActionOutcome(
-            name, "success", message, {"record_id": detail.id}
+            name, "success", message, {"record_id": detail.id,
+                "feedback_saved": feedback_saved,
+                **({"user_feedback": feedback} if feedback_saved else {})}
         ))
 
     def _build_evaluation_view(
@@ -6214,15 +7183,59 @@ class ConversationService:
             yield _storage_error_event(prepared)
             return
 
+        ctx = _DynamicContext(
+            conversation_id=prepared.conversation_id,
+            exercise_view=ex_view,
+            evaluation_view=eval_view,
+        )
+        composite = [ActionResultItem(
+            action="evaluate_exercise", status="success", message="作答已完成评价",
+            details={"exercise_id": ex.id, "solution_image_count": len(selected_images)},
+        )]
+        material = self._build_reply_material(prepared, ctx, composite, [], None)
+        message = self._teaching_material(ctx) or "已完成作答评价。"
+        payload = material_to_payload(material) if material is not None else None
+        meta = {
+            "mode": "fallback", "deltas": 0,
+            "reason": "reply_pending" if self._make_reply else "reply_not_configured",
+        }
+        # 与聊天入口相同：评价已经落盘后，只重做正文材料；停止不会重评作答。
+        self._repository.update_turn_reply(
+            prepared.conversation_id, prepared.request_id,
+            assistant_message=message, reply_meta=meta, reply_input=payload,
+        )
         state.saved = True
+        if material is not None and self._make_reply is not None:
+            yield TurnProgressEvent(
+                conversation_id=prepared.conversation_id, request_id=prepared.request_id,
+                stage="composing_reply", message="正在组织作答评价",
+            )
+            meta = {}
+            async for piece in self._reply_pieces(self._make_reply(), material, meta):
+                yield TurnMessageDeltaEvent(
+                    conversation_id=prepared.conversation_id, request_id=prepared.request_id,
+                    seq=int(meta["deltas"]), delta=piece[:400],
+                )
+            text = str(meta.pop("text", "") or "")
+            message = text or message
+            self._repository.update_turn_reply(
+                prepared.conversation_id, prepared.request_id,
+                assistant_message=message, reply_meta=meta, reply_input=payload,
+            )
+        reply_status, reply_retryable = (
+            _reply_state({"reply": meta, "reply_input": payload})
+            if self._make_reply else (None, False)
+        )
         yield TurnResultEvent(
             conversation_id=prepared.conversation_id,
             request_id=prepared.request_id,
             kind="exercise",
             exercise=ex_view,
             evaluation=eval_view,
-            assistant_message="已完成作答评价。",
+            assistant_message=message,
             exercise_id=ex.id,
+            reply_status=reply_status,
+            reply_retryable=reply_retryable,
         )
 
     def _save_exercise_attempt(

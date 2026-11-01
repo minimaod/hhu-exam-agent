@@ -78,6 +78,8 @@ type ConversationWorkspaceProps = {
   downloads: DownloadStates;
   onDownload: (paper: PaperItem) => void;
   onOpenRecord: (recordId: string) => void;
+  /** 从学习记忆跳回某次会话；只切到该会话，不复制任何内容。 */
+  openConversationId?: string | null;
 };
 
 const STORAGE_KEY = "hhu-exam-review.current-conversation";
@@ -150,6 +152,7 @@ export default function ConversationWorkspace({
   downloads,
   onDownload,
   onOpenRecord,
+  openConversationId = null,
 }: ConversationWorkspaceProps) {
   const [listState, setListState] = useState<ListState>({ phase: "loading" });
   const [listAttempt, setListAttempt] = useState(0);
@@ -372,6 +375,16 @@ export default function ConversationWorkspace({
       setCreating(false);
     }
   }, [creating, openConversation]);
+
+  // 从学习记忆跳回某次会话：同一个 id 只切一次，之后仍可自由切换。
+  const openedRequestRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!openConversationId || openedRequestRef.current === openConversationId) {
+      return;
+    }
+    openedRequestRef.current = openConversationId;
+    openConversation(openConversationId);
+  }, [openConversationId, openConversation]);
 
   const sourceOptions = useMemo(() => {
     const map = new Map<string, PaperItem>();
@@ -678,11 +691,12 @@ export default function ConversationWorkspace({
               setSolutionText((current) => current === submittedSolution ? "" : current);
               setSourcePaperId(""); setTargetProblem(null); setMode("auto");
             }
-            setPendingFiles((current) => current.filter((item) => {
-              if (!pending.includes(item)) return true;
-              URL.revokeObjectURL(item.previewUrl); return false;
-            }));
           }
+          // 卡片提交也会消费解法图；只清理这次实际发送的图片，保留其余草稿。
+          setPendingFiles((current) => current.filter((item) => {
+            if (!pending.includes(item)) return true;
+            URL.revokeObjectURL(item.previewUrl); return false;
+          }));
         }
       } catch (error) {
         if (!isCurrentOperation(conversationId, sequence)) {
@@ -881,6 +895,7 @@ export default function ConversationWorkspace({
         studentAnswer: answerText,
         solutionText,
         attemptKind,
+        files: filesRef.current.filter((item) => item.role === "solution"),
       });
     },
     [submit],
@@ -1409,6 +1424,7 @@ export default function ConversationWorkspace({
                               : 0
                           }
                           exerciseDrafts={exerciseDrafts[currentId]}
+                          solutionImageNames={files.filter((item) => item.role === "solution").map((item) => item.file.name)}
                           onExerciseDraftChange={(exerciseId, value) =>
                             setExerciseDrafts((current) => ({
                               ...current,

@@ -8,9 +8,9 @@ import pytest
 
 from app.question_bank.models import SearchRequest
 from app.question_bank.service import QuestionBankService
-from app.questions.runtime import QuestionRuntime
+from app.questions.runtime import QuestionRuntime, bank_root_from_env
 
-BANK_ROOT = Path("data/local/question-bank")
+BANK_ROOT = bank_root_from_env()
 
 
 @pytest.fixture(scope="module")
@@ -41,3 +41,12 @@ def test_real_bank_capability_and_unreviewed_gate(real_runtime: QuestionRuntime)
     if capability.approved == 0:
         assert result.status == "unreviewed"
         assert result.cards == []
+
+
+def test_cross_paper_runtime_preserves_individual_sources_without_claiming_scope(real_runtime):
+    result = real_runtime.search(SearchRequest(course="Python", query="循环", question_type="choice", limit=3),
+                                 conversation_id="conv-cross-paper")
+    assert result.status == "ok" and result.cards
+    assert result.paper_id is None and result.paper_title is None
+    assert all(card.source.paper_id and card.source.paper_title for card in result.cards)
+    assert all(card.answer_detail is None for card in result.cards)
