@@ -37,3 +37,5 @@ Thumbs.db
 tmp*/
 .tmp*/
 .dsh/
+
+/jieba.cache

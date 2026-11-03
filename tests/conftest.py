@@ -5,8 +5,24 @@
 完全不需要移动、改名或删除用户的原始 PDF。
 """
 
+import os
+import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
+
+# 测试临时根目录固定在项目的 tmp/pytest-tmp。必须在导入 app 之前设置：
+# pytest 的 tmp_path、tempfile 和 jieba 缓存都以 tempfile.gettempdir() 为根；
+# 未配置 TEMP/TMP 时它会退回当前工作目录，文件就会散落到项目根目录。
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_TEST_TMP_ROOT = (_PROJECT_ROOT / "tmp" / "pytest-tmp").resolve()
+_TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+_TEST_TMP_TEXT = str(_TEST_TMP_ROOT)
+
+os.environ.pop("TMPDIR", None)  # POSIX 变量；无效值会让 tempfile 退回 cwd
+os.environ["TEMP"] = _TEST_TMP_TEXT
+os.environ["TMP"] = _TEST_TMP_TEXT
+os.environ["PYTEST_DEBUG_TEMPROOT"] = _TEST_TMP_TEXT
+tempfile.tempdir = _TEST_TMP_TEXT  # 覆盖 tempfile 已缓存的目录
 
 import pytest
 from fastapi.testclient import TestClient
@@ -43,8 +59,12 @@ def _isolate_study_db(
 
     lifespan 会在每个 TestClient 启动时初始化数据库；若不隔离，跑测试就会
     在项目的 data/local 下创建或修改真实的个人学习数据。
+
+    build_store_state 优先读取 HHU_STUDY_DB；先清除外部变量，再替换默认路径，
+    保证每个用例只写自己的 tmp_path。
     """
 
+    monkeypatch.delenv("HHU_STUDY_DB", raising=False)
     monkeypatch.setattr(
         conversation_repository,
         "DEFAULT_DB_PATH",

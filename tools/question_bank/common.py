@@ -19,12 +19,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from app.question_bank.config import DEFAULT_BANK_ROOT
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = PROJECT_ROOT / "data"
 CATALOG_PATH = DATA_ROOT / "papers" / "catalog.json"
 PAPER_ROOT = DATA_ROOT / "papers"
 
-QB_ROOT = DATA_ROOT / "local" / "question-bank"
+# 与查题服务共用同一个题库根：HHU_QB_ROOT 可指向隔离副本。
+QB_ROOT = DEFAULT_BANK_ROOT
 SOURCE_ROOT = QB_ROOT / "source"
 WORK_ROOT = QB_ROOT / "ingest"
 REVIEW_ROOT = QB_ROOT / "review"

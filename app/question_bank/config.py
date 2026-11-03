@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BANK_ROOT = PROJECT_ROOT / "data" / "local" / "question-bank"
+# 允许用 HHU_QB_ROOT 指向隔离副本（测试/联调）；未设置时仍用本地正式题库。
+DEFAULT_BANK_ROOT = Path(
+    os.environ.get("HHU_QB_ROOT") or PROJECT_ROOT / "data" / "local" / "question-bank"
+).expanduser()
 DEFAULT_MODEL_CACHE = DEFAULT_BANK_ROOT / "models"
 DEFAULT_PAPERS_ROOT = PROJECT_ROOT / "data" / "papers"
 
