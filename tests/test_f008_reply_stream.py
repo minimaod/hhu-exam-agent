@@ -243,7 +243,8 @@ async def test_service_streams_message_delta_then_result(tmp_path: Path) -> None
     assert read_turn_message(db_path, conversation.id, prepared.request_id) == result.assistant_message
     recovery = read_recovery(db_path, conversation.id, prepared.request_id)
     assert recovery is not None
-    assert recovery["reply"]["mode"] == "model"
+    # F010 C：终局回复在调度循环同一份消息上生成，模式记为 finalize。
+    assert recovery["reply"]["mode"] == "finalize"
     assert recovery["version"] == 2
 
 

@@ -4,6 +4,8 @@ import asyncio
 import re
 from typing import Any
 
+from app.conversations import tool_projection
+from app.conversations.authorization import requested_question_ref, requested_question_types
 from app.conversations.graph import (
     ActionOutcome,
     ActionPlan,
@@ -12,15 +14,12 @@ from app.conversations.turn_types import (
     ExecuteTurn,
     _DynamicContext,
 )
+from app.conversations.workspace import ambiguity
 from app.question_bank.models import SearchRequest
 from app.questions.errors import (
     QuestionError,
     QuestionSelectionInvalidError,
     QuestionSourceChangedError,
-)
-from app.questions.intent import (
-    candidate_number,
-    detect_question_type,
 )
 from app.questions.models import (
     QuestionCard,
@@ -29,6 +28,28 @@ from app.questions.models import (
 
 class SelectionMixin:
     """把学生的话解析成当前要操作的题目目标。"""
+
+    def _selection_type_basis(self, prepared: ExecuteTurn, paper_id: str | None) -> str | None:
+        """允许学生已限定的单一范围，拒绝把模型的最后一页当成范围。"""
+        kinds = requested_question_types(prepared.input.text or "")
+        if kinds:
+            return next(iter(kinds)) if len(kinds) == 1 else None
+        if not paper_id:
+            return None
+        for turn in self._repository.list_turns(prepared.conversation_id):
+            if turn.status != "completed" or turn.request_id == prepared.request_id:
+                continue
+            cards = list(turn.question_results or [])
+            if turn.question is not None:
+                cards.append(turn.question)
+            shown = {card.question_type for card in cards if card.source.paper_id == paper_id}
+            if shown:
+                stated = requested_question_types(turn.query)
+                if stated and stated != shown:
+                    # 学生范围与实际展示不一致，不能借该轮为模型的题型背书。
+                    return None
+                kinds.update(stated)
+        return next(iter(kinds)) if len(kinds) == 1 else None
 
     def _adopt_question_target(
         self, prepared: ExecuteTurn, ctx: _DynamicContext,
@@ -111,10 +132,21 @@ class SelectionMixin:
                 ctx.question_card = None
             return None, message
 
-        intent = self._search_intent(
-            text, ctx, ActionPlan(action="search_questions", parameters=parameters)
+        intent = self._intent_from_params(
+            ctx, ActionPlan(action="search_questions", parameters=parameters)
         )
-        positional = self._mentions_list_position(text)
+        wanted_type = parameters.get("question_type")
+        basis_type = self._selection_type_basis(prepared, intent.paper_id)
+        if wanted_type and basis_type != wanted_type:
+            # 同号题的题型必须来自学生，而不是模型自行缩小的候选范围。
+            wanted_type = None
+        raw_number = parameters.get("number_label")
+        number = None
+        if raw_number is not None:
+            digits = re.sub(r"[^0-9]", "", str(raw_number))
+            if digits:
+                number = int(digits)
+        positional = parameters.get("index") is not None and number is None
         if intent.paper_unresolved and not positional:
             return unresolved("我无法从这些条件唯一确定一份试卷，请补充年份、学期或考试类型；不会改选旧试卷。")
 
@@ -123,23 +155,15 @@ class SelectionMixin:
             "unlocated",
             "clarify_paper",
         }
-        if (
-            stale_target
-            and intent.paper_id is None
-            and self._requested_number(parameters, text) is None
-            and not positional
-        ):
+        if stale_target and intent.paper_id is None and "ref" not in parameters:
+            # 只有显式题卡引用（ref / question_action）能打开历史题；
+            # 只报题号或位置时不得回落到失败换卷前的旧页面。
             # 明确换卷失败或还在等卷别时，数据库里的旧已选题不能当成“这道题”：
             # 否则学生会听到旧卷题目的讲解（§7.9 R1）。点历史题卡走
             # question_action 分支，不受这里影响。
             return unresolved(self._stale_target_message(state))
 
         paper_id = intent.paper_id
-        wanted_type = detect_question_type(text) or parameters.get("question_type")
-        number = (
-            int(intent.number_label) if intent.number_label is not None
-            else self._requested_number(parameters, text)
-        )
         position = None
         if positional or number is None:
             raw_position = number if positional and number is not None else parameters.get("index")
@@ -185,11 +209,11 @@ class SelectionMixin:
         if len(candidates) > 1:
             return unresolved(self._target_ambiguity(candidates))
 
-        # 当前页没有目标，按本轮已解析的卷与题号查找。题型未指定且当前
-        # 浏览上下文也未限定时，查事实库确认唯一性，不能由局部页推断。
+        # 当前页没有目标，按本轮已解析的卷与题号查找。题型未指定时，
+        # 必须查事实库确认整卷唯一性，不能由上一页的浏览范围推断。
         context = self._question_context(ctx)
         needs_lookup = number is not None and paper_id and (
-            not candidates or (wanted_type is None and not context.get("question_type"))
+            not candidates or wanted_type is None
         )
         if needs_lookup:
             located, problem = await self._locate_question_by_number(
@@ -230,6 +254,11 @@ class SelectionMixin:
     async def _dynamic_select_question(
         self, prepared: ExecuteTurn, action: ActionPlan, ctx: _DynamicContext,
     ) -> ActionOutcome:
+        ref = action.parameters.get("ref")
+        if isinstance(ref, str) and ref.strip():
+            return await self._select_by_ref(
+                prepared, ctx, ref.strip(), action.parameters.get("question_type")
+            )
         selection, problem = await self._resolve_question_selection(prepared, ctx, action.parameters)
         if selection is None:
             return self._action_result(prepared, ctx, ActionOutcome(
@@ -252,30 +281,98 @@ class SelectionMixin:
             needs_user=False,
         ))
 
-    @staticmethod
-    def _requested_number(parameters: dict[str, Any], text: str) -> int | None:
-        # “第五道选择题”与“第5题”都是原卷题号；本轮原话优先于模型参数。
-        match = re.search(
-            r"第\s*([0-9]+|[一二三四五六七八九十]+)\s*(?:道|个)?\s*"
-            r"(?:(?:选择|单选|多选|填空|编程|代码|程序设计)题|小题|题)", text or "",
+    async def _select_by_ref(
+        self, prepared: ExecuteTurn, ctx: _DynamicContext, ref: str,
+        question_type: str | None = None,
+    ) -> ActionOutcome:
+        """按工作区短引用选题：归属/版本/哈希由 ``_resolve_question_card`` 校验。"""
+
+        table = self._ensure_ref_table(ctx)
+        entry = table.resolve(ref)
+        if entry is not None:
+            explicit_ref = requested_question_ref(prepared.input.text or "", ref)
+            user_type = self._selection_type_basis(prepared, entry.paper_id)
+            if explicit_ref:
+                question_type = entry.question_type
+            elif user_type == entry.question_type:
+                question_type = user_type
+            else:
+                # 工作区可能只持久化了最后一页，仍需查询整卷的同号候选。
+                try:
+                    number = int(entry.number_label)
+                except (TypeError, ValueError):
+                    return self._action_result(prepared, ctx, ActionOutcome(
+                        "select_question", "clarification", "请明确题型或题卡引用。", needs_user=True,
+                    ))
+                unique, problem = await self._locate_question_by_number(
+                    ctx, number, None, paper_id=entry.paper_id,
+                )
+                if unique is None or unique.question_id != entry.question_id:
+                    return self._action_result(prepared, ctx, ActionOutcome(
+                        "select_question", "clarification", problem or "请明确题型或题卡引用。",
+                        {"ref": ref}, needs_user=True, error_code="AMBIGUOUS_TARGET",
+                    ))
+                question_type = unique.question_type
+            # 同一卷同一题号出现在多个题型里，而学生原话没有限定题型：
+            # 先澄清，不能因为模型选了某个 ref 就替学生决定。
+            same_number = [
+                item
+                for item in table.entries
+                if item.paper_id == entry.paper_id
+                and item.number_label == entry.number_label
+            ]
+            if ambiguity(same_number, question_type):
+                return self._action_result(prepared, ctx, ActionOutcome(
+                    "select_question", "clarification",
+                    f"第 {entry.number_label} 题在选择题和填空题里都有，"
+                    "你想听哪一道？",
+                    {"ref": ref}, needs_user=True,
+                    error_code="AMBIGUOUS_TARGET",
+                ))
+        card, code, message = self._ref_target(ctx, ref, question_type)
+        if card is None:
+            if code == "AMBIGUOUS_TARGET":
+                return self._action_result(prepared, ctx, ActionOutcome(
+                    "select_question", "clarification", message or "请先确认题型。",
+                    {"ref": ref}, needs_user=True,
+                    error_code="AMBIGUOUS_TARGET",
+                ))
+            return self._action_result(prepared, ctx, ActionOutcome(
+                "select_question", "failed", message or "这道题暂时不能选。",
+                {"ref": ref, "error_code": code},
+                needs_user=False, error_code=code,
+                retryable=code in {"BANK_UNAVAILABLE"},
+            ))
+        assert entry is not None
+        selection = self._select_question_card(
+            prepared.conversation_id,
+            prepared.request_id,
+            entry.source_request_id,
+            card,
         )
-        if match:
-            raw = match.group(1)
-            if raw.isdigit():
-                return int(raw)
-            digits = {char: number for number, char in enumerate("零一二三四五六七八九")}
-            if "十" in raw:
-                left, right = raw.split("十", 1)
-                if (not left or left in digits) and (not right or right in digits):
-                    return digits.get(left, 1) * 10 + digits.get(right, 0)
-            if raw in digits:
-                return digits[raw]
-        raw = parameters.get("number_label")
-        if isinstance(raw, str):
-            match = re.search(r"([0-9]+)", raw)
-            if match:
-                return int(match.group(1))
-        return candidate_number(text)
+        self._adopt_question_target(prepared, ctx, selection, card)
+        # 同轮后续讲解必须命中同一张卡：收敛候选并标记来源轮次。
+        ctx.question_results = [card]
+        ctx.question_source_turn = prepared.request_id
+        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        return self._action_result(prepared, ctx, ActionOutcome(
+            "select_question", "success",
+            f"已选中 {ref}（第 {card.number_label} 题，{kinds.get(card.question_type, '题目')}）。",
+            {
+                "ref": ref,
+                "question_id": card.question_id,
+                "build_id": card.build_id,
+                "content_sha256": card.content_sha256,
+                "number_label": card.number_label,
+                "question_type": card.question_type,
+                "paper_id": card.source.paper_id,
+                "paper_title": card.source.paper_title,
+                "question": tool_projection.public_question(
+                    card, ref=ref, statement_limit=400
+                ),
+            },
+            needs_user=False,
+        ))
 
     async def _locate_question_by_number(
         self,
@@ -348,17 +445,4 @@ class SelectionMixin:
             prepared.request_id,
             prepared.request_id,
             card,
-        )
-
-    @staticmethod
-    def _mentions_list_position(text: str) -> bool:
-        """学生是否在说“列表里的第 N 个”，而不是原卷题号。"""
-
-        return bool(
-            re.search(
-                r"(列表|上面|其中|这些|那几个|这几道|这几个|结果|候选)[^。；，]{0,6}"
-                r"第?\s*[0-9一二三四五六七八九十]+\s*(个|项|条|道题?)",
-                text or "",
-            )
-            or re.search(r"第\s*[0-9]+\s*(个|项|条)", text or "")
         )

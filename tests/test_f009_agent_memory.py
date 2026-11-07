@@ -142,7 +142,7 @@ def test_review_failure_is_reported_as_unavailable_not_empty(tmp_path: Path) -> 
     assert "不要编造" in (ctx.memory_text or "")
 
 
-def test_memory_context_is_injected_only_when_relevant(tmp_path: Path) -> None:
+def test_memory_context_requires_an_explicit_tool_call(tmp_path: Path) -> None:
     service, seed, _ = build(tmp_path)
     conversation, _, _ = seed_wrong(seed)
     ctx = _DynamicContext(conversation_id=conversation, confirmed_course="Python语言程序设计")
@@ -150,9 +150,17 @@ def test_memory_context_is_injected_only_when_relevant(tmp_path: Path) -> None:
     plain = prepared_for(conversation, "req-1", "这道题怎么解")
     assert service._prepare_memory_context(plain, ctx) is None
 
+    # 原话再相关也不自动读库；只有显式 review_learning_memory 才注入。
     relevant = prepared_for(conversation, "req-2", "我最近该先补哪块")
-    text = service._prepare_memory_context(relevant, ctx)
-    assert text is not None and text.startswith("【学习记忆】")
+    assert service._prepare_memory_context(relevant, ctx) is None
+    outcome = service._memory_review_outcome(
+        relevant,
+        ActionPlan(action="review_memory", parameters={"course": "Python语言程序设计"}),
+        ctx,
+        relevant.input.text,
+    )
+    assert outcome.status == "success"
+    assert ctx.memory_text and ctx.memory_text.startswith("【学习记忆】")
 
 
 def test_guard_blocks_writes_without_reviewed_entry(tmp_path: Path) -> None:

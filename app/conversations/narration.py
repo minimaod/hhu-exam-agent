@@ -24,7 +24,6 @@ from app.conversations.turn_types import (
     TurnInputRulesMixin,
     _DynamicContext,
 )
-from app.questions.intent import candidate_number
 from app.questions.models import QuestionCard
 
 logger = logging.getLogger("app.conversations.service")
@@ -71,7 +70,6 @@ class NarrationMixin:
             ),
             question_materials=self._question_materials(
                 ctx,
-                prepared.input.text,
                 ctx.question_results if own_questions else [],
             ),
             question_page=(
@@ -85,9 +83,7 @@ class NarrationMixin:
             suggestions=[item.label for item in suggestions],
             context_summary=recent_summary,
             teaching=teaching,
-            learning_memory=self._memory_material(
-                ctx, text=prepared.input.text
-            ),
+            learning_memory=self._memory_material(ctx),
         ))
 
     @classmethod
@@ -97,13 +93,7 @@ class NarrationMixin:
         同一投影也在生成前应用，防止旧恢复材料绕过本轮回答范围。
         前端题卡不受影响；考点、提示、题意或明确解题请求仍获得公开材料。
         """
-        if (
-            material.teaching or material.answer_scope is not None
-            or (
-                not cls._wants_to_try_first(material.user_text)
-                and cls._wants_explanation(material.user_text)
-            )
-        ):
+        if material.teaching or material.answer_scope is not None:
             return material
         return replace(material, question_materials=(), context_summary=None)
 
@@ -114,7 +104,7 @@ class NarrationMixin:
         这只决定已完成操作的展示方式；Agent 的继续决策和用户的后续请求不受限。
         """
         if (
-            material.teaching or material.answer_scope or cls._wants_explanation(material.user_text)
+            material.teaching or material.answer_scope
             or not material.results
             or any(item.action != "select_question" or item.status != "success" for item in material.results)
         ):
@@ -128,7 +118,7 @@ class NarrationMixin:
 
     @staticmethod
     def _question_materials(
-        ctx: _DynamicContext, text: str = "", results: list[Any] | None = None
+        ctx: _DynamicContext, results: list[Any] | None = None
     ) -> list[str]:
         """本轮公开题面材料：题干、选项、代码、知识点与来源（不含答案）。
 
@@ -144,11 +134,6 @@ class NarrationMixin:
         for card in (ctx.question_results if results is None else results):
             if all(item.question_id != card.question_id for item in cards):
                 cards.append(card)
-        wanted = candidate_number(text)
-        if wanted is not None:
-            preferred = [card for card in cards if TurnInputRulesMixin._same_number(card.number_label, wanted)]
-            if preferred:
-                cards = preferred + [card for card in cards if card not in preferred]
         lines: list[str] = []
         used = 0
         budget = 4000
@@ -187,79 +172,6 @@ class NarrationMixin:
             lines.append(text)
             used += len(text)
         return lines
-
-    async def _compose_reply(
-        self,
-        prepared: ExecuteTurn,
-        ctx: _DynamicContext,
-        final_state: dict[str, Any],
-        composite_results: list[ActionResultItem],
-        suggestions: list[SuggestionItem],
-        *,
-        material: ReplyMaterial | None = None,
-        emit: Callable[[str, str], None],
-        push: Callable[[object], None],
-        recent_summary: str | None,
-    ) -> tuple[str, dict[str, Any]]:
-        """业务结果确定后单独流式生成正文；失败时退回确定性说明。
-
-        返回值第二项写入恢复记录的 ``reply`` 字段，用于区分“模型真实生成”
-        与“程序兜底”，报告不能把兜底算作自然回复验证通过。
-        """
-
-        fallback = self._dynamic_reply(final_state, composite_results, ctx)
-        clarified = [it for it in composite_results if it.status == "clarification"]
-        if material is None:
-            material = self._build_reply_material(
-                prepared, ctx, composite_results, suggestions, recent_summary
-            )
-        if material is None:
-            return fallback, {"mode": "clarification", "deltas": 0}
-
-        if ctx.recovery is not None:
-            # 留着材料，回复失败/截断时可以只重做正文，不重跑已经成功的操作。
-            ctx.recovery["reply_input"] = material_to_payload(material)
-        if self._make_reply is None:
-            return fallback, {
-                "mode": "fallback",
-                "reason": "reply_not_configured",
-                "deltas": 0,
-            }
-
-        emit("composing_reply", "正在组织回复")
-
-        def on_piece(piece: str, seq: int) -> None:
-            push(
-                TurnMessageDeltaEvent(
-                    conversation_id=prepared.conversation_id,
-                    request_id=prepared.request_id,
-                    seq=seq,
-                    delta=piece[:400],
-                )
-            )
-
-        text, meta = await self._stream_reply(self._make_reply(), material, on_piece)
-        if text and clarified and material.answer_scope is None:
-            # 讲解之后再问下一步：讲解已经由模型写出，问题按工具原文补在末尾，
-            # 既不会丢讲解，也不会让模型改写要学生回答的问题。
-            question = clarified[-1].message.strip()
-            if question and question not in text:
-                seq = int(meta.get("deltas") or 0) + 1
-                extra = "\n\n" + question
-                on_piece(extra, seq)
-                text = text + extra
-                meta["deltas"] = seq
-        if text:
-            # 移除学习的记忆是程序事实：模型换了说法也不能把“原会话记录保留”说丢。
-            notice = self._memory_notice(composite_results)
-            if notice and notice not in text:
-                seq = int(meta.get("deltas") or 0) + 1
-                extra = "\n\n" + notice
-                on_piece(extra, seq)
-                text = text + extra
-                meta["deltas"] = seq
-            return text, meta
-        return fallback, dict(meta, mode="fallback")
 
     async def _stream_reply(
         self,

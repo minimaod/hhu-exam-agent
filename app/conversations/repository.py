@@ -2396,6 +2396,7 @@ class ConversationRepository:
         problem_id: str | None = None,
         exercise_id: str | None = None,
         question_context: dict[str, Any] | None = None,
+        transcript: dict[str, Any] | None = None,
     ) -> None:
         result_json = None
         if result is not None:
@@ -2435,6 +2436,9 @@ class ConversationRepository:
             # 当前试卷 / 题型 / 总数 / 浏览位置：下一轮“刚刚那张卷”“继续”的依据。
             # 只随成功的查题/浏览写入，空结果不覆盖上一次的有效事实。
             output_payload["question_context"] = question_context
+        if transcript:
+            # F010 B：本轮工具步骤的公开投影，供下一轮历史与恢复使用。
+            output_payload["_transcript"] = transcript
 
         output_json = (
             json.dumps(output_payload, ensure_ascii=False) if output_payload else None
@@ -2447,10 +2451,16 @@ class ConversationRepository:
                 (conversation_id, request_id),
             ).fetchone()
             if previous and previous["output_json"]:
-                recovery = _json_load(previous["output_json"], {}).get("_recovery")
+                stored = _json_load(previous["output_json"], {})
+                recovery = stored.get("_recovery")
                 if recovery:
                     output_payload["_recovery"] = recovery
-                    output_json = json.dumps(output_payload, ensure_ascii=False)
+                if not transcript:
+                    # 正文重做或旧调用没有传 transcript 时，不能把已存的步骤冲掉。
+                    stored_transcript = stored.get("_transcript")
+                    if stored_transcript:
+                        output_payload["_transcript"] = stored_transcript
+                output_json = json.dumps(output_payload, ensure_ascii=False)
             cursor = connection.execute(
                 """
                 UPDATE conversation_turns
@@ -3612,6 +3622,30 @@ class ConversationRepository:
             if isinstance(context, dict) and context:
                 contexts.append(context)
         return contexts
+
+    def list_turn_transcripts(self, conversation_id: str) -> dict[str, dict[str, Any]]:
+        """读取本会话每轮已提交的工具步骤（``output_json._transcript``）。
+
+        一次扫描完成；旧轮次没有该字段时自然缺失，调用方按“只有学生/助手
+        消息”的历史处理。
+        """
+
+        with self._read() as connection:
+            rows = connection.execute(
+                "SELECT request_id, output_json FROM conversation_turns "
+                "WHERE conversation_id = ? AND output_json IS NOT NULL "
+                "ORDER BY seq ASC, rowid ASC",
+                (conversation_id,),
+            ).fetchall()
+        transcripts: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            payload = _json_load(row["output_json"], {})
+            if not isinstance(payload, dict):
+                continue
+            transcript = payload.get("_transcript")
+            if isinstance(transcript, dict) and transcript.get("steps"):
+                transcripts[str(row["request_id"])] = transcript
+        return transcripts
 
     def find_paper_state(self, conversation_id: str) -> dict[str, Any] | None:
         """最近一次“明确未定位/待澄清”的试卷状态（§7.7 R1、R2）。

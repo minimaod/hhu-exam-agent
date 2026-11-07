@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from app.conversations.graph import ActionPlan
 from app.conversations.reply import _describe_details
 from app.conversations.service import _DynamicContext
 from app.memory.models import MemoryCorrectionRequest
 from app.memory.summary import material_block
-from tests.test_f009_agent_memory import build
+from tests.test_f009_agent_memory import build, prepared_for
 from tests.test_f009_evidence import build as build_memory
 
 PY = "Python语言程序设计"
@@ -147,18 +148,33 @@ def test_material_prefers_the_entry_student_asked_about(tmp_path: Path) -> None:
     assert focused.index(target_note) < focused.index("还有")
 
 
-def test_focus_ids_come_from_student_words(tmp_path: Path) -> None:
-    service, seed, memory = build(tmp_path)
+def test_focus_ids_come_from_explicit_tool_parameters(tmp_path: Path) -> None:
+    service, seed, _ = build(tmp_path)
     conversation, exercise = seed_exercise(seed, knowledge_point="函数参数")
     seed.attempt(exercise, correct=False)
-    view = memory.summary(PY, days=30, limit=50)
 
+    # 模型明确点名“这一条”时，用 entry_ids 传进来，程序只核对编号是否存在。
     ctx = _DynamicContext(conversation_id=conversation)
-    ctx.memory_view = view
-    assert service._memory_focus_ids(ctx, "函数参数那道题我总错") == {
-        f"exercise:{exercise}"
-    }
-    assert service._memory_focus_ids(ctx, "随便看看") == set()
+    text = "函数参数那道题我总错"
+    service._memory_review_outcome(
+        prepared_for(conversation, "req-focus-1", text),
+        ActionPlan(
+            action="review_memory",
+            parameters={"course": PY, "entry_ids": [f"exercise:{exercise}"]},
+        ),
+        ctx,
+        text,
+    )
+    assert ctx.memory_focus_entry_ids == {f"exercise:{exercise}"}
+
+    ctx2 = _DynamicContext(conversation_id=conversation)
+    service._memory_review_outcome(
+        prepared_for(conversation, "req-focus-2", "随便看看"),
+        ActionPlan(action="review_memory", parameters={"course": PY}),
+        ctx2,
+        "随便看看",
+    )
+    assert ctx2.memory_focus_entry_ids == set()
 
 
 def test_tool_result_notes_reach_the_reply_prompt() -> None:

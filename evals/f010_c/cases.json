@@ -1,0 +1,18 @@
+{
+  "kind": "f010-c",
+  "run_root": "tmp/f010-c",
+  "score": "11 组 × 2 维 = 22；组内两项都满足才得分",
+  "cases": [
+    {"id": "C01", "dims": ["product", "mechanism"], "title": "跨题授权：上一题看过答案，不代表下一题可以看"},
+    {"id": "C02", "dims": ["product", "mechanism"], "title": "跨版本授权：旧 build 不被当前选择顶替"},
+    {"id": "C03", "dims": ["product", "mechanism"], "title": "工具调用轮的文字留在内部，只有终局文本出站"},
+    {"id": "C04", "dims": ["product", "mechanism"], "title": "业务提交后断流：服务端取消证据 + 只重做正文"},
+    {"id": "C05", "dims": ["product", "mechanism"], "title": "/reply 使用已提交材料并重新校验，失效则如实提示"},
+    {"id": "C06", "dims": ["product", "mechanism"], "title": "模型可见数据逐字段投影，历史不重复答案"},
+    {"id": "C07", "dims": ["product", "mechanism"], "title": "答案拒绝以工具结果返回，含结构化原因与事实"},
+    {"id": "C08", "dims": ["product", "mechanism"], "title": "终态判定：收尾文字即最终回复"},
+    {"id": "C09", "dims": ["product", "mechanism"], "title": "SSE delta 契约：seq 连续、单段上限、拼合等于落库正文"},
+    {"id": "C10", "dims": ["product", "mechanism"], "title": "同 request_id 重复提交幂等，不重复执行业务"},
+    {"id": "C11", "dims": ["product", "mechanism"], "title": "B 批旧 reply_input 记录仍支持只重做正文"}
+  ]
+}

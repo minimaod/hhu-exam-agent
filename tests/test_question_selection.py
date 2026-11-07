@@ -24,7 +24,7 @@ from app.question_bank.models import (
     SearchRequest,
     SearchResponse,
 )
-from app.questions.intent import candidate_number, extract_intent
+from evals.f010_d.legacy_intent import candidate_number, extract_intent
 from app.questions.models import QuestionFormula, QuestionOption
 from app.questions.runtime import QuestionRuntime
 from tests.question_fakes import BUILD_ID, SOURCE_VERSION, sample_card
@@ -326,7 +326,7 @@ def test_explicit_immediate_answer_remains_available(text):
 
 
 def test_correction_and_generated_exercise_are_not_real_question_lookup():
-    from app.questions.intent import is_question_lookup
+    from evals.f010_d.legacy_intent import is_question_lookup
     assert not is_question_lookup("纠正题干，再出一道类似题")
 
 

@@ -109,7 +109,7 @@ def test_student_course_switch_beats_the_previous_memory_course(tmp_path: Path) 
     text = "改看高等数学的复习建议，先补哪块"
     outcome = service._memory_review_outcome(
         prepared_for(python_conversation, "req-1", text),
-        ActionPlan(action="review_memory", parameters={}),
+        ActionPlan(action="review_memory", parameters={"course": MATH}),
         ctx,
         text,
     )
@@ -378,4 +378,10 @@ def test_student_note_reaches_material_and_tool_details(tmp_path: Path) -> None:
         for item in outcome.details["memory_entries"]
         if item["entry_id"] == f"exercise:{exercise}"
     )
-    assert detail["note"] == "这条是我算错了符号"
+    assert "note" not in detail
+    model_detail = next(
+        item
+        for item in outcome.model_details["memory_entries"]
+        if item["entry_id"] == f"exercise:{exercise}"
+    )
+    assert model_detail["note"] == "这条是我算错了符号"

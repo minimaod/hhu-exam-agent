@@ -9,7 +9,7 @@ from app.conversations.graph import ActionPlan
 from app.conversations.service import ConversationService, _DynamicContext
 from app.question_bank.models import SearchRequest
 from app.question_bank.service import QuestionBankService
-from app.questions.intent import extract_intent
+from evals.f010_d.legacy_intent import extract_intent
 from app.questions.runtime import QuestionRuntime
 
 TITLE = "2024-2025学年第一学期《Python语言程序设计》期末试卷（A卷）"
@@ -97,7 +97,8 @@ def test_conversation_passes_number_and_explains_type_ambiguity(bank):
     runtime = QuestionRuntime(bank)
     service = object.__new__(ConversationService)
     service.questions = runtime
-    service._search_intent = lambda text, ctx, action: intent(text, **action.parameters)
+    text = TITLE + "的大题第一题"
+    service._intent_from_params = lambda ctx, action: intent(text, **action.parameters)
     service._action_result = lambda prepared, ctx, outcome: outcome
     ctx = _DynamicContext(conversation_id="isolated-exact-lookup", confirmed_course="Python")
     prepared = SimpleNamespace(input=SimpleNamespace(text=TITLE + "的大题第一题"),

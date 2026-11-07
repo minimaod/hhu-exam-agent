@@ -339,22 +339,22 @@ async def test_composite_actions_save_and_exercise(tmp_path: Path) -> None:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("text,course,planned,expected,total", [
-    ("查看高等数学试卷", "高等数学", "final", None, 14),
-    ("查看 Python 语言程序设计试卷", "Python", "final", None, 20),
-    ("查看高等数学试卷", "高等数学", "midterm", None, 14),
+    ("查看高等数学试卷", "高等数学", None, None, 14),
+    ("查看 Python 语言程序设计试卷", "Python", None, None, 20),
+    ("查看高等数学试卷", "高等数学", None, None, 14),
     ("给我期中卷", "Python", "midterm", "midterm", 10),
-    ("给我期中卷", "Python", None, "midterm", 10),
-    ("给我期末卷", "Python", "midterm", "final", 10),
-    ("高数期中期末都要", "高等数学", "final", None, 14),
+    ("给我期中卷", "Python", "midterm", "midterm", 10),
+    ("给我期末卷", "Python", "final", "final", 10),
+    ("高数期中期末都要", "高等数学", None, None, 14),
     ("找全部期末试卷", "Python", "final", "final", 10),
-    ("不要只查期末，给我全部类型", "Python", "final", None, 20),
-    ("查看转专业试卷", "转专业", "other", None, 10),
+    ("不要只查期末，给我全部类型", "Python", None, None, 20),
+    ("查看转专业试卷", "转专业", None, None, 10),
     ("查看转专业其他类型试卷", "转专业", "other", "other", 10),
 ])
-async def test_paper_scope_follows_current_request_not_model_default(
+async def test_query_papers_uses_the_structured_exam_type(
     tmp_path: Path, text: str, course: str, planned: str | None, expected: str | None, total: int,
 ) -> None:
-    """模拟模型擅加期末或传错类型，检查真实查库、回复、详情与回放。"""
+    """S1：考试类型只来自参数；模型不再靠原话替参数纠错。"""
     svc, repo, scheduler, _, _ = setup_service(tmp_path)
     conversation = repo.create_conversation()
     repo.upsert_context(conversation.id, confirmed_course=course)

@@ -27,22 +27,12 @@ from app.memory.summary import (
     context_line,
     material_block,
 )
-from app.papers.courses import (
-    detect_course,
-    normalize_course,
-)
+from app.papers.courses import normalize_course
 
 logger = logging.getLogger("app.conversations.service")
 
 class MemoryHandlerMixin:
     """学习记忆的读取、写入、纠正与删除。"""
-
-    _MEMORY_INTENT = re.compile(
-        r"学习记忆|学习记录|复习建议|先补|补哪|弱项|薄弱|最近学|学到哪|从哪开始|"
-        r"怎么复习|怎么安排|我的记录|记得我|我学过|复习计划|学习情况"
-    )
-
-    _MEMORY_DELETE_INTENT = re.compile(r"删|移除|去掉|别算|不算|不要算|不参与|别记")
 
     _MEMORY_DELETE_MESSAGE = "从学习记忆和复习建议中移除，原会话记录保留。"
 
@@ -69,9 +59,6 @@ class MemoryHandlerMixin:
             course = action.parameters.get("course")
             if isinstance(course, str) and course.strip():
                 return normalize_course(course.strip())
-        detected = detect_course(text)
-        if detected:
-            return normalize_course(detected)
         if confirmed:
             return normalize_course(confirmed)
         if ctx.confirmed_course:
@@ -92,14 +79,9 @@ class MemoryHandlerMixin:
 
         if self._memory is None:
             return None
-        text = prepared.input.text or ""
-        if (
-            not force
-            and ctx.memory_text is None
-            and not self._MEMORY_INTENT.search(text)
-        ):
+        if not force:
             return None
-        course = self._memory_course(ctx, None, text)
+        course = self._memory_course(ctx, None, prepared.input.text)
         if course is None:
             ctx.memory_status = "needs_course"
             ctx.memory_text = (
@@ -145,9 +127,7 @@ class MemoryHandlerMixin:
                 return item.message
         return None
 
-    def _memory_material(
-        self, ctx: _DynamicContext, *, text: str | None = None
-    ) -> str | None:
+    def _memory_material(self, ctx: _DynamicContext) -> str | None:
         if self._memory is None:
             return None
         if ctx.memory_status == "unavailable":
@@ -155,37 +135,11 @@ class MemoryHandlerMixin:
         if ctx.memory_view is None:
             return None
         focus = set(ctx.memory_focus_entry_ids)
-        if text:
-            focus.update(self._memory_focus_ids(ctx, text))
         try:
             return material_block(ctx.memory_view, focus_entry_ids=focus)
         except Exception:
             logger.warning("学习记忆材料生成失败", exc_info=True)
             return self._MEMORY_UNAVAILABLE_TEXT
-
-    @staticmethod
-    def _memory_focus_ids(ctx: _DynamicContext, text: str) -> set[str]:
-        """学生原话里提到的知识点/题干，视为本轮明确询问的条目。"""
-
-        view = ctx.memory_view
-        if view is None:
-            return set()
-        compact = re.sub(r"\s+", "", text or "").casefold()
-        if not compact:
-            return set()
-        found: set[str] = set()
-        for entry in list(view.entries) + list(view.pending_course_entries):
-            needles = [
-                point for point in entry.knowledge_points if len(point.strip()) >= 2
-            ]
-            if entry.statement_excerpt:
-                needles.append(entry.statement_excerpt[:24])
-            for needle in needles:
-                key = re.sub(r"\s+", "", needle).casefold()
-                if len(key) >= 2 and key in compact:
-                    found.add(entry.entry_id)
-                    break
-        return found
 
     def _memory_review_outcome(
         self,
@@ -239,6 +193,12 @@ class MemoryHandlerMixin:
             ctx.memory_entry_ids.update(
                 f"attempt:{attempt.attempt_id}" for attempt in entry.attempts
             )
+        requested_focus = action.parameters.get("entry_ids") or []
+        ctx.memory_focus_entry_ids = {
+            str(entry_id)
+            for entry_id in requested_focus
+            if str(entry_id) in ctx.memory_entry_ids
+        }
 
         if view.status == "empty":
             message = view.message
@@ -261,13 +221,25 @@ class MemoryHandlerMixin:
             # 待确认条目也要带编号：否则模型知道“有 11 条待确认”却没法纠正归属。
             "memory_entries": [self._memory_entry_detail(entry) for entry in entries],
         }
-        return ActionOutcome(name, "success", message, details)
+        model_details = {
+            "memory_entries": [
+                self._memory_entry_detail(entry, include_note=True) for entry in entries
+            ],
+        }
+        return ActionOutcome(
+            name, "success", message, details, model_details=model_details
+        )
 
     @staticmethod
-    def _memory_entry_detail(entry: MemoryEntryView) -> dict[str, Any]:
-        """工具结果里的一条记忆：编号、首末变化、附注和每次作答的编号。"""
+    def _memory_entry_detail(
+        entry: MemoryEntryView, *, include_note: bool = False
+    ) -> dict[str, Any]:
+        """工具结果里的一条记忆：编号、首末变化和每次作答的编号。
 
-        return {
+        附注只进入模型上下文，不进入公开 details；公开结果会经 SSE 出站。
+        """
+
+        payload = {
             "entry_id": entry.entry_id,
             "kind": entry.kind,
             "course": entry.course,
@@ -278,7 +250,6 @@ class MemoryHandlerMixin:
             "knowledge_points": entry.knowledge_points,
             "validity": entry.validity,
             "validity_note": entry.validity_note,
-            "note": entry.note,
             "recorded_at": entry.recorded_at.isoformat(),
             "first_at": entry.first_at.isoformat() if entry.first_at else None,
             "wrong_at": entry.wrong_at.isoformat() if entry.wrong_at else None,
@@ -297,6 +268,9 @@ class MemoryHandlerMixin:
                 for attempt in entry.attempts
             ],
         }
+        if include_note:
+            payload["note"] = entry.note
+        return payload
 
     def _memory_write_target(
         self, action: ActionPlan, ctx: _DynamicContext

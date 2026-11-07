@@ -40,10 +40,12 @@ ReplyStatus = Literal["complete", "truncated", "failed"]
 
 _REPLY_MODE_TO_STATUS: dict[str, str] = {
     "model": "complete",
+    "finalize": "complete",
     "clarification": "complete",
     "truncated": "truncated",
     "incomplete": "truncated",
     "fallback": "failed",
+    "pending": "failed",
 }
 
 
@@ -60,7 +62,8 @@ def reply_state(recovery: dict[str, Any]) -> tuple[ReplyStatus | None, bool]:
     if not mode:
         return None, False
     status = _REPLY_MODE_TO_STATUS.get(str(mode), "failed")
-    retryable = status != "complete" and bool(recovery.get("reply_input"))
+    has_material = bool(recovery.get("reply_context") or recovery.get("reply_input"))
+    retryable = status != "complete" and has_material
     if meta.get("reason") == "reply_not_configured":
         # 没有配置回复模型时重试也不会变好，不提供入口。
         retryable = False

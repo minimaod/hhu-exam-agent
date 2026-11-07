@@ -11,6 +11,7 @@ from collections.abc import (
 from contextlib import suppress
 from typing import Any
 
+from app.conversations import answer_gate
 from app.conversations.errors import (
     AttachmentInvalidError,
     ConversationConflictError,
@@ -751,11 +752,37 @@ class PracticeMixin:
                 "当前没有可以查看解答的练习题。",
                 needs_user=True,
             )
+        # F010 C：参考解答只给“已提交作答”或“学生主动要看”的练习；
+        # 模型自己调 reveal_solution 不构成授权。
+        decision = answer_gate.exercise_solution_gate(
+            request_id=ctx.request_id,
+            student_text=ctx.input_text or "",
+            exercise=exercise,
+        )
+        if not decision.allowed:
+            return ActionOutcome(
+                name,
+                "failed",
+                decision.message,
+                details={
+                    "rejected": True,
+                    "gate_rejected": True,
+                    "error_code": decision.code,
+                    "retryable": decision.retryable,
+                    "needs_user": decision.needs_user,
+                    "remedies": list(decision.remedies),
+                    "facts": {"exercise_id": exercise.id},
+                },
+                needs_user=decision.needs_user,
+                error_code=decision.code,
+            )
+        ctx.answer_grant = decision.grant
         try:
             revealed = self._repository.reveal_exercise_solution(
                 exercise.id, conversation_id=ctx.conversation_id
             )
         except ProblemNotFoundError as exc:
+            ctx.answer_grant = None
             return ActionOutcome(name, "failed", str(exc), needs_user=True)
         ctx.active_exercise = revealed
         ctx.exercise_id = revealed.id
@@ -863,6 +890,38 @@ class PracticeMixin:
         ex = prepared.exercise
         if ex is None:
             yield self._failure_event(prepared, "TUTORING_FAILED", "未找到当前练习题。", state)
+            return
+        # F010 C：这条专用路径同样要过参考解答门禁；「暂不展示参考解答」这类
+        # 否定说法会命中路由关键词，但不能因此绕过权限。
+        decision = answer_gate.exercise_solution_gate(
+            request_id=prepared.request_id,
+            student_text=prepared.input.text or "",
+            exercise=ex,
+        )
+        if not decision.allowed:
+            denied_view = self._build_exercise_view(ex)
+            try:
+                self._repository.complete_dynamic_turn(
+                    conversation_id=prepared.conversation_id,
+                    request_id=prepared.request_id,
+                    kind="reveal_solution",
+                    exercise=denied_view,
+                    assistant_message=decision.message,
+                    problem_id=ex.problem_id,
+                    exercise_id=ex.id,
+                )
+            except ConversationStorageError:
+                yield _storage_error_event(prepared)
+                return
+            state.saved = True
+            yield TurnResultEvent(
+                conversation_id=prepared.conversation_id,
+                request_id=prepared.request_id,
+                kind="reveal_solution",
+                exercise=denied_view,
+                assistant_message=decision.message,
+                exercise_id=ex.id,
+            )
             return
         revealed = self._repository.reveal_exercise_solution(
             ex.id, conversation_id=prepared.conversation_id

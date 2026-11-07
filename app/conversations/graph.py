@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
@@ -24,7 +25,10 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import DeepSeekSettings
+from app.conversations.prompts import TOOLING_SYSTEM_PROMPT
 from app.conversations.protocol import ActionPlan, ActionStatus, ActionType
+from app.conversations.reply import chunk_finish_reason, chunk_text
+from app.conversations.tool_projection import model_payload
 from app.conversations.tools import (
     ToolRejection,
     openai_tools,
@@ -32,7 +36,7 @@ from app.conversations.tools import (
     tool_label,
 )
 from app.llm import build_chat_model, log_usage, map_provider_error, response_text
-from app.papers.courses import detect_course, normalize_course
+from app.papers.courses import normalize_course
 from app.querying.errors import QueryError
 
 __all__ = [
@@ -42,6 +46,8 @@ __all__ = [
     "ActionType",
     "DynamicReviewGraph",
     "ExecutionResult",
+    "FINAL_REPLY_INSTRUCTION",
+    "FinalizeUnavailable",
     "ReviewState",
     "ScheduleDecision",
     "SchedulerAgent",
@@ -71,36 +77,27 @@ class ScheduleDecision(BaseModel):
     finished: bool = False
 
 
-TOOLING_SYSTEM_PROMPT = """\
-你是河海大学考试复习助手的调度核心。你要根据学生本轮发言、当前持久上下文、最近对话，以及你刚调用工具得到的真实结果，决定下一步调用哪个工具。
+# F010 C：工具轮结束后的终局回复。工具已禁用，模型只写面向学生的正文。
+FINAL_REPLY_INSTRUCTION = (
+    "【最终回复】本轮工具调用已经结束，信息都在上面的工具结果里。"
+    "现在只面向学生写这一段回复，不要再调用工具：\\n"
+    "1. 只依据工具结果和【学生本轮发言】里的事实，不要编造题号、答案或来源；不要提"
+    "“工具/系统/调度/上下文”这些词。\\n"
+    "2. 工具结果里带 authorized 的答案/参考代码/讲解，只在本轮学生已获授权时出现；"
+    "没有 authorized 就只能复述公开题面、给提示或讲考点，绝不能补全答案或解法。\\n"
+    "3. 有【回答范围】时以它为准：只给提示要给出与题干相关的具体提示（看哪个条件、"
+    "下一步先算什么），只问考点要说明考查的知识点及理由，都不能写完整解法。\\n"
+    "4. 已完成的批改结果优先于旧对话里“没收到图片”的说法；备注保存与否只按本轮"
+    "实际写入结果说明。\\n"
+    "5. 中文纯文本，不用 Markdown、不用编号列表或标题，2-5 句自然口语；不要重复"
+    "学生原话，不要复述工具参数，不要写“我将要/已经调用”这类过程说明。\\n"
+    "6. 工具结果里有等待学生回答的问题时，用一句话把问题问出来；不要替学生作答。"
+)
+MAX_FINALIZE_TOKENS = 1600
 
-严格守则（必须绝对遵守）：
-1. “我懂了”“明白了”“听懂了”：只调用 record_feedback，绝对不能同时调用 generate_exercise（出题）或 save_mistake（保存错题）。
-2. 歧义消除：如果上下文里“上次建议”给出多个选项，学生只回答“好”“可以”且没有指明具体做哪件事时，必须只调用 ask_user 澄清，不能擅自出题或保存。
-3. 拒绝建议：学生说“不用了”“不需要”“算了”时，调用 ask_user 温和确认，不再强推。
-4. 复合指令：学生明确要求两个操作（如“保存这题，再来一道类似题”）时，可以在一次响应里同时调用 save_mistake 和 generate_exercise；也可以先调用一个，看到真实结果后再调用下一个。
-5. 依赖关系：需要前一步新生成的对象（例如刚查到的题、刚生成的练习）时，必须先看到本轮的 tool 结果再发起下一次调用，不能凭猜测填题目 ID 或练习 ID。
-6. 上下文继承：已确认课程后学生说“给我期末试卷”，调用 query_papers 并带上该课程；考试类型只按学生本轮明确要求填写，未提及就留空，不要默认期末。
-7. 没有当前题目时，不要调用 answer_followup、generate_exercise、save_mistake、record_feedback、evaluate_exercise、reveal_solution。
-8. 区分题目修改方式：全新题目 mode=new；给尚未讲清的题补充信息 mode=supplement；纠正已讲解题目的题干 mode=correction。程序会保护已讲解的旧版本，不会被原地覆盖。
-9. 如果某个工具的结果是 failed 或要求用户补充，不要重复同一个调用，也不要调用依赖它成功的工具；这时应调用 ask_user 如实说明，或直接结束本轮。
-10. 课程名必须是学生本轮说出的课程或已确认课程（如“高等数学”“Python”“转专业”），不能写成“通识选修课程”“专业课”等类别。
-11. 本地目录与题库事实必须来自工具真实返回。未调用 query_papers 前不能声称某课程没有资料；未调用 search_questions 前不能声称有真题。查询失败或没有结果时，不得假装看到了题目，也不能编造题干、答案或参考代码。
-12. 查题与浏览是中间事实，不是“必须结束本轮”的信号。学生指定了试卷和题型（“这张卷的选择题”“所有单选”“前五题”）时用 list_paper_questions；有明确内容主题（“考循环的那几道”）时用 search_questions 并带上 query；“第 5 题”“第五小题”是原卷题号，用 number_label 精确定位，与当前展示到第几道无关。反过来，学生只是点名一份试卷（“2024-2025学年第一学期……期末试卷（A卷）”）时，只用 query_papers 给出卷名和下载入口就结束本轮，不要顺手列题、解题或出题；学生说“这张卷的选择题”时再列。
-13. 学生问考点、题意、某个选项的含义，或要讲解：先按上一句定位到具体题目（必要时先查题或选题），然后可以用 explain_problem 讲解；只问考点时也可以根据已返回的公开题干直接回答。不要要求学生先作答，也不要要求学生说“讲解”“直接”这类口令。只有学生明确表示“先自己做、不给答案”时，才展示题目并等他作答。
-14. 真题讲解用 explain_problem；基于当前真题生成变式用 generate_exercise 并带 from_question=true；保存真题到错题本用 save_mistake。
-15. 学生没有主动查看答案前，不能调用 show_question_answer 或 reveal_solution，也不要在回复里泄露答案或参考代码。
-16. 确实需要学生补充信息、或学生要求自己先做时，调用 ask_user 或在结果里说明，然后停止新增工具调用。
-17. 如果这一轮只需要自然语言回复（例如学生在闲聊或你已经拿到全部结果），不要调用任何工具。
-18. 学习记忆：学生问“先补什么”“最近学得怎么样”“从哪开始复习”时调用 review_learning_memory，用真实返回的知识点、次数和日期组织建议。不要算掌握率或用百分比，不要因为一次答对就说“已掌握”；返回里没有记录就直说没有，不能编造经历。看解答后作答、独立性未确认、过程不足、还没作答都要如实区分；材料标明“早于本窗口”或“只作历史回看”的记录不能说成近期表现。
-19. 纠正归属：学生指出记忆里的课程、知识点或描述不对时，调用 correct_learning_memory，entry_id 只能用 review_learning_memory 真实返回过的编号；一次只纠正被指出的那一项。学生只是不同意某次评价、要它别计入复习建议时，用 delete_learning_memory。
-20. 移除记忆：学生明确要求“这条别算”“从我记录里删掉”时才调用 delete_learning_memory，并原样告诉学生“从学习记忆和复习建议中移除，原会话记录保留”；不要替学生批量删除。
 
-调用风格：
-- 一次响应最多 3 个工具调用；总体不超过 4 次工具尝试。
-- 每次只做真实必要的事，不要为了凑步骤重复调用同一个工具。
-- 工具参数只填工具定义里存在的字段。
-"""
+class FinalizeUnavailable(RuntimeError):
+    """终局回复只能由服务层的回复适配器兜底时抛出（测试替身/恢复路径）。"""
 
 
 @dataclass
@@ -115,6 +112,9 @@ class ActionOutcome:
     executed: bool = True
     error_code: str | None = None
     retryable: bool = False
+    # F010 C：本轮已授权、只随 tool 消息给模型的事实（答案正文/讲解/评价）。
+    # 不进入 to_dict()，因此永不落盘、不进历史、不进 SSE。
+    model_details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,18 +127,23 @@ class ActionOutcome:
         }
 
     def to_tool_payload(self) -> dict[str, Any]:
-        """回传给模型的工具结果；只含公开事实，不含答案正文。"""
+        """回传给模型的工具结果：公开字段 + 本轮授权字段（逐字段投影）。"""
 
-        return {
+        payload = {
             "status": "ok" if self.status == "success" else (
                 "needs_user" if self.status == "clarification" else "failed"
             ),
             "message": self.message,
             "needs_user": self.needs_user,
-            "details": dict(self.details),
             "error_code": self.error_code,
             "retryable": self.retryable,
         }
+        if self.details.get("remedies"):
+            payload["remedies"] = list(self.details["remedies"])
+        if self.details.get("rejected"):
+            payload["rejected"] = True
+        payload.update(model_payload(self.action, self.details, self.model_details))
+        return payload
 
 
 @dataclass
@@ -161,6 +166,9 @@ class ReviewState(TypedDict, total=False):
     memory_context: str | None
     last_suggestions: list[str]
     recent_turns_summary: str
+    # F010 B：跨轮消息历史与结构化工作区；只在首次决策时注入。
+    history: list[dict[str, Any]]
+    workspace_text: str | None
     has_attachments: bool
     rounds: int
     executed_count: int
@@ -171,6 +179,8 @@ class ReviewState(TypedDict, total=False):
     assistant_reply: str | None
     suggested_actions: list[str]
     replan_error: str | None
+    # F010 C：本轮为什么结束（model_finished/clarification/budget/replan_error/recovery）。
+    terminal_reason: str | None
 
 
 # 同一轮里，右侧动作只有在左侧动作存在且成功时才允许执行。
@@ -213,6 +223,8 @@ _ACTION_LABELS = {
     "clarify_or_reply": "澄清提问",
     "review_memory": "查看学习记忆", "correct_memory": "纠正学习记忆",
     "delete_memory": "移除学习记忆",
+    "view_workspace": "读取工作区", "view_question_detail": "查看题目详情",
+    "list_shown_questions": "列出已展示题目", "view_learning_summary": "查看学习摘要",
 }
 
 
@@ -242,7 +254,11 @@ class SchedulerAgent:
         self._model = model
         self._http_async_client = http_async_client
         self._messages: list[Any] | None = None
+        # 本轮第一条消息在 _messages 里的下标；之前的都是跨轮历史。
+        self._turn_start: int = 1
         self._observed: set[str] = set()
+        self.last_chunk: Any = None
+        self.last_finish_reason: str | None = None
 
     # ------------------------------------------------------------------
     # 协议：把执行结果按 tool_call_id 回传给模型
@@ -263,6 +279,87 @@ class SchedulerAgent:
         )
 
     # ------------------------------------------------------------------
+    # 终局回复（F010 C）
+    # ------------------------------------------------------------------
+    def conversation_messages(self) -> list[Any] | None:
+        """本轮循环的真实消息（含本轮工具结果）；没有发生过决策时返回 None。
+
+        跨轮历史只保留学生/助手的文字，上一轮的工具结果（可能含当时获准的
+        答案或整份试卷列表）不进入终局提示：上一轮的授权不在本轮生效，正文
+        也不需要重复回放旧工具载荷。
+        """
+
+        if self._messages is None:
+            return None
+        return self._finalize_messages()
+
+    def _finalize_messages(self) -> list[Any]:
+        messages = list(self._messages or [])
+        if len(messages) <= 1:
+            return messages
+        start = getattr(self, "_turn_start", 1)
+        if start < 1 or start > len(messages):
+            start = len(messages)
+        cleaned: list[Any] = [messages[0]]
+        # 跨轮历史只保留学生/助手的可见文字；工具调用轮的伴随文字属于内部
+        # 诊断信息，连同工具载荷一起退出终局提示。
+        for message in messages[1:start]:
+            role = message.get("role")
+            if role == "tool":
+                continue
+            if role == "assistant" and message.get("tool_calls"):
+                continue
+            cleaned.append(message)
+        # 本轮消息保留 tool_calls → role=tool 的配对（终局需要本轮事实），
+        # 但决策消息的 content 属于内部判断，不出现在终局提示里。
+        for message in messages[start:]:
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                cleaned.append({**message, "content": ""})
+            else:
+                cleaned.append(message)
+        return cleaned
+
+    async def finalize_stream(self, *, note: str | None = None) -> AsyncIterator[str]:
+        """用同一份循环消息、工具禁用，流式写最终回复。
+
+        生产路径用调度器自己的模型；测试替身没有 ``astream`` 时抛
+        :class:`FinalizeUnavailable`，由服务层退回回复适配器（同一份消息）。
+        """
+
+        if self._messages is None:
+            raise FinalizeUnavailable("本轮没有决策消息，无法终局生成")
+        model = self._model
+        if model is None:
+            model = build_chat_model(
+                self._settings,  # type: ignore[arg-type]
+                max_tokens=MAX_FINALIZE_TOKENS,
+                timeout=45.0,
+                json_mode=False,
+                http_async_client=self._http_async_client,
+                stream_usage=True,
+            )
+        if not hasattr(model, "astream"):
+            raise FinalizeUnavailable("调度器模型不支持流式输出")
+        instruction = FINAL_REPLY_INSTRUCTION
+        if note:
+            instruction = f"{instruction}\n\n【补充要求】{note}"
+        messages = self._finalize_messages() + [
+            {"role": "user", "content": instruction}
+        ]
+        last_chunk: Any = None
+        finish_reason: str | None = None
+        async for chunk in model.astream(messages):
+            last_chunk = chunk
+            finish_reason = chunk_finish_reason(chunk) or finish_reason
+            piece = chunk_text(chunk)
+            if piece:
+                yield piece
+        self.last_finish_reason = finish_reason
+        self.last_chunk = last_chunk
+        if last_chunk is not None:
+            log_usage("loop_finalize", last_chunk)
+
+    # ------------------------------------------------------------------
     # 决策
     # ------------------------------------------------------------------
 
@@ -280,6 +377,8 @@ class SchedulerAgent:
         memory_context: str | None = None,
         last_suggestions: list[str] | None = None,
         recent_turns_summary: str | None = None,
+        history: list[dict[str, Any]] | None = None,
+        workspace_text: str | None = None,
         has_attachments: bool = False,
         observations: list[dict[str, Any]] | None = None,
         iteration: int = 1,
@@ -306,7 +405,6 @@ class SchedulerAgent:
                 suggested_actions=[],
             )
 
-        detected_course = detect_course(query)
         model = self._model or build_chat_model(
             self._settings,  # type: ignore[arg-type]
             max_tokens=900,
@@ -317,11 +415,6 @@ class SchedulerAgent:
 
         if self._messages is None:
             context_parts: list[str] = []
-            if detected_course:
-                context_parts.append(
-                    f"学生本轮提到的课程：{detected_course}（工具里的 course 必须使用该课程名，"
-                    "不能改写成“通识选修课程”“专业课”等类别）"
-                )
             if confirmed_course:
                 context_parts.append(f"已确认复习科目：{confirmed_course}")
             if active_problem_text:
@@ -339,6 +432,9 @@ class SchedulerAgent:
                     context_parts.append("当前练习还需要学生补充解题过程。")
             if question_context:
                 context_parts.append(question_context[:200])
+            if workspace_text:
+                # 结构化工作区：试卷/引用/选中事实由程序派生，模型只读。
+                context_parts.append(f"当前工作区：\n{workspace_text[:800]}")
             if memory_context:
                 # 学习记忆事实由程序算好再交给模型，避免模型自己“总结”出掌握结论。
                 context_parts.append(memory_context[:400])
@@ -347,8 +443,12 @@ class SchedulerAgent:
             if recent_turns_summary:
                 context_parts.append(f"最近对话摘要：\n{recent_turns_summary}")
             context_text = "\n".join(context_parts) if context_parts else "（当前无特殊上下文）"
-            self._messages = [
-                {"role": "system", "content": TOOLING_SYSTEM_PROMPT},
+            self._messages = [{"role": "system", "content": TOOLING_SYSTEM_PROMPT}]
+            if history:
+                # 历史消息只进决策模型；正文模型不读它们，保持“决策/正文分离”。
+                self._messages.extend(history)
+            self._turn_start = len(self._messages)
+            self._messages.append(
                 {
                     "role": "user",
                     "content": (
@@ -356,8 +456,8 @@ class SchedulerAgent:
                         f"【学生本轮发言】：\n{query}\n\n"
                         "请决定下一步调用哪些工具；如果本轮不需要任何工具，就不要调用。"
                     ),
-                },
-            ]
+                }
+            )
 
         bound = model.bind_tools(openai_tools()) if hasattr(model, "bind_tools") else model
         try:
@@ -369,7 +469,7 @@ class SchedulerAgent:
             raise QueryError("MODEL_UNAVAILABLE", "会话调度服务暂时不可用，请稍后重试。") from exc
 
         log_usage("scheduler_tools", response)
-        return self._decision_from_response(response, detected_course, iteration)
+        return self._decision_from_response(response, confirmed_course, iteration)
 
     # ------------------------------------------------------------------
     # 响应解析
@@ -378,7 +478,7 @@ class SchedulerAgent:
     def _decision_from_response(
         self,
         response: Any,
-        detected_course: str | None,
+        confirmed_course: str | None,
         iteration: int,
     ) -> ScheduleDecision:
         raw_calls = list(getattr(response, "tool_calls", None) or [])
@@ -409,7 +509,7 @@ class SchedulerAgent:
             return ScheduleDecision(
                 assistant_reply=content or None,
                 finished=True,
-                confirmed_course=detected_course,
+                confirmed_course=confirmed_course,
             )
 
         actions: list[ActionPlan] = []
@@ -449,13 +549,12 @@ class SchedulerAgent:
             if isinstance(candidate, str) and candidate.strip():
                 param_course = candidate.strip()
                 break
-        # 确定性识别的课程优先：模型把“转专业考试”当成“通识选修课程”时纠正；
-        # 写法与识别结果等价时保留模型原话（例如都指 Python 语言程序设计）。
-        course: str | None = detected_course
-        if detected_course is None:
-            course = normalize_course(param_course) or param_course if param_course else None
-        elif param_course and normalize_course(param_course) == detected_course:
-            course = param_course
+        # 课程只来自模型显式传入的工具参数，或沿用已确认课程；不再从原话兜底。
+        course = (
+            (normalize_course(param_course) or param_course)
+            if param_course
+            else confirmed_course
+        )
         return ScheduleDecision(
             confirmed_course=course,
             actions=actions,
@@ -560,6 +659,11 @@ class DynamicReviewGraph:
                 state.update(await self._execute(state))
                 if any(item.get("needs_user") for item in state.get("observations", [])):
                     break
+            state["terminal_reason"] = (
+                "clarification"
+                if any(item.get("needs_user") for item in state.get("observations", []))
+                else "recovery"
+            )
             return state
         return await self._graph.ainvoke(initial)
 
@@ -583,6 +687,8 @@ class DynamicReviewGraph:
                 memory_context=state.get("memory_context"),
                 last_suggestions=state.get("last_suggestions") or [],
                 recent_turns_summary=state.get("recent_turns_summary"),
+                history=state.get("history") or None,
+                workspace_text=state.get("workspace_text"),
                 has_attachments=bool(state.get("has_attachments")),
                 observations=list(state.get("observations") or []),
                 iteration=rounds,
@@ -713,7 +819,25 @@ class DynamicReviewGraph:
         return "respond"
 
     def _respond(self, state: ReviewState) -> dict[str, Any]:
-        return {}
+        """终局步：只判定本轮为什么结束，正文由服务层在同一循环消息上生成。"""
+
+        reason = state.get("terminal_reason")
+        if not reason:
+            observations = list(state.get("observations") or [])
+            if any(item.get("needs_user") for item in observations) or any(
+                (item.get("details") or {}).get("waiting_user") for item in observations
+            ):
+                reason = "clarification"
+            elif state.get("replan_error"):
+                reason = "replan_error"
+            elif int(state.get("rounds", 0)) > self._max_rounds or state.get("pending"):
+                reason = "budget"
+            elif state.get("assistant_reply") is None and state.get("rounds"):
+                # 模型没有给出收尾文字，但也没有待执行计划：按正常结束处理。
+                reason = "model_finished"
+            else:
+                reason = "model_finished"
+        return {"terminal_reason": reason}
 
     @staticmethod
     def _blocked_reason(action: str, observations: list[dict[str, Any]]) -> str | None:
@@ -726,6 +850,16 @@ class DynamicReviewGraph:
                     )
         if action in _SINGLE_USE_ACTIONS:
             for item in observations:
-                if item.get("action") == action:
-                    return f"“{_action_label(action)}”本轮已经处理过，未重复执行。"
+                if item.get("action") != action:
+                    continue
+                details = item.get("details") or {}
+                # F010 D14：上一次只是被可纠正拒绝（没有执行、无需等学生），
+                # 允许模型在同一轮换参数重试；成功执行过的仍不重复。
+                if (
+                    details.get("rejected")
+                    and item.get("needs_user") is False
+                    and item.get("executed") is False
+                ):
+                    continue
+                return f"“{_action_label(action)}”本轮已经处理过，未重复执行。"
         return None

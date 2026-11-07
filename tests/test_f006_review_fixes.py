@@ -1429,7 +1429,7 @@ async def test_successful_action_updates_confirmed_course(tmp_path: Path) -> Non
             decision(
                 ActionPlan(
                     action="query_papers",
-                    parameters={"exam_type": "final"},
+                    parameters={"course": "线性代数", "exam_type": "final"},
                 ),
                 course="线性代数",
             ),
@@ -1449,7 +1449,8 @@ async def test_successful_action_updates_confirmed_course(tmp_path: Path) -> Non
     result_event = next(event for event in events if event.type == "result")
     assert result_event.result is not None
     assert result_event.result.filters is not None
-    assert result_event.result.filters.course == "线性代数"
+    # 课程名按目录规范名落库（线性代数是几何与线性代数的别名）。
+    assert result_event.result.filters.course == "几何与线性代数"
     context = repository.get_context(conversation.id)
     assert context is not None
-    assert context.confirmed_course == "线性代数"
+    assert context.confirmed_course == "几何与线性代数"

@@ -13,6 +13,7 @@ from typing import Any
 
 from fastapi import Request
 
+from app.conversations import final_reply
 from app.conversations.context import DynamicContextMixin
 from app.conversations.dispatch import DeepSeekIntentRouter
 from app.conversations.errors import (
@@ -46,6 +47,7 @@ from app.conversations.models import (
 from app.conversations.narration import NarrationMixin
 from app.conversations.practice import PracticeMixin
 from app.conversations.question_flow import QuestionFlowMixin
+from app.conversations.read_tools import ReadToolMixin
 from app.conversations.reply import material_from_payload
 from app.conversations.repository import (
     AttachmentRecord,
@@ -99,6 +101,7 @@ class ConversationService(
     QuestionFlowMixin,
     SearchMixin,
     SelectionMixin,
+    ReadToolMixin,
     ExplainMixin,
     PracticeMixin,
     MemoryHandlerMixin,
@@ -233,17 +236,42 @@ class ConversationService(
         turn = self._repository.find_turn(conversation_id, request_id)
         if turn is None:
             raise ConversationNotFoundError("该轮次不存在。")
+        # 只有已完成的轮次才有“已提交材料”可复用；进行中/失败/中断的轮次
+        # 不能借 /reply 绕过正常执行或恢复流程。
+        if turn.status != "completed":
+            raise ConversationConflictError("这一轮还没有完成，请等它结束后再重做正文。")
         recovery = turn.recovery or {}
+        context = recovery.get("reply_context")
         payload = recovery.get("reply_input")
-        if not payload:
+        if not context and not payload:
             raise ConversationConflictError("这一轮没有可复用的回复材料，请重新提出需求。")
         if self._make_reply is None:
             raise ConversationConflictError("回复模型尚未配置。")
 
-        material = material_from_payload(payload)
+        notes: list[str] = []
+        legacy_public_only = False
+        if isinstance(context, dict) and int(context.get("version") or 0) >= 2:
+            # F010 C：新轮次只存公开材料 + 授权引用；答案在这里重新读取并
+            # 逐条校验版本/来源，失效的条目丢弃后如实提示。
+            material, notes = final_reply.material_from_context(
+                self, conversation_id, context
+            )
+        else:
+            # B 旧记录：无法核对当时的授权，只复用公开材料（讲解与披露类
+            # 工具结果可能含已失效的答案）。
+            material = final_reply.public_material_from_legacy(
+                material_from_payload(payload)
+            )
+            legacy_public_only = True
         text, meta = await self._stream_reply(self._make_reply(), material)
         if not text:
             raise ConversationConflictError("这次仍然没能生成回复，请稍后再试。")
+        if legacy_public_only:
+            meta = {**meta, "material_scope": "public_only"}
+        if notes:
+            unique = list(dict.fromkeys(notes))
+            text = text.rstrip() + "\n\n" + "；".join(unique)
+            meta = {**meta, "reason": "answer_revalidated", "revalidated": unique}
         notice = self._memory_notice_from_material(material)
         if notice and notice not in text:
             text = text + "\n\n" + notice

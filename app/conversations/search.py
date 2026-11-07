@@ -2,11 +2,11 @@
 
 import asyncio
 import logging
-import re
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
+from app.conversations import tool_projection
 from app.conversations.graph import (
     ActionOutcome,
     ActionPlan,
@@ -20,39 +20,19 @@ from app.papers.locator import (
     PaperLocation,
     RANK_AMBIGUOUS,
     RANK_UNIQUE,
-    cancels_exam_type,
     describe_location,
-    extract_location,
-    locate_papers,
+    locate_papers_by_location,
+    normalize_academic_year,
+    paper_matches,
 )
 from app.querying.models import ResultEvent
+from app.question_bank.config import MAX_BROWSE_LIMIT
 from app.question_bank.models import SearchRequest
 from app.questions.errors import QuestionError
-from app.questions.intent import (
-    SearchIntent,
-    asks_across_papers,
-    extract_intent,
-    question_answer_requested,
-    wants_next_card,
-)
+from app.questions.intent import SearchIntent
 from app.questions.models import QuestionSearchResult
 
 logger = logging.getLogger("app.conversations.service")
-
-_PAGE_WORDS = re.compile(
-    r"继续|接着|下一批|下一页|下一部分|剩下的|其余的|后面那些|还没(看|显示|列)|"
-    r"换一道|换一题|换一个|换个题|换道题|再来一道|再换一道|不要这道|别来这道|下一道|下一个题|"
-    r"选择题|填空题|编程题|判断题|计算题|简答题|问答题|大题|小题|运算题|"
-    r"给我|再看|再列|再显示|看看|一下|这些|那些|这|那|份|张|道|题|卷|个|的|吧|呢|啊|呀|了|我|你|它|"
-    r"再|还|都|全|列|显示|看|来|出|给|要|有|几"
-)
-
-def _page_topic_words(text: str) -> str:
-    """去掉翻页/客套词后剩下的话题约束；空表示这一轮只是翻页。"""
-
-    return _PAGE_WORDS.sub("", text or "").strip()
-
-_SIMILAR_QUESTION_RE = re.compile(r"类似|相似|同类型|同一类|换一道|另一道|别的题|其他题|其它题")
 
 class SearchMixin:
     """搜索意图、范围、翻页和查询结果的组织。"""
@@ -66,7 +46,7 @@ class SearchMixin:
     ) -> ActionOutcome:
         name = "search_questions"
         emit("searching_questions", "正在检索已审核的 Python 真题")
-        intent = self._search_intent(prepared.input.text, ctx, action)
+        intent = self._intent_from_params(ctx, action)
         if not intent.course:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
@@ -82,13 +62,21 @@ class SearchMixin:
                 "不会扩大到其他试卷。",
                 needs_user=True,
             ))
+        if intent.page_error:
+            return self._action_result(prepared, ctx, ActionOutcome(
+                name, "clarification", intent.page_error, needs_user=True,
+                error_code="PAGE_SCOPE_CHANGED", retryable=False,
+            ))
         if intent.page_exhausted:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name, "clarification", self._exhausted_text(ctx, intent), needs_user=True
             ))
+        exclude = action.parameters.get("exclude_question_id")
+        if not exclude and action.parameters.get("exclude_previous"):
+            exclude = self._source_question_id(ctx)
         result = await self._run_question_search(
             prepared, ctx, name, intent, emit,
-            exclude_question_id=self._similar_source_question(prepared.input.text, ctx),
+            exclude_question_id=exclude,
         )
         if isinstance(result, ActionOutcome):
             return result
@@ -234,6 +222,11 @@ class SearchMixin:
                 "query": intent.query,
                 "question_type": intent.question_type,
                 "number_label": intent.number_label,
+                "total": result.total,
+                "offset": result.offset,
+                "returned": result.returned,
+                "next_offset": result.next_offset,
+                "limit": intent.limit,
                 "request_id": prepared.request_id,
             }
         ctx.question_context["shown_ids"] = list(
@@ -241,10 +234,7 @@ class SearchMixin:
         )[-200:]
 
         selected = False
-        wants_explain = self._wants_explanation(prepared.input.text) or question_answer_requested(
-            prepared.input.text
-        )
-        if intent.auto_explain and wants_explain and len(result.cards) == 1:
+        if intent.auto_explain and len(result.cards) == 1:
             card = result.cards[0]
             selection = self._select_question_card(
                 prepared.conversation_id,
@@ -276,6 +266,11 @@ class SearchMixin:
             "paper_title": paper_title,
             "question_type": intent.question_type,
             "number_label": intent.number_label,
+            # F010 C：公开题面随检索结果交给模型；不含答案正文。
+            "questions": [
+                tool_projection.public_question(card, statement_limit=400)
+                for card in list(result.cards)[:10]
+            ],
         }
         return self._action_result(prepared, ctx, ActionOutcome(
             name,
@@ -375,178 +370,136 @@ class SearchMixin:
             text += "已经全部列出。"
         return text
 
-    def _search_intent(
-        self, text: str, ctx: _DynamicContext, action: ActionPlan
+    def _intent_from_params(
+        self, ctx: _DynamicContext, action: ActionPlan
     ) -> SearchIntent:
-        papers: list[dict[str, Any]] = []
-        if self._papers is not None:
-            try:
-                papers = [
-                    item.model_dump()
-                    for item in self._papers.list_papers(course="Python语言程序设计").items
-                ]
-            except Exception:
-                logger.warning("读取试卷目录失败，查题不带试卷筛选", exc_info=True)
-        confirmed = normalize_course(ctx.confirmed_course) if ctx.confirmed_course else None
+        """只从工具参数与工作区事实构造检索目标，不读取学生原话。"""
+
+        params = dict(action.parameters)
         context = self._question_context(ctx, trace=True)
         current_paper = context.get("paper_id")
-        if context.get("derived") and not self._refers_to_current_paper(text):
-            # 旧会话里只有题卡时，不能把任意一次查题都算成“这张卷”。
-            current_paper = None
-        parameters = dict(action.parameters)
-        # 明确跨卷与“沿用当前卷”互斥：先删模型带来的旧 ID，“这道题”之类的
-        # 指代也不能把旧卷重新写回去（见 §7.7 R3）。
-        cross_paper = asks_across_papers(text)
-        if cross_paper:
-            parameters.pop("paper_id", None)
-        # 最近成功浏览是指代依据；旧选题和模型带来的旧卷 ID 都不能覆盖它。
-        # 新年份/学期等显式条件仍由 extract_intent 优先核对。
-        if current_paper and not cross_paper and self._refers_to_current_paper(text):
-            parameters["paper_id"] = current_paper
-        explicit = extract_intent(text, confirmed_course=confirmed, papers=papers)
-        if explicit.paper_id:
-            # 明确年份/学期/卷名能唯一定位时，在共用入口先消除旧 ID；
-            # 底层解析器仍保留“条件冲突必须澄清”的校验契约。
-            parameters["paper_id"] = explicit.paper_id
-        if parameters.get("paper_id"):
-            # 模型给的试卷 ID 必须真实存在；不存在就当没给，由上下文或原文决定。
-            known = {str(item.get("id")) for item in papers}
-            if str(parameters["paper_id"]) not in known:
-                parameters.pop("paper_id")
-        if parameters.get("offset") is None:
-            parameters.pop("offset", None)
-        intent = extract_intent(
-            text,
-            confirmed_course=confirmed,
-            planned=parameters,
-            papers=papers,
-            current_paper_id=current_paper,
+        scope = str(params.get("scope") or "current")
+        paper_id = params.get("paper_id")
+        if scope == "bank":
+            paper_id = None
+            unresolved = False
+        elif paper_id is None:
+            paper_id = current_paper if scope == "current" else None
+            unresolved = scope == "paper" and paper_id is None
+        else:
+            unresolved = False
+
+        year = (
+            normalize_academic_year(str(params.get("academic_year")))
+            if params.get("academic_year")
+            else None
         )
-        course = normalize_course(intent.course) if intent.course else None
-        if course is None:
-            # 学生说“这张卷/继续”时不会重复课程名：沿用已确认课程，或按当前
-            # 试卷所属课程补齐，避免工具因为没课程而要求重复信息。
-            course = confirmed or self._course_for_paper(current_paper)
-        # 明确换了课程（例如从 Python 改问高数）时，不能带着旧试卷 ID。
-        if course and intent.paper_id and self._course_for_paper(intent.paper_id) not in (None, course):
-            intent = replace(intent, paper_id=None)
-        if course and not intent.paper_id and current_paper:
-            if self._course_for_paper(current_paper) not in (None, course):
-                current_paper = None
-                ctx.question_context = {}
-        query = re.sub(
-            r"(来|找|出|给|查|搜)(一道|一题|道题|个题)|一道|一题|真题|题目|讲讲|讲解|分析|练练|练习|一下",
-            " ",
-            intent.query,
-        )
-        query = re.sub(r"\s+", " ", query).strip()[:120]
-        # “直接讲解”只由学生的话决定：模型可以建议，但不能替学生开启讲解。
-        auto = bool(parameters.get("auto_explain") or action.parameters.get("auto_explain"))
-        auto = auto and self._wants_explanation(text)
-        intent = replace(intent, course=course, query=query, auto_explain=auto)
-        intent = self._apply_page_position(text, intent, context, ctx)
-        if self._source_question_id(ctx) is not None and (
-            asks_across_papers(text) or _SIMILAR_QUESTION_RE.search(text or "")
-        ):
-            # 会过滤掉原题，所以多要一条，避免过滤后这一页变空。
-            intent = replace(intent, limit=min(intent.limit + 1, 64))
-        return intent
-
-    def _apply_page_position(
-        self,
-        text: str,
-        intent: SearchIntent,
-        context: dict[str, Any],
-        ctx: _DynamicContext,
-    ) -> SearchIntent:
-        """把“继续/下一批/换一道”落到正确位置，并绑定筛选条件。
-
-        续页位置只对同一 (试卷, 题型, 无关键词) 的浏览成立：换了题型
-        （例如看完选择题又问填空题）就从第 1 道重新开始，不沿用旧位置；
-        已经列完时标记 ``page_exhausted``，而不是回到第 1 道重放。
-        """
-
-        wants_next = self._wants_continuation(text) or wants_next_card(text)
-        if intent.next_card is False and wants_next_card(text):
-            intent = replace(intent, next_card=True)
-        if not wants_next or intent.number_label is not None:
-            return intent
-        if not _page_topic_words(text):
-            # 这一轮没有新的内容约束（没说“考循环的选择题”），只是翻页：
-            # 不能把“继续/下一批/换一道”当成检索关键词，否则会变成相关度检索。
-            intent = replace(intent, query="")
-        if intent.next_card:
-            # “换一道”是换题不是换条件：沿用上一次的关键词与题型，
-            # 再排除已经展示过的题。
-            if not _page_topic_words(text):
-                last = self._last_search_filter(ctx)
-                if last.get("query") and not intent.query:
-                    intent = replace(intent, query=str(last["query"]))
-                if last.get("question_type") and intent.question_type is None:
-                    intent = replace(intent, question_type=last["question_type"])
-            if intent.paper_id is None:
-                # 没有锁定试卷时要先有一小池候选，才能排除看过的、给出新题。
-                intent = replace(intent, limit=max(intent.limit, 10))
-        if (
-            intent.question_type is None
-            and context.get("paper_id")
-            and context["paper_id"] == intent.paper_id
-            and context.get("question_type")
-        ):
-            # 只说“继续”时沿用上次的题型，否则会被当成整卷而要重列一遍。
-            intent = replace(intent, question_type=context["question_type"])
-        if not self._same_page_filter(context, intent):
-            return intent
-        if intent.offset:
-            return intent
-        next_offset = context.get("next_offset")
-        if next_offset is None:
-            return replace(intent, page_exhausted=True)
-        limited = intent.limit
-        if context.get("limit"):
-            # 沿用上一页页宽，避免“前五题”之后突然变成整卷。
-            limited = min(limited, int(context["limit"])) if limited else int(context["limit"])
-        return replace(intent, offset=int(next_offset), limit=limited)
-
-    @staticmethod
-    def _same_page_filter(context: dict[str, Any], intent: SearchIntent) -> bool:
-        """续页只能在同一个筛选条件下成立。"""
-
-        if not context.get("paper_id") or context["paper_id"] != intent.paper_id:
-            return False
-        if intent.query:
-            return False
-        stored_kind = context.get("question_type") or None
-        return stored_kind == (intent.question_type or None)
-
-    @staticmethod
-    def _refers_to_current_paper(text: str) -> bool:
-        """学生的话是否指向刚刚那份卷（而不是另起一个检索条件）。"""
-
-        return bool(
-            re.search(
-                r"这张|这份|这卷|该卷|本卷|刚才|刚刚|上面|之前那|继续|下一批|下一页|剩下的|"
-                r"第\s*[0-9一二三四五六七八九十]+\s*(?:道|个)?题|这道|这个题",
-                text or "",
+        term = str(params.get("term")) if params.get("term") else None
+        variant = str(params.get("variant")) if params.get("variant") else None
+        if year or term or variant:
+            location = PaperLocation(
+                year=year,
+                term=term,
+                variant=variant,
+                exam_type=params.get("exam_type"),
+                exam_type_stated=bool(params.get("exam_type")),
             )
+            papers = None
+            if self._papers is not None:
+                try:
+                    papers = self._papers.list_papers(
+                        course=(
+                            normalize_course(str(params.get("course")))
+                            if params.get("course")
+                            else self._course_for_paper(str(paper_id) if paper_id else None)
+                        ),
+                        exam_type=params.get("exam_type"),
+                    )
+                except Exception:
+                    papers = None
+            if papers is not None:
+                match = locate_papers_by_location(
+                    papers.items, exam_type=location.exam_type, location=location
+                )
+                if match.rank == RANK_UNIQUE:
+                    paper_id = str(getattr(match.paper, "id", "")) or paper_id
+                else:
+                    paper_id = None
+                    unresolved = True
+
+        course = normalize_course(str(params.get("course") or "")) if params.get("course") else None
+        if course is None:
+            course = normalize_course(ctx.confirmed_course) if ctx.confirmed_course else None
+        if course is None:
+            course = self._course_for_paper(paper_id or current_paper)
+        if course and paper_id and self._course_for_paper(paper_id) not in (None, course):
+            paper_id = None
+            unresolved = unresolved or scope == "paper"
+
+        question_type = params.get("question_type")
+        query = str(params.get("query") or "").strip()
+        number_label = params.get("number_label")
+        number_label = str(number_label) if number_label is not None else None
+        offset = 0
+        page_exhausted = False
+        page_error: str | None = None
+        continue_page = bool(params.get("continue_from_previous"))
+        explicit_offset = params.get("offset")
+        if continue_page and explicit_offset is not None:
+            page_error = "offset 与 continue_from_previous 只能选一个。"
+        elif continue_page:
+            if not context or not context.get("request_id"):
+                page_error = "当前没有可续的查询，请先列出一页题目。"
+            else:
+                if paper_id is None:
+                    paper_id = context.get("paper_id")
+                if question_type is None:
+                    question_type = context.get("question_type")
+                if not query and context.get("query"):
+                    query = str(context.get("query") or "")
+                changed = (
+                    (paper_id or None) != (context.get("paper_id") or None)
+                    or (question_type or None) != (context.get("question_type") or None)
+                    or query != str(context.get("query") or "")
+                )
+                if changed:
+                    page_error = "查询条件已经变化，不能沿用上一页的位置；请确认是否从第一页重新看。"
+            if page_error is None:
+                next_offset = context.get("next_offset")
+                if next_offset is None:
+                    page_exhausted = True
+                else:
+                    offset = int(next_offset)
+        elif explicit_offset is not None:
+            offset = int(explicit_offset)
+
+        limit = params.get("limit")
+        if limit is None and continue_page and context.get("limit"):
+            limit = int(context["limit"])
+        if limit is None:
+            # 整卷浏览的默认仍是一次列全，保持旧卷面体验；跨卷检索才用较小页宽。
+            limit = 40 if action.action == "list_paper_questions" else (
+                MAX_BROWSE_LIMIT if paper_id else 3
+            )
+
+        knowledge_points = params.get("knowledge_points") or ()
+        auto_explain = bool(params.get("auto_explain")) and not bool(params.get("defer_answer"))
+        return SearchIntent(
+            course=course,
+            query=query,
+            question_type=question_type,
+            exam_type=params.get("exam_type"),
+            paper_id=str(paper_id) if paper_id else None,
+            number_label=number_label,
+            knowledge_points=tuple(str(item) for item in knowledge_points),
+            limit=max(1, min(int(limit), 64)),
+            offset=max(0, offset),
+            auto_explain=auto_explain,
+            next_card=bool(params.get("exclude_previous")),
+            page_exhausted=page_exhausted,
+            page_error=page_error,
+            paper_unresolved=unresolved,
         )
-
-    @staticmethod
-    def _wants_continuation(text: str) -> bool:
-        return bool(
-            re.search(r"继续|接着|下一批|下一页|下一部分|剩下的|其余的|后面那些|还没(看|显示|列)", text or "")
-        )
-
-    def _similar_source_question(self, text: str, ctx: _DynamicContext) -> str | None:
-        """要求学生找“类似的题”时，返回应当排除的原题 ID。
-
-        不排除的话，按相关度检索往往把学生刚做完的那道原题排在第一位，
-        等于把原题又发了一遍。
-        """
-
-        if not (_SIMILAR_QUESTION_RE.search(text or "") or asks_across_papers(text)):
-            return None
-        return self._source_question_id(ctx)
 
     def _dynamic_query(
         self,
@@ -556,11 +509,10 @@ class SearchMixin:
         emit: Callable[[str, str], None],
     ) -> ActionOutcome:
         name = "query_papers"
-        text = prepared.input.text
-        course = action.parameters.get("course") or ctx.confirmed_course
-        exam_type = self._requested_exam_type(
-            text, action.parameters.get("exam_type")
-        )
+        params = dict(action.parameters)
+        course = normalize_course(str(params.get("course") or "")) if params.get("course") else None
+        if course is None and ctx.confirmed_course:
+            course = normalize_course(ctx.confirmed_course)
         if not course:
             return ActionOutcome(
                 name,
@@ -572,6 +524,8 @@ class SearchMixin:
         if self._papers is None:
             return ActionOutcome(name, "failed", "试卷目录暂时不可用，请稍后重试。", error_code="CATALOG_UNAVAILABLE", retryable=True)
 
+        all_exam_types = bool(params.get("all_exam_types"))
+        exam_type = None if all_exam_types else params.get("exam_type")
         emit("retrieving", "正在检索试卷资料")
         try:
             papers = self._papers.list_papers(course=course, exam_type=exam_type)
@@ -579,16 +533,54 @@ class SearchMixin:
             logger.warning("查卷执行失败：%s", exc)
             return ActionOutcome(name, "failed", "试卷检索失败，请稍后重试。", error_code="QUERY_FAILED", retryable=True)
 
-        # 模型只给“课程＋考试类型”是常态（截图里的真实调用就只有这两个）：
-        # 原文里的学年、学期、卷别必须由服务端自己核对，不能因为工具参数没带
-        # 就静默丢掉，也不能退回全部试卷。
-        location = extract_location(text)
+        year = normalize_academic_year(str(params.get("academic_year"))) if params.get("academic_year") else None
+        term = str(params.get("term")) if params.get("term") else None
+        variant = str(params.get("variant")) if params.get("variant") else None
+        location = PaperLocation(
+            year=year,
+            term=term,
+            variant=variant,
+            exam_type=exam_type,
+            exam_type_stated=bool(exam_type),
+        )
         candidates: list[str] | None = None
         state = self._paper_state(ctx)
-        if state is not None and state.get("status") == "clarify_paper":
-            # 上一轮已经问过“A 卷还是 B 卷”：本轮学生只回“B卷”时，
-            # 学年、学期和候选范围要接着上一轮，不能重新在全目录里找。
-            location, candidates = self._merge_clarification(state, location, course, text)
+        if (
+            state is not None
+            and state.get("status") == "clarify_paper"
+            and not (year or term)
+        ):
+            location, candidates = self._merge_clarification(
+                state, location, course, clear_exam_type=all_exam_types
+            )
+
+        param_paper = params.get("paper_id")
+        if param_paper:
+            chosen = next(
+                (item for item in papers.items if str(getattr(item, "id", "")) == str(param_paper)),
+                None,
+            )
+            if chosen is None:
+                return ActionOutcome(
+                    name,
+                    "clarification",
+                    "目录里没有这份试卷，请确认年份、学期和卷别。",
+                    needs_user=True,
+                    error_code="NO_SUCH_PAPER",
+                )
+            if location.explicit and not paper_matches(chosen, location, include_exam_type=False):
+                # 学生对学年/学期/卷别给了明确新条件：旧 paper_id 视为过期。
+                ctx.last_paper_switch_override = {
+                    "old_paper_id": str(param_paper),
+                    "academic_year": year,
+                    "term": term,
+                    "variant": variant,
+                }
+            else:
+                return self._adopt_located_paper(
+                    prepared, ctx, name, course, chosen, location
+                )
+
         if location.explicit:
             return self._located_query(
                 prepared, ctx, name, course, papers, location, candidates
@@ -616,31 +608,27 @@ class SearchMixin:
                 items=[],
                 total=0,
             )
-        return ActionOutcome(
-            name,
-            "success",
-            ctx.result.message,
-            {"total": papers.total, "course": course, "exam_type": exam_type,
-             "papers": [{"paper_id": item.id, "title": item.title,
-                         "academic_year": item.academic_year, "exam_type": item.exam_type}
-                        for item in papers.items]},
-        )
+        details = {
+            "total": papers.total,
+            "course": course,
+            "exam_type": exam_type,
+            "papers": [{"paper_id": item.id, "title": item.title,
+                        "academic_year": item.academic_year, "exam_type": item.exam_type}
+                       for item in papers.items],
+        }
+        if getattr(ctx, "last_paper_switch_override", None):
+            details["paper_switch_override"] = ctx.last_paper_switch_override
+        return ActionOutcome(name, "success", ctx.result.message, details)
 
     def _merge_clarification(
         self,
         state: dict[str, Any],
         location: PaperLocation,
         course: str | None = None,
-        text: str | None = None,
+        *,
+        clear_exam_type: bool = False,
     ) -> tuple[PaperLocation, list[str] | None]:
-        """把上一轮的待澄清条件合并进本轮；换了课程或条件就作废旧候选。
-
-        区分四种情况：
-        - 换了课程：旧课程的条件和候选 ID 全部作废（§7.9 R2 场景 A）；
-        - 明确取消考试类型：保留学年/学期，清掉类型限制与旧候选（§7.10 R2b）；
-        - 同一课程里显式改考试类型：学年/学期可以留下，候选必须按新类型重查；
-        - 只补卷别或什么都没说：沿用上一轮的学年、学期与候选范围。
-        """
+        """把上一轮的待澄清条件合并进本轮；换了课程或条件就作废旧候选。"""
 
         state_course = state.get("course")
         if (
@@ -650,10 +638,8 @@ class SearchMixin:
         ):
             return location, None
         if location.year or location.term:
-            # 明确改了年份或学期：旧候选不再适用，按新范围重新定位。
             return location, None
-        if cancels_exam_type(text):
-            # “不限期中期末”：题型限制和旧候选都释放，学年学期仍然有效。
+        if clear_exam_type:
             return (
                 PaperLocation(
                     year=location.year or state.get("academic_year"),
@@ -666,8 +652,6 @@ class SearchMixin:
             )
         stated_exam = location.exam_type if location.exam_type_stated else None
         if stated_exam and stated_exam != state.get("exam_type"):
-            # 同一课程、显式换考试类型（例如期末澄清期间改看期中）：
-            # 旧的期末候选 ID 不能把合法的期中卷排除掉。
             return (
                 PaperLocation(
                     year=location.year or state.get("academic_year"),
@@ -710,8 +694,8 @@ class SearchMixin:
             for item in papers.items
             if not candidates or str(getattr(item, "id", "")) in candidates
         ]
-        match = locate_papers(
-            prepared.input.text, pool, exam_type=location.exam_type, location=location
+        match = locate_papers_by_location(
+            pool, exam_type=location.exam_type, location=location
         )
         if match.rank == RANK_UNIQUE:
             return self._adopt_located_paper(prepared, ctx, name, course, match.paper, location)
@@ -727,6 +711,10 @@ class SearchMixin:
                 "exam_type": location.exam_type,
                 "candidates": [
                     str(getattr(item, "id", "")) for item in match.candidates
+                ],
+                # F010 B：工作区要显示卷名，不能只给 ID（旧记录没有该字段时回退）。
+                "candidate_titles": [
+                    str(getattr(item, "title", "") or "") for item in match.candidates
                 ],
                 "request_id": prepared.request_id,
             }
@@ -839,62 +827,4 @@ class SearchMixin:
                 "term": term,
                 "exam_type": getattr(paper, "exam_type", None),
             },
-        )
-
-    @staticmethod
-    def _requested_exam_type(text: str, planned: Any) -> str | None:
-        """模型选择能力，程序检查筛选是否确实出现在本轮请求中。"""
-        if re.search(r"不限|不区分|全部类型|所有类型|不要只查|别只查|不只查|不只要", text):
-            return None
-        markers = {
-            "midterm": r"期中|\bmidterm\b",
-            "final": r"期末|期终|\bfinal\b",
-            "other": r"其[他它]类型|其[他它]考试|\bother\b",
-        }
-        mentioned = {kind for kind, pattern in markers.items() if re.search(pattern, text, re.IGNORECASE)}
-        if not mentioned:
-            return None
-        # 未指定某一类型时查询全部；“全部期末卷”仍是期末范围。
-        if len(mentioned) > 1 and not re.search(r"不要|不查|不找|不看|不是|只要|只查|仅要|仅查", text):
-            return None
-        if isinstance(planned, str) and planned in mentioned:
-            return planned
-        if len(mentioned) == 1:
-            return next(iter(mentioned))
-        return None
-
-    @staticmethod
-    def _wants_explanation(text: str) -> bool:
-        """学生是否在本轮要求讲解、问考点或问题意。"""
-
-        return bool(
-            re.search(
-                r"讲|解释|说明|分析|啥意思|什么意思|考(点|啥|什么|哪个)|怎么做|为什么|"
-                r"思路|步骤|看不懂|看不明白|不会|错在|对不对|选哪个|哪个选项",
-                text or "",
-            )
-        )
-
-    @staticmethod
-    def _wants_to_try_first(text: str) -> bool:
-        """学生是否明确要求先自己做、暂不给答案。
-
-        这是唯一保留“先作答”的合法理由；不能拿“这是真题请求”当理由。
-        """
-
-        return bool(
-            re.search(
-                r"先自己做|自己做|别给(我)?答案|不要答案|先不给答案|先别说答案|"
-                r"不公布答案|先不(要)?讲解|先别讲|只看题|先看题|先自己(想|写|做)|自己想|"
-                r"只给提示|只提示|给点提示|提示一下|先别公布|别公布|不要公布",
-                text or "",
-            )
-        )
-
-    @staticmethod
-    def _wants_hint_only(text: str) -> bool:
-        """学生只要提示、不要完整答案。"""
-
-        return bool(
-            re.search(r"只给提示|只提示|给点提示|给个提示|提示一下|稍作提示|稍微提示", text or "")
         )

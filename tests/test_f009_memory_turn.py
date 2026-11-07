@@ -131,9 +131,9 @@ async def test_turn_gives_decision_and_reply_the_same_memory_facts(tmp_path: Pat
     prepared = service.prepare_turn(conversation_id, turn_input("我最近复习 Python 应该先补什么"))
     events = [event async for event in service.stream_prepared(prepared, dummy_request())]
 
-    # 决策阶段确实拿到了程序统计的记忆上下文。
+    # S1：调度阶段不再预读记忆；材料只来自下面显式 review_memory 的工具结果。
     plan_call = scheduler.calls[0]
-    assert "【学习记忆】" in (plan_call.get("memory_context") or "")
+    assert not (plan_call.get("memory_context") or "")
 
     result = next(event for event in events if event.type == "result")
     assert result.assistant_message == "建议先补循环：条件与终止条件。"

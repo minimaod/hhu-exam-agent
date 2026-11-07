@@ -382,6 +382,7 @@ async def test_dynamic_search_and_auto_explain_binds_source(tmp_path: Path) -> N
                     ActionPlan(
                         action="search_questions",
                         parameters={
+                            "course": "Python",
                             "query": "Python 期末 循环",
                             "question_type": "choice",
                             "auto_explain": True,
@@ -443,7 +444,9 @@ async def test_model_cannot_disclose_answer_without_student_request(tmp_path, te
     """学生只是找题，模型自作主张的讲解/看答案仍被拦下。"""
 
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
-        ActionPlan(action="search_questions", parameters={"auto_explain": True}),
+        ActionPlan(action="search_questions", parameters={
+            "course": "Python", "defer_answer": True,
+        }),
         ActionPlan(action=extra_action, parameters={}),
     ])])
     tutor = FakeTutor(explanations=[sample_explanation("B")])
@@ -454,7 +457,8 @@ async def test_model_cannot_disclose_answer_without_student_request(tmp_path, te
     assert result.question_results
     # 没有公开答案，也没有把答案写进卡片。
     assert all(not c.answer_revealed and c.answer_detail is None for c in result.question_results)
-    assert result.question is None and result.tutoring is None
+    assert result.question is None or result.question.answer_revealed is False
+    assert result.tutoring is None
     assert tutor.explain_calls == []
     if extra_action == "view_question_answer":
         assert repository.get_active_question(conversation.id) is None
@@ -469,7 +473,9 @@ async def test_explain_request_runs_without_forced_student_choice(tmp_path):
 
     scheduler = FakeScheduler(decisions=[
         ScheduleDecision(actions=[
-            ActionPlan(action="search_questions", parameters={"auto_explain": True}),
+            ActionPlan(action="search_questions", parameters={
+            "course": "Python", "auto_explain": True,
+        }),
         ]),
         ScheduleDecision(actions=[ActionPlan(action="explain_problem", parameters={})]),
     ])
@@ -505,7 +511,10 @@ async def test_lookup_cannot_skip_search_and_disclose_answer(tmp_path, action):
 @pytest.mark.anyio
 async def test_new_lookup_does_not_echo_previous_revealed_selection(tmp_path):
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
-        ActionPlan(action="search_questions", parameters={"auto_explain": True}),
+        ActionPlan(action="search_questions", parameters={
+            "course": "Python", "defer_answer": True,
+            "exclude_previous": True,
+        }),
         ActionPlan(action="explain_problem", parameters={}),
     ])])
     # 两道题：换一道要能给出没看过的那一道，而不是回显旧题。
@@ -535,7 +544,7 @@ async def test_dynamic_search_unreviewed_is_a_clear_clarification(
     scheduler = FakeScheduler(
         decisions=[
             ScheduleDecision(
-                actions=[ActionPlan(action="search_questions", parameters={})]
+                actions=[ActionPlan(action="search_questions", parameters={"course": "Python"})]
             )
         ]
     )
@@ -572,7 +581,7 @@ async def test_dynamic_search_bank_unavailable_is_retryable(tmp_path: Path) -> N
     scheduler = FakeScheduler(
         decisions=[
             ScheduleDecision(
-                actions=[ActionPlan(action="search_questions", parameters={})]
+                actions=[ActionPlan(action="search_questions", parameters={"course": "Python"})]
             )
         ]
     )

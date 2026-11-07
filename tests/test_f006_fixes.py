@@ -188,15 +188,15 @@ async def test_scheduler_agent_usage_logging_with_real_structure(caplog):
     with caplog.at_level(logging.INFO, logger="app.llm"):
         dec = await scheduler.plan("我想复习 Python")
 
-    assert dec.confirmed_course == "Python"
+    assert dec.confirmed_course == "Python语言程序设计"
     assert [plan.action for plan in dec.actions] == ["introduce"]
     assert dec.actions[0].tool_call_id == "call_introduce_1"
     assert any("deepseek usage" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.anyio
-async def test_scheduler_overrides_category_with_detected_course():
-    """模型把“转专业考试”误当成“通识选修课程”时，用确定性识别纠正。"""
+async def test_scheduler_uses_explicit_course_without_text_detection():
+    """课程只认模型显式传参，不再由 graph 的文本识别覆盖。"""
     tool_calls = [
         {
             "id": "call_introduce_2",
@@ -209,7 +209,25 @@ async def test_scheduler_overrides_category_with_detected_course():
 
     dec = await scheduler.plan("我要复习转专业考试")
 
-    assert dec.confirmed_course == "转专业"
+    assert dec.confirmed_course == "通识选修课程"
+
+
+@pytest.mark.anyio
+async def test_scheduler_does_not_detect_course_without_tool_parameter():
+    """学生原话提到课程，但工具没传 course 时，不得由 graph 文本识别补上。"""
+    tool_calls = [
+        {
+            "id": "call_query_no_course",
+            "name": "query_papers",
+            "args": {"exam_type": "final"},
+            "type": "tool_call",
+        }
+    ]
+    scheduler = SchedulerAgent(model=FakeChatModel("", tool_calls=tool_calls))
+
+    dec = await scheduler.plan("我想复习 Python")
+
+    assert dec.confirmed_course is None
 
 
 # ------------------------------------------------------------------

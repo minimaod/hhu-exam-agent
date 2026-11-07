@@ -336,3 +336,27 @@ def locate_papers(
     if candidates:
         return PaperMatch(RANK_UNIQUE, candidates[0], candidates, location)
     return PaperMatch(RANK_NONE, None, (), location)
+
+
+def locate_papers_by_location(
+    papers: Iterable[Any],
+    *,
+    exam_type: str | None = None,
+    location: PaperLocation,
+) -> PaperMatch:
+    """只按结构化条件定位，不解析任何学生原话。
+
+    F010 D 的生产入口；``locate_papers`` 的文本入口保留给旧评测与测试。
+    """
+
+    items = list(papers)
+    if not location.explicit:
+        return PaperMatch(RANK_NULL, None, (), location)
+    candidates = tuple(
+        item for item in items if paper_matches(item, location, include_exam_type=True)
+    )
+    if len(candidates) > 1:
+        return PaperMatch(RANK_AMBIGUOUS, None, candidates, location)
+    if candidates:
+        return PaperMatch(RANK_UNIQUE, candidates[0], candidates, location)
+    return PaperMatch(RANK_NONE, None, (), location)

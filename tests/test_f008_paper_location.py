@@ -246,7 +246,10 @@ def test_location_summary_keeps_real_conditions() -> None:
 
 @pytest.mark.anyio
 async def test_query_finds_one_paper_and_saves_its_identity(tmp_path: Path) -> None:
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    )])
     service, repository, _ = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     result = result_of(await run(
@@ -282,7 +285,10 @@ async def test_query_without_academic_year_still_lists_all_final_papers(tmp_path
 
 @pytest.mark.anyio
 async def test_missing_year_returns_empty_result_without_fallback(tmp_path: Path) -> None:
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2019-2020", term="s1",
+    )])
     service, repository, _ = build_service(tmp_path, items=PYTHON_PAPERS, scheduler=scheduler)
     conversation = service.create_conversation()
     result = result_of(await run(
@@ -300,7 +306,10 @@ async def test_missing_year_returns_empty_result_without_fallback(tmp_path: Path
 @pytest.mark.anyio
 async def test_ambiguous_paper_asks_only_for_missing_variant(tmp_path: Path) -> None:
     two = [paper("2024-2025", term="s1", variant="A"), paper("2024-2025", term="s1", variant="B")]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1",
+    )])
     service, _, _ = build_service(tmp_path, items=two, scheduler=scheduler)
     conversation = service.create_conversation()
     result = result_of(await run(
@@ -324,7 +333,10 @@ async def test_real_catalog_screenshot_sentence_hits_one_paper(tmp_path: Path) -
     if not (DEFAULT_PAPERS_ROOT / "catalog.json").is_file():
         pytest.skip("本机无真实试卷目录")
     papers = PaperService(PaperRepository(DEFAULT_PAPERS_ROOT))
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    )])
     repository = ConversationRepository(tmp_path / "study.sqlite3")
     repository.initialize()
     service = ConversationService(
@@ -363,8 +375,10 @@ async def test_naming_a_paper_does_not_list_its_questions(tmp_path: Path) -> Non
     """只发卷名时模型若顺手列题，程序必须拦下，不能把整卷题目倒出来。"""
 
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
-        ActionPlan(action="query_papers",
-                   parameters={"course": COURSE, "exam_type": "final"}),
+        ActionPlan(action="query_papers", parameters={
+                       "course": COURSE, "exam_type": "final",
+                       "academic_year": "2024-2025", "term": "s1", "variant": "A",
+                   }),
         # 真实记录里模型就是这样追加的：不带题型，等于整卷 59 题。
         ActionPlan(action="list_paper_questions", parameters={}),
     ])])
@@ -393,8 +407,10 @@ async def test_asking_for_a_type_still_lists_questions(tmp_path: Path) -> None:
     """同一轮里学生明确要题型时，拦截面不能误伤。"""
 
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
-        ActionPlan(action="query_papers",
-                   parameters={"course": COURSE, "exam_type": "final"}),
+        ActionPlan(action="query_papers", parameters={
+                       "course": COURSE, "exam_type": "final",
+                       "academic_year": "2024-2025", "term": "s1", "variant": "A",
+                   }),
         ActionPlan(action="list_paper_questions", parameters={"question_type": "choice"}),
     ])])
     service, _, runtime = build_service(tmp_path, scheduler=scheduler)
@@ -413,8 +429,10 @@ async def test_paper_query_does_not_replay_previous_question_cards(tmp_path: Pat
     """上一轮列过题，下一轮只问试卷时，旧题卡不能冒充本轮结果。"""
 
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
-        ActionPlan(action="query_papers",
-                   parameters={"course": COURSE, "exam_type": "final"}),
+        ActionPlan(action="query_papers", parameters={
+                       "course": COURSE, "exam_type": "final",
+                       "academic_year": "2024-2025", "term": "s1", "variant": "A",
+                   }),
         ActionPlan(action="list_paper_questions", parameters={"question_type": "choice"}),
     ])])
     service, repository, _ = build_service(tmp_path, scheduler=scheduler)
@@ -423,7 +441,10 @@ async def test_paper_query_does_not_replay_previous_question_cards(tmp_path: Pat
     assert first.question_results, "第一轮应该真的列出题目"
 
     # 第二轮只发卷名：模型仍只调 query_papers。
-    scheduler.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler.push(query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    ))
     events = await run(service, conversation.id, "2024-2025学年第一学期《Python语言程序设计》期末试卷（A卷）")
     second = result_of(events)
 
@@ -449,7 +470,10 @@ async def test_similar_question_searches_whole_bank_and_skips_source(
     own = card_of(PAPER, 12)
     other = card_of("py-2019-2020-s1-final", 3)
     scheduler = FakeScheduler(decisions=[
-        query_decision(course=COURSE, exam_type="final"),
+        query_decision(
+            course=COURSE, exam_type="final",
+            academic_year="2024-2025", term="s1", variant="A",
+        ),
     ])
     service, _, runtime = build_service(tmp_path, scheduler=scheduler, cards=[own, other])
     conversation = service.create_conversation()
@@ -470,6 +494,8 @@ async def test_similar_question_searches_whole_bank_and_skips_source(
             "paper_id": PAPER,
             "query": "字符串大小写转换 capitalize title upper",
             "question_type": "choice",
+            "scope": "bank",
+            "exclude_previous": True,
         },
     )]))
     similar = result_of(await run(service, conversation.id, "去真实试卷库里面找一道类似的题"))
@@ -483,7 +509,10 @@ async def test_similar_question_searches_whole_bank_and_skips_source(
 
 @pytest.mark.anyio
 async def test_following_question_inherits_located_paper(tmp_path: Path) -> None:
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    )])
     service, _, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     await run(service, conversation.id,

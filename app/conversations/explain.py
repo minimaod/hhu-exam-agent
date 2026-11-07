@@ -2,11 +2,11 @@
 
 import asyncio
 import logging
-import re
 import uuid
 from collections.abc import Callable
 
 from app import images
+from app.conversations import answer_gate
 from app.conversations.errors import (
     TurnInvalidError,
     TutoringUnavailableError,
@@ -29,10 +29,6 @@ from app.questions.cards import (
     compose_statement,
 )
 from app.questions.errors import QuestionError
-from app.questions.intent import (
-    looks_like_new_problem,
-    mentions_question_target,
-)
 from app.questions.models import (
     QuestionCard,
     QuestionSelection,
@@ -67,7 +63,9 @@ class ExplainMixin:
         if self._make_tutor is None:
             return self._action_result(prepared, ctx, ActionOutcome(name, "failed", "辅导模型尚未配置，暂时不能讲解。"))
 
-        real_selection, ambiguity = await self._resolve_real_question_target(prepared, ctx)
+        real_selection, ambiguity = await self._resolve_real_question_target(
+            prepared, ctx, action
+        )
         if ambiguity:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name, "clarification", ambiguity, needs_user=True
@@ -263,6 +261,12 @@ class ExplainMixin:
             ctx.tutoring = build_explanation_result(
                 saved, explanation, record_id=self._record_id_for(saved)
             )
+            ctx.answer_grant = answer_gate.AnswerGrant(
+                kind="explanation",
+                scope=ctx.answer_scope or "explain",
+                request_id=prepared.request_id,
+                target_id=saved.id,
+            )
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
                 "success",
@@ -321,6 +325,15 @@ class ExplainMixin:
         ctx.question_card = question
         ctx.question_result_status = "ok"
         ctx.question_result_message = ""
+        ctx.answer_grant = answer_gate.AnswerGrant(
+            kind="question_explain",
+            scope=ctx.answer_scope or "explain",
+            request_id=prepared.request_id,
+            target_id=question.question_id,
+            build_id=question.build_id,
+            content_sha256=question.content_sha256,
+            selection_id=selection.id,
+        )
         return self._action_result(prepared, ctx, ActionOutcome(
             "explain_problem",
             "success",
@@ -329,24 +342,26 @@ class ExplainMixin:
         ))
 
     async def _resolve_real_question_target(
-        self, prepared: ExecuteTurn, ctx: _DynamicContext
+        self, prepared: ExecuteTurn, ctx: _DynamicContext, action: ActionPlan
     ) -> tuple[QuestionSelection | None, str | None]:
         """讲解入口采用与选题相同的目标解析，不自行匹配第一张同号卡片。"""
-        if prepared.input.attachments or prepared.input.kind in ("problem", "supplement", "correction"):
+        if action.parameters.get("target") == "new":
             return None, None
-        text = prepared.input.text or ""
+        if prepared.input.attachments:
+            return None, None
+        explicit_target = action.parameters.get("paper_id") or action.parameters.get("ref")
+        if (
+            not explicit_target
+            and prepared.input.kind in ("problem", "supplement", "correction")
+        ):
+            return None, None
         cards, _ = self._question_candidates(ctx)
         selection = ctx.question_selection or self._repository.get_active_question(ctx.conversation_id)
         if not cards and selection is None:
             return None, None
-        targetish = (
-            mentions_question_target(text) or not text.strip()
-            or bool(re.search(r"第\s*[0-9一二三四五六七八九十]+", text))
-            or (ctx.question_result_status == "ok" and not looks_like_new_problem(text))
+        return await self._resolve_question_selection(
+            prepared, ctx, action.parameters, use_active=True
         )
-        if not targetish:
-            return None, None
-        return await self._resolve_question_selection(prepared, ctx, use_active=True)
 
     async def _explain_selection(
         self, prepared: ExecuteTurn, selection: QuestionSelection
@@ -484,7 +499,7 @@ class ExplainMixin:
         statement = active.statement_text
         explanation = active.explanation
         exercise = ctx.active_exercise
-        explicit_problem = bool(re.search(r"母题|原题|原来的题|原来那道", prepared.input.text))
+        explicit_problem = target == "problem"
         if explicit_problem:
             target = "problem"
         use_exercise = exercise is not None and exercise.problem_id == active.id and (
@@ -525,6 +540,12 @@ class ExplainMixin:
             answer=answer.answer,
             related_steps=answer.related_steps,
         )
+        ctx.answer_grant = answer_gate.AnswerGrant(
+            kind="followup_answer",
+            scope=ctx.answer_scope or "explain",
+            request_id=prepared.request_id,
+            target_id=active.id,
+        )
         return ActionOutcome(
             name,
             "success",
@@ -535,51 +556,3 @@ class ExplainMixin:
                 "followup_target": "exercise" if use_exercise else "problem",
             },
         )
-
-    @classmethod
-    def _answer_scope(cls, text: str) -> str | None:
-        """本轮回答范围：``hint``（只要提示）、``topic``（只问考点）。
-
-        两者都**不是**“完整讲解”授权，因此不能执行讲解或看答案。学生同时
-        要求讲解/答案时返回 ``None``，按完整讲解处理。
-        """
-
-        value = text or ""
-        if cls._wants_hint_only(value):
-            return "hint"
-        # 判断“解释/讲”的对象与范围：说的是“考什么/考点/知识点”，就只是考点，
-        # 不能因为出现“解释”两个字就当成完整讲解。按小句判断，避免“讲讲…的
-        # 考点和解题步骤”被整句吞掉。
-        topic_object = re.compile(
-            r"考点|知识点|考查(什么|点|哪些|哪个)"
-            r"|考[了的]?(什么|啥|哪些|哪个|哪几个)"
-            r"|考核?[^。；，,！？]{0,3}(什么|啥|哪些|哪个|哪几个)"
-            r"|查[^。；，,！？]{0,3}(什么|啥|哪个|哪些)"
-        )
-        if not topic_object.search(value):
-            return None
-        # 问“这段代码/解题过程考什么”时，代码和过程是提问对象，不是
-        # 请求的输出。完整解答须由独立请求或明确的解答动作来授权。
-        full_marker = re.compile(
-            r"步骤|答案|解答|过程|代码|完整|怎么做|为什么|解析|推导|思路|例子|举例"
-        )
-        solution_request = re.compile(
-            r"(?:给出|展示|写出|补全|实现|解释|讲解|分析).{0,8}"
-            r"(?:答案|解答|解法|步骤|解题过程|参考代码|完整代码)"
-            r"|(?:代码|程序)(?:怎么写|如何写)|为什么(?:选|答案|结果)"
-        )
-        clause_marker = re.compile(r"讲|解释|说明|分析|说说|聊聊")
-        has_topic = False
-        wants_more = False
-        for clause in re.split(r"[，,。；;！!？?\s]+|和|以及|与|并|然后|再|顺便|另外", value):
-            # “不用给答案/不必讲步骤”是限制，不是要求。
-            clause = re.sub(r"(不用|不需要|不必|不要|别|无需)[^。；，,]{0,8}", " ", clause)
-            if not clause.strip():
-                continue
-            if topic_object.search(clause):
-                has_topic = True
-                if solution_request.search(clause):
-                    wants_more = True
-            elif clause_marker.search(clause) or full_marker.search(clause):
-                wants_more = True
-        return "topic" if has_topic and not wants_more else None

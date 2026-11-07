@@ -33,6 +33,11 @@ ActionType = Literal[
     "review_memory",
     "correct_memory",
     "delete_memory",
+    # F010 B：只读工作区工具，不改业务状态。
+    "view_workspace",
+    "view_question_detail",
+    "list_shown_questions",
+    "view_learning_summary",
 ]
 
 ActionStatus = Literal["success", "failed", "clarification"]

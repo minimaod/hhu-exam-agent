@@ -5,6 +5,7 @@ from contextlib import suppress
 from typing import Any
 
 from app.conversations.errors import ProblemNotFoundError
+from app.conversations.history import build_history, project_turn
 from app.conversations.models import (
     ExerciseEvaluation,
     ExerciseView,
@@ -21,6 +22,12 @@ from app.questions.models import (
 from app.tutoring.models import TutoringResult
 
 logger = logging.getLogger("app.conversations.service")
+
+
+def _summary_clip(value: Any, limit: int) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + "…"
+
 
 class DynamicContextMixin:
     """一轮执行所需的上下文读取与恢复。"""
@@ -114,16 +121,31 @@ class DynamicContextMixin:
         )
 
     def _recent_turns_summary(self, conversation_id: str) -> str:
-        recent_turns = self._repository.list_turns(conversation_id)
-        if not recent_turns:
+        """最近四轮摘要；必须与历史投影同源，不能回传原始助手正文。
+
+        摘要同时进调度提示和正文材料。上一轮合法展示的答案或练习解答，
+        在原始 ``assistant_message`` 里是可读正文；这里统一走
+        ``project_turn``，只保留授权事实或结构化占位。
+        """
+
+        turns = [
+            turn
+            for turn in self._repository.list_turns(conversation_id)
+            if turn.status == "completed"
+        ]
+        if not turns:
             return ""
+        transcripts = self._repository.list_turn_transcripts(conversation_id)
         summary_lines: list[str] = []
-        for turn in recent_turns[-4:]:
-            summary_lines.append(f"用户：{turn.query}")
-            if turn.assistant_message:
-                summary_lines.append(f"助手：{turn.assistant_message}")
-            elif turn.tutoring is not None:
-                summary_lines.append(f"助手：{turn.tutoring.kind}")
+        for turn in turns[-4:]:
+            block = project_turn(turn, transcripts.get(turn.request_id))
+            if block is None:
+                continue
+            summary_lines.append(f"用户：{_summary_clip(block.get('query'), 200)}")
+            if block.get("assistant"):
+                summary_lines.append(
+                    f"助手：{_summary_clip(block['assistant'], 300)}"
+                )
         return "\n".join(summary_lines)
 
     def _question_context(self, ctx: _DynamicContext, *, trace: bool = False) -> dict[str, Any]:
@@ -225,6 +247,17 @@ class DynamicContextMixin:
                 return turn
         return None
 
+    def _history_for(
+        self, conversation_id: str, current_request_id: str
+    ) -> list[dict[str, Any]]:
+        """跨轮消息历史：只读投影，同一请求重放时结果完全一致。"""
+
+        turns = self._repository.list_turns(conversation_id)
+        transcripts = self._repository.list_turn_transcripts(conversation_id)
+        return build_history(
+            turns, transcripts, current_request_id=current_request_id
+        )
+
     def _source_question_id(self, ctx: _DynamicContext) -> str | None:
         """学生此刻在看的题：优先选中的题，否则用当前页码/卷内的那张卡。"""
 
@@ -232,7 +265,8 @@ class DynamicContextMixin:
             return ctx.question_card.question_id
         pool = list(ctx.question_results)
         if not pool:
-            return None
+            shown = self._question_context(ctx).get("shown_ids") or []
+            return str(shown[0]) if shown else None
         context = self._question_context(ctx)
         number = context.get("number_label")
         if number:

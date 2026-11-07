@@ -10,7 +10,9 @@ from collections.abc import (
 from dataclasses import replace
 from typing import Any
 
+from app.conversations import answer_gate
 from app.conversations.errors import ConversationStorageError
+from app.conversations.final_reply import question_answer_text
 from app.conversations.graph import (
     ActionOutcome,
     ActionPlan,
@@ -604,8 +606,7 @@ class QuestionFlowMixin:
 
         name = "list_paper_questions"
         emit("searching_questions", "正在读取这份试卷的题目")
-        intent = self._search_intent(prepared.input.text, ctx, action)
-        context = self._question_context(ctx)
+        intent = self._intent_from_params(ctx, action)
         if not intent.course:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
@@ -621,9 +622,11 @@ class QuestionFlowMixin:
                 "要列哪一份试卷的题目？" + (f"目前有：{options}。" if options else ""),
                 needs_user=True,
             ))
-        wanted = action.parameters.get("question_type")
-        if wanted and not intent.question_type:
-            intent = replace(intent, question_type=wanted)
+        if intent.page_error:
+            return self._action_result(prepared, ctx, ActionOutcome(
+                name, "clarification", intent.page_error, needs_user=True,
+                error_code="PAGE_SCOPE_CHANGED", retryable=False,
+            ))
         if intent.page_exhausted:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name, "clarification", self._exhausted_text(ctx, intent), needs_user=True
@@ -631,7 +634,14 @@ class QuestionFlowMixin:
         intent = replace(intent, query="")
         result = await self._run_question_search(
             prepared, ctx, name, intent, emit,
-            exclude_question_id=self._similar_source_question(prepared.input.text, ctx),
+            exclude_question_id=(
+                action.parameters.get("exclude_question_id")
+                or (
+                    self._source_question_id(ctx)
+                    if action.parameters.get("exclude_previous")
+                    else None
+                )
+            ),
         )
         if isinstance(result, ActionOutcome):
             return result
@@ -670,6 +680,70 @@ class QuestionFlowMixin:
                     needs_user=True,
                 ))
         emit("viewing_question", "正在读取原卷答案")
+        # F010 C：先拿到本轮的公开卡片（同轮选中用内存卡，跨轮用已提交快照），
+        # 再经过答案门禁。未获授权时不 reveal、不读 answer_detail，也不调用
+        # answer_view；版本与来源在真正读取时还会再校验一次。
+        card: QuestionCard | None = None
+        if ctx.question_card is not None and ctx.question_card.question_id == selection.question_id:
+            card = ctx.question_card
+        if card is None:
+            try:
+                card = self.questions.card_for_selection(selection)
+            except QuestionError:
+                card = None
+        if card is None:
+            try:
+                card = self._resolve_question_card(
+                    prepared.conversation_id,
+                    selection.source_request_id,
+                    selection.question_id,
+                )
+            except QuestionSourceChangedError as exc:
+                return self._gate_rejection(
+                    prepared,
+                    ctx,
+                    name,
+                    answer_gate.GateDecision(
+                        code="ANSWER_VERSION_CHANGED",
+                        message=exc.message,
+                        remedies=answer_gate.REJECTION_REMEDIES["ANSWER_VERSION_CHANGED"],
+                        facts={
+                            "question_id": selection.question_id,
+                            "number_label": selection.number_label,
+                        },
+                    ),
+                )
+            except QuestionError as exc:
+                return self._gate_rejection(
+                    prepared,
+                    ctx,
+                    name,
+                    answer_gate.GateDecision(
+                        code="ANSWER_SOURCE_INVALID",
+                        message=exc.message,
+                        remedies=answer_gate.REJECTION_REMEDIES["ANSWER_SOURCE_INVALID"],
+                        facts={"question_id": selection.question_id},
+                    ),
+                )
+        decision = answer_gate.question_answer_gate(
+            conversation_id=prepared.conversation_id,
+            request_id=prepared.request_id,
+            student_text=prepared.input.text,
+            selection=selection,
+            card=card,
+        )
+        if not decision.allowed:
+            return self._gate_rejection(
+                prepared,
+                ctx,
+                name,
+                decision,
+                facts={
+                    "question_id": selection.question_id,
+                    "number_label": selection.number_label,
+                },
+            )
+        ctx.answer_grant = decision.grant
         try:
             selection = (
                 self._repository.reveal_question_answer(
@@ -682,6 +756,7 @@ class QuestionFlowMixin:
             )
             card, evidence = self.questions.answer_view(selection)
         except QuestionError as exc:
+            ctx.answer_grant = None
             return self._action_result(prepared, ctx, ActionOutcome(
                 name, "failed", exc.message, error_code=exc.code,
                 needs_user=True,
@@ -689,6 +764,7 @@ class QuestionFlowMixin:
         ctx.question_selection = selection
         ctx.question_card = card
         if evidence.status in ("source_changed", "source_pruned"):
+            ctx.answer_grant = None
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
                 "clarification",
@@ -698,6 +774,7 @@ class QuestionFlowMixin:
         message = evidence.message or "已显示原卷参考答案。"
         ctx.question_result_status = "ok"
         ctx.question_result_message = message
+        ctx.authorized_text = question_answer_text(card)
         return self._action_result(prepared, ctx, ActionOutcome(
             name,
             "success",

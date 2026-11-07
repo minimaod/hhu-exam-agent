@@ -170,7 +170,9 @@ async def test_new_recovery_record_is_version_two_with_dispatch_and_reply(
     recovery = read_recovery(db_path, conversation.id, first.request_id)
     assert recovery["version"] == 2
     assert recovery["dispatch"] == "tools"
-    assert recovery["reply"] == {"mode": "model", "deltas": 1}
+    assert recovery["reply"]["mode"] == "finalize"
+    assert recovery["reply"]["deltas"] == 1
+    assert recovery["reply_context"]["version"] == 2
     assert recovery["actions"][0]["plan"]["tool_call_id"] is None  # 由替身计划写入
     assert recovery["input"]["text"] == "我要复习高数"
 

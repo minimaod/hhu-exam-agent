@@ -35,6 +35,10 @@ EXPECTED_ACTIONS = {
     "review_learning_memory": "review_memory",
     "correct_learning_memory": "correct_memory",
     "delete_learning_memory": "delete_memory",
+    "view_workspace": "view_workspace",
+    "view_question_detail": "view_question_detail",
+    "list_shown_questions": "list_shown_questions",
+    "view_learning_summary": "view_learning_summary",
 }
 
 
@@ -49,13 +53,13 @@ def test_note_and_followup_target_are_typed_and_validated():
     assert error is not None
 
 
-def test_seventeen_tools_and_one_to_one_action_mapping() -> None:
-    """工具集合固定为 17 个（F009 新增 3 个记忆工具），且与内部动作一一对应。"""
+def test_twenty_one_tools_and_one_to_one_action_mapping() -> None:
+    """工具集合固定为 21 个（F009 记忆 3 个 + F010 只读 4 个），且与内部动作一一对应。"""
 
-    assert len(TOOL_SPECS) == 17
+    assert len(TOOL_SPECS) == 21
     assert {spec.name for spec in TOOL_SPECS} == set(EXPECTED_ACTIONS)
     assert {spec.action for spec in TOOL_SPECS} == set(EXPECTED_ACTIONS.values())
-    assert len({spec.action for spec in TOOL_SPECS}) == 17
+    assert len({spec.action for spec in TOOL_SPECS}) == 21
     for spec in TOOL_SPECS:
         assert spec.description.strip(), spec.name
         assert spec.args_model.model_json_schema()["type"] == "object"
@@ -65,7 +69,7 @@ def test_openai_schema_is_flat_and_declares_all_parameters() -> None:
     """工具定义可直接交给 bind_tools；参数模型字段与描述全部出现在 schema 中。"""
 
     payload = openai_tools()
-    assert len(payload) == 17
+    assert len(payload) == 21
     for item in payload:
         assert item["type"] == "function"
         function = item["function"]
@@ -172,5 +176,5 @@ def test_public_details_whitelist_blocks_answer_material() -> None:
 
 def test_tool_lookup_table_matches_specs() -> None:
     assert set(TOOLS_BY_NAME) == {spec.name for spec in TOOL_SPECS}
-    assert len(TOOLS_BY_NAME) == 17
+    assert len(TOOLS_BY_NAME) == 21
     assert TOOLS_BY_NAME["query_papers"].action == "query_papers"

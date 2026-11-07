@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.conversations.final_reply import material_from_context
 from app.conversations.graph import ActionPlan, ScheduleDecision
 from app.conversations.reply import material_from_payload
 from app.conversations.repository import ConversationRepository
@@ -126,7 +127,10 @@ def query_decision(**parameters) -> ScheduleDecision:
 @pytest.mark.anyio
 async def test_missing_paper_switch_invalidates_current_paper(tmp_path: Path) -> None:
     items = [paper("py-2024-2025-s1-final", "2024-2025")]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    )])
     service, repository, _ = build_service(tmp_path, items=items, scheduler=scheduler)
     conversation = service.create_conversation()
 
@@ -139,7 +143,10 @@ async def test_missing_paper_switch_invalidates_current_paper(tmp_path: Path) ->
     )
     assert found.result.total == 1
 
-    scheduler.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler.push(query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2019-2020", term="s1",
+    ))
     missing = result_of(
         await run(service, conversation.id, "换成 2019-2020 学年第一学期 Python 期末试卷")
     )
@@ -162,7 +169,10 @@ async def test_missing_paper_switch_invalidates_current_paper(tmp_path: Path) ->
     assert any(word in message for word in ("哪一份", "哪份", "试卷", "说明"))
 
     # 旧卷历史仍然保留：学生明确点名回旧卷时照常命中。
-    scheduler2.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler2.push(query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    ))
     back = result_of(
         await run(
             restarted,
@@ -174,7 +184,10 @@ async def test_missing_paper_switch_invalidates_current_paper(tmp_path: Path) ->
     assert back.result.items[0].id == "py-2024-2025-s1-final"
 
     # 新的成功定位要覆盖更早的“未定位”标记，否则之后的指代会一直失效。
-    scheduler2.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler2.push(query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    ))
     follow = result_of(
         await run(
             restarted,
@@ -199,7 +212,10 @@ async def test_clarification_reuses_year_and_term(tmp_path: Path) -> None:
         paper("py-2023-2024-s1-final", "2023-2024", variant="A"),
         paper("py-2023-2024-s1-final-b", "2023-2024", variant="B"),
     ]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1",
+    )])
     service, _, _ = build_service(tmp_path, items=items, scheduler=scheduler)
     conversation = service.create_conversation()
 
@@ -209,13 +225,18 @@ async def test_clarification_reuses_year_and_term(tmp_path: Path) -> None:
     assert "请说明要哪一份" in ambiguous.assistant_message
     assert "A卷" in ambiguous.assistant_message and "B卷" in ambiguous.assistant_message
 
-    scheduler.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler.push(query_decision(
+        course=COURSE, exam_type="final", variant="B",
+    ))
     resolved = result_of(await run(service, conversation.id, "B卷"))
     assert resolved.result.total == 1
     assert resolved.result.items[0].id == "py-2024-2025-s1-final-b"
 
     # 学生明确换学年时，旧候选范围不能强加到新请求上。
-    scheduler.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler.push(query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2023-2024", term="s1", variant="A",
+    ))
     switched = result_of(
         await run(service, conversation.id, "2023-2024学年第一学期 Python 期末试卷 A 卷")
     )
@@ -230,14 +251,19 @@ async def test_clarification_reuses_year_and_term_after_restart(tmp_path: Path) 
         paper("py-2024-2025-s1-final-b", "2024-2025", variant="B"),
         paper("py-2023-2024-s1-final-b", "2023-2024", variant="B"),
     ]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1",
+    )])
     service, _, _ = build_service(tmp_path, items=items, scheduler=scheduler)
     conversation = service.create_conversation()
     await run(service, conversation.id, "2024-2025学年第一学期 Python 期末试卷")
 
     scheduler2 = FakeScheduler()
     restarted, _, _ = build_service(tmp_path, items=items, scheduler=scheduler2)
-    scheduler2.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler2.push(query_decision(
+        course=COURSE, exam_type="final", variant="B",
+    ))
     resolved = result_of(await run(restarted, conversation.id, "B卷"))
 
     assert resolved.result.total == 1
@@ -260,7 +286,10 @@ async def test_cross_paper_request_with_pronoun_keeps_no_paper(tmp_path: Path) -
         }
     )
     items = [paper("py-2024-2025-s1-final", "2024-2025")]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    )])
     service, _, runtime = build_service(
         tmp_path, items=items, scheduler=scheduler, cards=[own, other]
     )
@@ -298,6 +327,8 @@ async def test_cross_paper_request_with_pronoun_keeps_no_paper(tmp_path: Path) -
                         "paper_id": "py-2024-2025-s1-final",
                         "query": "字符串大小写转换 capitalize title upper",
                         "question_type": "choice",
+                        "scope": "bank",
+                        "exclude_previous": True,
                     },
                 )
             ]
@@ -322,7 +353,10 @@ async def test_cross_paper_request_with_pronoun_keeps_no_paper(tmp_path: Path) -
 @pytest.mark.anyio
 async def test_download_url_reaches_reply_prompt(tmp_path: Path) -> None:
     items = [paper("py-2024-2025-s1-final", "2024-2025")]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    )])
     replies = ReplyFactory(pieces=["已找到这份试卷。"])
     service, repository, _ = build_service(
         tmp_path, items=items, scheduler=scheduler, reply_factory=replies
@@ -347,7 +381,9 @@ async def test_download_url_reaches_reply_prompt(tmp_path: Path) -> None:
     # 恢复材料（只重做正文时读的就是它）必须与首次生成一致。
     turn = repository.find_turn(conversation.id, result.request_id)
     assert turn is not None
-    recovered = material_from_payload(turn.recovery["reply_input"])
+    recovered, _notes = material_from_context(
+        service, conversation.id, turn.recovery["reply_context"]
+    )
     assert url in recovered.describe()
 
 
@@ -379,7 +415,10 @@ async def test_missing_paper_switch_does_not_explain_old_selection(tmp_path: Pat
     items = [paper("py-2024-2025-s1-final", "2024-2025")]
     own = sample_card("py-2024-2025-s1-final-choice-12", number="12")
     tutor = FakeTutor(explanations=[sample_explanation()])
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1", variant="A",
+    )])
     service, repository, _ = build_service(
         tmp_path, items=items, scheduler=scheduler, cards=[own], tutor=tutor
     )
@@ -410,7 +449,10 @@ async def test_missing_paper_switch_does_not_explain_old_selection(tmp_path: Pat
     assert selected.question is not None, "先要选中一道题才能复现"
     assert repository.get_active_question(conversation.id) is not None
 
-    scheduler.push(query_decision(course=COURSE, exam_type="final"))
+    scheduler.push(query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2019-2020", term="s1",
+    ))
     missing = result_of(
         await run(service, conversation.id, "换成 2019-2020 学年第一学期 Python 期末试卷")
     )
@@ -452,7 +494,10 @@ async def test_clarification_drops_candidates_when_course_changes(tmp_path: Path
             download_url="/api/papers/math-2023-2024-s2-final/download",
         ),
     ]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1",
+    )])
     service, _, _ = build_service(tmp_path, items=items, scheduler=scheduler)
     conversation = service.create_conversation()
     await run(service, conversation.id, "2024-2025学年第一学期 Python 期末试卷")
@@ -484,7 +529,10 @@ async def test_clarification_drops_candidates_when_exam_type_changes(
             download_url="/api/papers/py-2024-2025-s1-midterm-b/download",
         ),
     ]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1",
+    )])
     service, _, _ = build_service(tmp_path, items=items, scheduler=scheduler)
     conversation = service.create_conversation()
     await run(service, conversation.id, "2024-2025学年第一学期 Python 期末试卷")
@@ -523,7 +571,10 @@ async def test_exam_type_change_keeps_inherited_year_and_term(tmp_path: Path) ->
         midterm("py-2024-2025-s1-midterm-b", "2024-2025"),
         midterm("py-2023-2024-s1-midterm-b", "2023-2024"),
     ]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1",
+    )])
     service, _, _ = build_service(tmp_path, items=items, scheduler=scheduler)
     conversation = service.create_conversation()
     await run(service, conversation.id, "2024-2025学年第一学期 Python 期末试卷")
@@ -544,12 +595,15 @@ async def test_explicit_unlimited_exam_type_clears_old_type(tmp_path: Path) -> N
         paper("py-2024-2025-s1-final-b", "2024-2025", variant="B"),
         midterm("py-2024-2025-s1-midterm-b", "2024-2025"),
     ]
-    scheduler = FakeScheduler(decisions=[query_decision(course=COURSE, exam_type="final")])
+    scheduler = FakeScheduler(decisions=[query_decision(
+        course=COURSE, exam_type="final",
+        academic_year="2024-2025", term="s1",
+    )])
     service, repository, _ = build_service(tmp_path, items=items, scheduler=scheduler)
     conversation = service.create_conversation()
     await run(service, conversation.id, "2024-2025学年第一学期 Python 期末试卷")
 
-    scheduler.push(query_decision(course=COURSE))
+    scheduler.push(query_decision(course=COURSE, all_exam_types=True, variant="B"))
     unlimited = result_of(
         await run(service, conversation.id, "不限期中期末，B卷都列出来")
     )

@@ -198,6 +198,9 @@ class _DynamicContext:
     """动态调度一轮内真实执行结果；供后续动作和最终事件共同读取。"""
 
     conversation_id: str
+    # F010 C：本轮请求号与学生原话（答案门禁的授权证据）；恢复路径同样补齐。
+    request_id: str = ""
+    input_text: str = ""
     confirmed_course: str | None = None
     active_problem: ProblemRecord | None = None
     active_exercise: ExerciseRecord | None = None
@@ -219,6 +222,11 @@ class _DynamicContext:
     # 本轮回答范围：hint=只给提示，topic=只问考点。都由学生的话决定，
     # 用来阻止模型把“提示/考点”当成完整讲解，并约束正文范围。
     answer_scope: str | None = None
+    # F010 D：本轮模型显式请求“先别公布答案”，后续答案动作不得越过。
+    answer_deferred: bool = False
+    # F010 C：本轮答案授权凭据与已授权正文（只给模型，不落盘）。
+    answer_grant: Any = None
+    authorized_text: str | None = None
     # F009：本轮的学习记忆上下文。由程序统计后交给决策与正文；读取失败时
     # 用“暂时无法读取”如实说明，不能变成“没有记录”。
     memory_course: str | None = None
@@ -228,8 +236,16 @@ class _DynamicContext:
     memory_entry_ids: set[str] = field(default_factory=set)
     # 本轮学生明确提到/操作的记忆条目：正文材料优先展开它们的附注与作答序列。
     memory_focus_entry_ids: set[str] = field(default_factory=set)
+    # F010 D：学生给出新卷条件、旧 paper_id 已过期时，记录覆盖事实供回复与审计。
+    last_paper_switch_override: dict[str, Any] | None = None
     recovery: dict[str, Any] = field(default_factory=dict)
     action_index: int = -1
+    # F010 B：读时派生的结构化工作区、跨轮历史与短引用表；本轮工具步骤记录。
+    workspace: dict[str, Any] = field(default_factory=dict)
+    workspace_text: str | None = None
+    history: list[dict[str, Any]] = field(default_factory=list)
+    ref_table: Any = None
+    transcript: list[dict[str, Any]] = field(default_factory=list)
 
 def _replay_event(prepared: ReplayTurn) -> TurnEvent:
     turn = prepared.turn

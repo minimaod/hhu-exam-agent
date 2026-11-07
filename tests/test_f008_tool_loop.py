@@ -106,9 +106,9 @@ async def test_successful_batch_returns_to_model_then_finishes() -> None:
     # 一次规划 + 一次收尾决策才是完整的工具循环。
     assert len(model.calls) == 2
     assert state["rounds"] == 2
-    # 模型被真实绑定了 17 个工具（F009 新增 3 个记忆工具）；历史里留下了可对应的
+    # 模型被真实绑定了 21 个工具（F009 记忆 3 个 + F010 只读 4 个）；历史里留下了可对应的
     # assistant tool_calls 和同 id 的 tool 结果，下一次决策/故障恢复才能对上号。
-    assert model.bound_tools is not None and len(model.bound_tools) == 17
+    assert model.bound_tools is not None and len(model.bound_tools) == 21
     transcript = _transcript(scheduler)
     assert _assistant_tool_ids(transcript) == ["call_a"]
     assert [

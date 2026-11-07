@@ -40,6 +40,11 @@ ToolName = Literal[
     "review_learning_memory",
     "correct_learning_memory",
     "delete_learning_memory",
+    # F010 B：四个只读工具。
+    "view_workspace",
+    "view_question_detail",
+    "list_shown_questions",
+    "view_learning_summary",
 ]
 
 ExamType = Literal["midterm", "final", "other"]
@@ -102,6 +107,13 @@ _PUBLIC_DETAIL_KEYS = frozenset(
         "memory_pending",
         "memory_removed",
         "memory_message",
+        # F010 B：只读工作区的公开引用与版本元数据。
+        "ref",
+        "shown_count",
+        "from_snapshot",
+        "build_id",
+        "content_sha256",
+        "has_more",
     }
 )
 
@@ -116,9 +128,26 @@ class ConfirmCourseArgs(_Strict):
     course: str = Field(min_length=1, max_length=40)
 
 
+class BasisArgs(_Strict):
+    """F010 D：受保护动作的可追溯依据；只证明“本轮有依据”，不代替授权。"""
+
+    kind: Literal[
+        "student_request", "confirmed_suggestion", "button", "tool_result"
+    ]
+    quote: str | None = Field(default=None, max_length=200)
+    suggestion_id: str | None = Field(default=None, max_length=80)
+    depends_on_call_id: str | None = Field(default=None, max_length=80)
+
+
 class QueryPapersArgs(_Strict):
     course: str | None = Field(default=None, max_length=40)
     exam_type: ExamType | None = None
+    academic_year: str | None = Field(default=None, max_length=20)
+    term: Literal["s1", "s2"] | None = None
+    variant: Literal["A", "B"] | None = None
+    paper_id: str | None = Field(default=None, max_length=80)
+    # 学生明确“不限期中期末”：null 与省略无法区分，必须显式给布尔。
+    all_exam_types: bool | None = None
 
 
 class SearchQuestionsArgs(_Strict):
@@ -129,8 +158,20 @@ class SearchQuestionsArgs(_Strict):
     knowledge_points: list[str] | None = Field(default=None, max_length=5)
     number_label: str | None = Field(default=None, max_length=20)
     paper_id: str | None = Field(default=None, max_length=80)
-    offset: int = Field(default=0, ge=0)
+    offset: int | None = Field(default=None, ge=0)
+    continue_from_previous: bool = False
     auto_explain: bool = False
+    scope: Literal["current", "paper", "bank"] = "current"
+    exclude_question_id: str | None = Field(default=None, max_length=80)
+    # 学生说“换一道/再来一道”：排除上一轮已经展示的题。
+    exclude_previous: bool = False
+    defer_answer: bool = False
+
+    @model_validator(mode="after")
+    def _one_page_target(self) -> "SearchQuestionsArgs":
+        if self.offset is not None and self.continue_from_previous:
+            raise ValueError("offset 与 continue_from_previous 只能选一个")
+        return self
 
 
 class ListPaperQuestionsArgs(_Strict):
@@ -138,29 +179,82 @@ class ListPaperQuestionsArgs(_Strict):
     paper_id: str | None = Field(default=None, max_length=80)
     question_type: QuestionType | None = None
     offset: int | None = Field(default=None, ge=0)
+    continue_from_previous: bool = False
+    limit: int | None = Field(default=None, ge=1, le=64)
+
+    @model_validator(mode="after")
+    def _one_page_target(self) -> "ListPaperQuestionsArgs":
+        if self.offset is not None and self.continue_from_previous:
+            raise ValueError("offset 与 continue_from_previous 只能选一个")
+        return self
 
 
 class SelectQuestionArgs(_Strict):
     index: int | None = Field(default=None, ge=1, le=64)
     number_label: str | None = Field(default=None, max_length=20)
+    # F010 B：工作区短引用（Q1…Qn），与 index/number_label 互斥。
+    ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
+    question_type: QuestionType | None = None
+    paper_id: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> "SelectQuestionArgs":
+        chosen = [
+            value is not None
+            for value in (self.index, self.number_label, self.ref)
+        ]
+        if sum(chosen) > 1:
+            raise ValueError("index、number_label、ref 只能填一个")
+        return self
+
+
+class ViewQuestionDetailArgs(_Strict):
+    ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
+
+
+class ListShownQuestionsArgs(_Strict):
+    question_type: QuestionType | None = None
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class ViewLearningSummaryArgs(_Strict):
+    course: str | None = Field(default=None, max_length=40)
+    days: int = Field(default=30, ge=1, le=365)
+    limit: int = Field(default=20, ge=1, le=50)
 
 
 class ExplainProblemArgs(_Strict):
     mode: Literal["new", "supplement", "correction"] = "new"
     course: str | None = Field(default=None, max_length=40)
+    ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
+    scope: Literal["full", "hint", "topic"] = "full"
+    # current=讲工作区里的题；new=讲本轮新输入/新题，避免误绑旧题卡。
+    target: Literal["current", "new"] = "current"
 
 
 class AnswerFollowupArgs(_Strict):
     question: str = Field(min_length=1, max_length=500)
     target: Literal["auto", "problem", "exercise"] = "auto"
+    ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
 
 
 class SaveMistakeArgs(_Strict):
     user_feedback: str | None = Field(default=None, max_length=2000)
+    basis: BasisArgs | None = None
 
 
 class GenerateExerciseArgs(_Strict):
     from_question: bool = False
+    ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
+    basis: BasisArgs | None = None
+
+
+class AnswerRevealArgs(_Strict):
+    """查看真题答案或练习参考解答：可带引用与依据。"""
+
+    ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
+    basis: BasisArgs | None = None
 
 
 class NoArgs(_Strict):
@@ -174,12 +268,22 @@ class RecordFeedbackArgs(_Strict):
 class AskUserArgs(_Strict):
     question: str = Field(min_length=1, max_length=300)
     options: list[str] | None = Field(default=None, max_length=5)
+    reason_code: Literal[
+        "missing_course",
+        "ambiguous_paper",
+        "ambiguous_type",
+        "ambiguous_suggestion",
+        "reject_ack",
+        "other",
+    ] | None = None
 
 
 class ReviewMemoryArgs(_Strict):
     course: str | None = Field(default=None, max_length=40)
     days: int = Field(default=30, ge=1, le=365)
     limit: int = Field(default=20, ge=1, le=50)
+    # “这几条”只能由模型显式给出，不能再从原话里猜。
+    entry_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
 class CorrectMemoryArgs(_Strict):
@@ -187,6 +291,7 @@ class CorrectMemoryArgs(_Strict):
     course: str | None = Field(default=None, max_length=40)
     knowledge_point: str | None = Field(default=None, max_length=120)
     note: str | None = Field(default=None, max_length=500)
+    basis: BasisArgs | None = None
 
     @model_validator(mode="after")
     def _require_change(self) -> "CorrectMemoryArgs":
@@ -201,6 +306,7 @@ class CorrectMemoryArgs(_Strict):
 class DeleteMemoryArgs(_Strict):
     entry_id: str = Field(min_length=6, max_length=80)
     reason: str | None = Field(default=None, max_length=200)
+    basis: BasisArgs | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +335,30 @@ def _object(
 
 def _nullable(kind: str) -> dict[str, Any]:
     return {"type": [kind, "null"]}
+
+
+def _basis_schema() -> dict[str, Any]:
+    """可追溯依据的扁平 schema；授权仍由执行层独立判断。"""
+
+    return {
+        "type": ["object", "null"],
+        "additionalProperties": False,
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "student_request",
+                    "confirmed_suggestion",
+                    "button",
+                    "tool_result",
+                ],
+            },
+            "quote": _nullable("string"),
+            "suggestion_id": _nullable("string"),
+            "depends_on_call_id": _nullable("string"),
+        },
+        "required": ["kind"],
+    }
 
 
 TOOL_SPECS: tuple[ToolSpec, ...] = (
@@ -260,6 +390,20 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "type": ["string", "null"],
                     "enum": ["midterm", "final", "other", None],
                     "description": "学生本轮明确要求的考试类型；未说明时留空",
+                },
+                "academic_year": _nullable("string"),
+                "term": {
+                    "type": ["string", "null"],
+                    "enum": ["s1", "s2", None],
+                },
+                "variant": {
+                    "type": ["string", "null"],
+                    "enum": ["A", "B", None],
+                },
+                "paper_id": _nullable("string"),
+                "all_exam_types": {
+                    "type": "boolean",
+                    "description": "学生明确不限期中/期末时置 true；不留空表示沿用条件",
                 },
             }
         ),
@@ -297,13 +441,31 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "description": "已确定的试卷 ID；不确定时留空，程序会沿用当前试卷",
                 },
                 "offset": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "minimum": 0,
-                    "description": "已展示到哪里；学生说“继续”且程序没有自动推进时才需要填",
+                    "description": "具体页码（从 0 起）。学生说“继续”时留空并置 continue_from_previous",
+                },
+                "continue_from_previous": {
+                    "type": "boolean",
+                    "description": "接上一页时置 true；必须与上一页的卷、题型和条件相同，不能与 offset 同时给",
                 },
                 "auto_explain": {
                     "type": "boolean",
                     "description": "仅当学生明确要求直接讲解或直接看答案时才为 true",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["current", "paper", "bank"],
+                    "description": "current=当前卷，paper=指定卷，bank=不限试卷",
+                },
+                "exclude_question_id": _nullable("string"),
+                "exclude_previous": {
+                    "type": "boolean",
+                    "description": "学生明确要“换一道/再来一道”时置 true，排除上一轮展示过的题",
+                },
+                "defer_answer": {
+                    "type": "boolean",
+                    "description": "学生明确要求先自己做、暂不看答案时为 true",
                 },
             },
             required=("course",),
@@ -333,7 +495,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "offset": {
                     "type": ["integer", "null"],
                     "minimum": 0,
-                    "description": "从第几道开始（0 起）；“继续”时留空由程序接上一次的位置",
+                    "description": "从第几道开始（0 起）；具体页码与 continue_from_previous 二选一",
+                },
+                "continue_from_previous": {
+                    "type": "boolean",
+                    "description": "接上一页时置 true；沿用上一页的卷、题型和检索条件",
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 64,
                 },
             }
         ),
@@ -355,6 +526,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "description": "结果列表里从 1 开始的序号；“第 5 题”这类原卷题号用 number_label",
                 },
                 "number_label": _nullable("string"),
+                "ref": {
+                    "type": ["string", "null"],
+                    "pattern": "^Q[1-9][0-9]{0,3}$",
+                    "description": "工作区里的短引用（如 Q8），来自 view_workspace/list_shown_questions；与 index/number_label 三选一",
+                },
+                "question_type": {
+                    "type": ["string", "null"],
+                    "enum": ["choice", "fill", "code", None],
+                },
+                "paper_id": _nullable("string"),
             }
         ),
     ),
@@ -375,6 +556,19 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "description": "本次输入与当前题目的关系",
                 },
                 "course": _nullable("string"),
+                "ref": {
+                    "type": ["string", "null"],
+                    "pattern": "^Q[1-9][0-9]{0,3}$",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["full", "hint", "topic"],
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["current", "new"],
+                    "description": "讲工作区当前题=current；讲本轮新题=new",
+                },
             }
         ),
     ),
@@ -390,6 +584,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "description": "把学生的追问原话整理后放进来",
                 },
                 "target": {"type": "string", "enum": ["auto", "problem", "exercise"]},
+                "ref": {
+                    "type": ["string", "null"],
+                    "pattern": "^Q[1-9][0-9]{0,3}$",
+                },
             },
             required=("question",),
         ),
@@ -407,7 +605,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "from_question": {
                     "type": "boolean",
                     "description": "从当前真题生成变式时为 true",
-                }
+                },
+                "ref": {
+                    "type": ["string", "null"],
+                    "pattern": "^Q[1-9][0-9]{0,3}$",
+                },
+                "basis": _basis_schema(),
             }
         ),
     ),
@@ -422,8 +625,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="reveal_solution",
         action="reveal_solution",
         description="学生主动要求查看当前练习的参考解答时使用。",
-        args_model=NoArgs,
-        schema=_object({}),
+        args_model=AnswerRevealArgs,
+        schema=_object(
+            {
+                "ref": {
+                    "type": ["string", "null"],
+                    "pattern": "^Q[1-9][0-9]{0,3}$",
+                },
+                "basis": _basis_schema(),
+            }
+        ),
     ),
     ToolSpec(
         name="show_question_answer",
@@ -432,8 +643,16 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "学生明确要求查看当前已选中真题的答案或参考代码时使用。"
             "学生没有主动要求时不能调用。"
         ),
-        args_model=NoArgs,
-        schema=_object({}),
+        args_model=AnswerRevealArgs,
+        schema=_object(
+            {
+                "ref": {
+                    "type": ["string", "null"],
+                    "pattern": "^Q[1-9][0-9]{0,3}$",
+                },
+                "basis": _basis_schema(),
+            }
+        ),
     ),
     ToolSpec(
         name="save_mistake",
@@ -446,7 +665,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "user_feedback": {
                 "type": ["string", "null"], "maxLength": 2000,
                 "description": "学生明确要求保存的备注原文；未要求备注时省略，不自行编写。",
-            }
+            },
+            "basis": _basis_schema(),
         }),
     ),
     ToolSpec(
@@ -474,6 +694,18 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "type": ["array", "null"],
                     "items": {"type": "string"},
                     "maxItems": 5,
+                },
+                "reason_code": {
+                    "type": ["string", "null"],
+                    "enum": [
+                        "missing_course",
+                        "ambiguous_paper",
+                        "ambiguous_type",
+                        "ambiguous_suggestion",
+                        "reject_ack",
+                        "other",
+                        None,
+                    ],
                 },
             },
             required=("question",),
@@ -507,6 +739,11 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "maximum": 50,
                     "description": "最多返回多少条证据，默认 20",
                 },
+                "entry_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "学生明确指到具体记忆条目时填写这些编号；否则留空",
+                },
             }
         ),
     ),
@@ -537,6 +774,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "type": ["string", "null"],
                     "description": "学生补充的说明，如“这题我当时看错条件了”",
                 },
+                "basis": _basis_schema(),
             },
             required=("entry_id",),
         ),
@@ -560,14 +798,85 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "type": ["string", "null"],
                     "description": "学生给出的原因原文；没说明就留空",
                 },
+                "basis": _basis_schema(),
             },
             required=("entry_id",),
+        ),
+    ),
+    ToolSpec(
+        name="view_workspace",
+        action="view_workspace",
+        description=(
+            "读取当前复习工作区：已确认课程、当前试卷与浏览位置、当前选中题、"
+            "本会话展示过的题及短引用（Q1…Qn）、当前练习与待确认事项。"
+            "学生提到“刚才那张卷”“之前那道题”“接着看”时先调用它，再决定下一步。"
+        ),
+        args_model=NoArgs,
+        schema=_object({}),
+    ),
+    ToolSpec(
+        name="view_question_detail",
+        action="view_question_detail",
+        description=(
+            "按工作区短引用读取一道已展示真题的公开题面与版本信息（题干、选项、"
+            "知识点、来源卷、答案是否可用）。只读：不展示答案正文，不改变选中状态。"
+            "学生问“第 5 题考什么”“刚才那道题题干是什么”时使用。"
+        ),
+        args_model=ViewQuestionDetailArgs,
+        schema=_object(
+            {
+                "ref": {
+                    "type": ["string", "null"],
+                    "pattern": "^Q[1-9][0-9]{0,3}$",
+                    "description": "短引用，如 Q8；不填表示当前选中题",
+                }
+            }
+        ),
+    ),
+    ToolSpec(
+        name="list_shown_questions",
+        action="list_shown_questions",
+        description=(
+            "列出本会话已经展示过的题目（分页），可按题型筛选。用于回答“刚才列了哪些题”"
+            "或找回某道题的短引用；只返回公开卡片信息，不含答案。"
+        ),
+        args_model=ListShownQuestionsArgs,
+        schema=_object(
+            {
+                "question_type": {
+                    "type": ["string", "null"],
+                    "enum": ["choice", "fill", "code", None],
+                },
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            }
+        ),
+    ),
+    ToolSpec(
+        name="view_learning_summary",
+        action="view_learning_summary",
+        description=(
+            "只读查看学习记忆摘要（练习与作答记录、待补知识点）。学生问“我最近学得怎么样”"
+            "“先补什么”时使用。与 review_learning_memory 不同：本工具不切换当前课程、"
+            "不改会话上下文。"
+        ),
+        args_model=ViewLearningSummaryArgs,
+        schema=_object(
+            {
+                "course": {
+                    "type": ["string", "null"],
+                    "description": "要查看的课程；不填就用当前会话课程",
+                },
+                "days": {"type": "integer", "minimum": 1, "maximum": 365},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            }
         ),
     ),
 )
 
 
 TOOLS_BY_NAME: dict[str, ToolSpec] = {spec.name: spec for spec in TOOL_SPECS}
+ACTION_TO_TOOL: dict[str, str] = {spec.action: spec.name for spec in TOOL_SPECS}
 
 
 def openai_tools() -> list[dict[str, Any]]:
@@ -728,4 +1037,8 @@ def tool_label(tool: str | None) -> str:
         "review_learning_memory": "查看学习记忆",
         "correct_learning_memory": "纠正学习记忆",
         "delete_learning_memory": "移除学习记忆",
+        "view_workspace": "读取工作区",
+        "view_question_detail": "查看题目详情",
+        "list_shown_questions": "列出已展示题目",
+        "view_learning_summary": "查看学习摘要",
     }.get(tool, tool)

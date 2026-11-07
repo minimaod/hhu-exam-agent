@@ -2,6 +2,7 @@
 
 import io
 from collections.abc import Iterable
+from typing import Any
 
 from PIL import Image
 
@@ -203,8 +204,12 @@ class FakeScheduler:
         self,
         *,
         decisions: Iterable[ScheduleDecision | QueryError] = (),
+        parameter_adapter: Any = None,
+        parameter_case: str = "",
     ) -> None:
         self._decisions = list(decisions)
+        self._parameter_adapter = parameter_adapter
+        self._parameter_case = parameter_case
         self.calls: list[dict] = []
 
     def push(self, item: ScheduleDecision | QueryError) -> None:
@@ -219,4 +224,16 @@ class FakeScheduler:
         item = self._decisions.pop(0)
         if isinstance(item, QueryError):
             raise item
+        if self._parameter_adapter is not None and self._parameter_case:
+            turn = len(self.calls) - 1
+            for action in item.actions:
+                params, _added = self._parameter_adapter.enrich(
+                    self._parameter_case,
+                    turn,
+                    0,
+                    action.action,
+                    action.parameters,
+                    query,
+                )
+                action.parameters = params
         return item

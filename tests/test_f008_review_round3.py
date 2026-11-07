@@ -102,7 +102,7 @@ async def test_question_explanation_streams_body_and_reports_status(tmp_path: Pa
     # 讲解卡仍然随结果返回（目标绑定没有丢）。
     assert result.tutoring is not None and result.question is not None
 
-    # 正文材料已存盘，后续可以只重做正文。
+    # 正文材料已存盘，后续可以只重做正文。（这条走的是旧版 question 讲解入口。）
     recovery = _turn_recovery(tmp_path / "study.sqlite3", conversation.id, prepared.request_id)
     assert recovery["reply"]["mode"] == "model"
     assert recovery["reply_input"]["teaching"]
@@ -356,7 +356,7 @@ async def test_dynamic_interruption_keeps_actions_and_redoes_only_body(
     assert [item.action for item in turn.composite_results] == ["introduce"]
 
     recovery = _turn_recovery(tmp_path / "study.sqlite3", conversation.id, prepared.request_id)
-    assert "user_text" in recovery["reply_input"], "正文材料必须在流式输出前就落盘"
+    assert "user_text" in recovery["reply_context"], "正文材料必须在流式输出前就落盘"
 
     calls_before = len(scheduler.calls)
     service._make_reply = ReplyFactory(["重写后的正文。"])

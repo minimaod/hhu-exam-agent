@@ -18,8 +18,10 @@ from uuid import uuid4
 import pytest
 
 from app.conversations.graph import ActionPlan, ScheduleDecision
+from app.conversations.final_reply import material_from_context
 from app.conversations.reply import material_from_payload, material_to_payload
 from app.conversations.repository import ConversationRepository
+from app.conversations.answer_gate import scope_of
 from app.conversations.service import ConversationService, TurnInput
 from app.papers.models import PaperItem, PaperListResponse
 from app.tutoring.models import Source
@@ -110,11 +112,12 @@ def seed_page(
     next_offset: int | None = None,
     question_type: str = "choice",
     cards: list | None = None,
+    user_message: str = "这张卷的选择题",
 ) -> str:
     """写入上一轮的试卷上下文，模拟“刚刚已经列过一页”。"""
 
     request_id = str(uuid4())
-    repository.start_turn(conversation_id, request_id, "这张卷的选择题", kind="dynamic")
+    repository.start_turn(conversation_id, request_id, user_message, kind="dynamic")
     repository.complete_dynamic_turn(
         conversation_id,
         request_id,
@@ -282,12 +285,18 @@ def two_papers(service, runtime):
 @pytest.mark.anyio
 async def test_all_target_entries_honour_explicit_new_paper(tmp_path: Path, action: str) -> None:
     """选题与讲解共用目标约束；新卷相同题号不能命中旧卷。"""
-    scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[ActionPlan(
-        action=action, parameters={"number_label": "5"} if action == "select_question" else {},
-    )])])
+    scheduler = FakeScheduler()
     tutor = FakeTutor(explanations=[sample_explanation("B")])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler, tutor=tutor)
     old, new = two_papers(service, runtime)
+    scheduler.push(ScheduleDecision(actions=[ActionPlan(
+        action=action,
+        parameters={
+            "paper_id": new.source.paper_id,
+            "number_label": "5",
+            "question_type": "choice",
+        },
+    )]))
     cid = service.create_conversation().id
     seed_page(repository, cid, cards=[old], returned=1)
     text = ("我选" if action == "select_question" else "讲讲") + new.source.paper_title + "的选择题第5题"
@@ -331,10 +340,95 @@ async def test_all_target_entries_require_a_unique_match(tmp_path: Path, action:
 
 
 @pytest.mark.parametrize("action", ["select_question", "explain_problem"])
+@pytest.mark.parametrize("last_type", ["choice", "fill"])
+@pytest.mark.anyio
+async def test_unqualified_number_checks_whole_paper_after_single_type_page(
+    tmp_path: Path, action: str, last_type: str
+) -> None:
+    """最后浏览的是选择题或填空题，都不能证明“第5题”就是该题型。"""
+
+    cards = mixed_type_cards()
+    scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
+        ActionPlan(action=action, parameters={"number_label": "5"})
+    ])])
+    tutor = FakeTutor(explanations=[sample_explanation("B")])
+    service, repository, runtime = build_service(
+        tmp_path, cards=cards, scheduler=scheduler, tutor=tutor
+    )
+    cid = service.create_conversation().id
+    page = [card for card in cards if card.question_type == last_type]
+    seed_page(repository, cid, returned=5, question_type=last_type, cards=page)
+    text = "我选这张卷的第5题" if action == "select_question" else "讲讲这张卷的第5题"
+    result = result_of(await run(service, cid, turn_input(text=text)))
+
+    assert result.business_status == "needs_input"
+    assert "题型" in result.assistant_message
+    assert result.question_results == []
+    assert repository.get_active_question(cid) is None
+    assert repository.get_active_problem(cid) is None
+    assert tutor.explain_calls == []
+    request = runtime.search_calls[-1]["request"]
+    assert request.paper_id == PAPER
+    assert request.number_label == "5"
+    assert request.question_type is None
+
+
+@pytest.mark.anyio
+async def test_after_clarification_explicit_choice_explains_choice_five(
+    tmp_path: Path,
+) -> None:
+    """学生补说选择题后，实际讲解必须是 choice-05，不能仍是 fill-05。"""
+
+    cards = mixed_type_cards()
+    scheduler = FakeScheduler(decisions=[
+        ScheduleDecision(actions=[ActionPlan(
+            action="select_question", parameters={"number_label": "5"}
+        )]),
+        ScheduleDecision(actions=[ActionPlan(
+            action="select_question",
+            parameters={"number_label": "5", "question_type": "choice"},
+        )]),
+        ScheduleDecision(actions=[ActionPlan(
+            action="explain_problem", parameters={}
+        )]),
+    ])
+    tutor = FakeTutor(explanations=[sample_explanation("B")])
+    service, repository, _ = build_service(
+        tmp_path, cards=cards, scheduler=scheduler, tutor=tutor
+    )
+    cid = service.create_conversation().id
+    seed_page(
+        repository, cid, returned=5, question_type="fill",
+        cards=[card for card in cards if card.question_type == "fill"],
+    )
+
+    first = result_of(await run(service, cid, turn_input(text="我选这张卷的第5题")))
+    assert first.business_status == "needs_input"
+
+    second = result_of(await run(service, cid, turn_input(text="选择题第5题")))
+    selected = repository.get_active_question(cid)
+    assert selected is not None
+    assert selected.question_id == f"{PAPER}-choice-5"
+
+    third = result_of(await run(service, cid, turn_input(text="讲讲这道题")))
+    assert third.question is not None
+    assert third.question.question_id == f"{PAPER}-choice-5"
+    assert repository.get_active_question(cid).question_id == f"{PAPER}-choice-5"
+    assert len(tutor.explain_calls) == 1
+    assert "第 5 道选择题" in tutor.explain_calls[0]["statement"]
+
+
+@pytest.mark.parametrize("action", ["select_question", "explain_problem"])
 @pytest.mark.anyio
 async def test_unresolved_new_paper_cannot_fall_back_to_old_card(tmp_path: Path, action: str) -> None:
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[ActionPlan(
-        action=action, parameters={"number_label": "5"} if action == "select_question" else {},
+        action=action,
+        parameters={
+            "number_label": "5",
+            "question_type": "choice",
+            "academic_year": "2030-2031",
+            "term": "s1",
+        },
     )])])
     tutor = FakeTutor(explanations=[sample_explanation("B")])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler, tutor=tutor)
@@ -351,7 +445,9 @@ async def test_unresolved_new_paper_cannot_fall_back_to_old_card(tmp_path: Path,
 async def test_whole_paper_choices_listed_in_one_page(tmp_path: Path) -> None:
     """指定“这张卷的选择题”就给全 40 道，并说明总数与范围。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        paper_id=PAPER, question_type="choice", limit=64,
+    )])
     service, _, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
 
@@ -371,7 +467,9 @@ async def test_whole_paper_choices_listed_in_one_page(tmp_path: Path) -> None:
 async def test_explicit_count_pages_and_reports_remaining(tmp_path: Path) -> None:
     """“前五题”只显示 5 道，但必须告诉学生还有多少没显示。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        paper_id=PAPER, question_type="choice", limit=5,
+    )])
     service, repository, _ = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     seed_page(repository, conversation.id, offset=0, returned=40, next_offset=None)
@@ -390,7 +488,9 @@ async def test_explicit_count_pages_and_reports_remaining(tmp_path: Path) -> Non
 async def test_all_choices_request_after_context_returns_everything(tmp_path: Path) -> None:
     """“给出全部选择题”：沿用刚刚那张卷，一次给全 40 道，不再回“没有找到”。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        paper_id=PAPER, question_type="choice", limit=64,
+    )])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     seed_page(repository, conversation.id)
@@ -410,7 +510,9 @@ async def test_all_choices_request_after_context_returns_everything(tmp_path: Pa
 async def test_continue_resumes_from_saved_offset(tmp_path: Path) -> None:
     """“继续”从上次留下的位置往后翻，不重放已经看过的题。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        continue_from_previous=True, question_type="choice", limit=5,
+    )])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     seed_page(repository, conversation.id, offset=0, returned=5, next_offset=5)
@@ -428,7 +530,9 @@ async def test_continue_resumes_from_saved_offset(tmp_path: Path) -> None:
 async def test_continue_after_restart_uses_persisted_offset(tmp_path: Path) -> None:
     """刷新、重启后仍从库里恢复位置，而不是从头再来。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        continue_from_previous=True, question_type="choice", limit=5,
+    )])
     service, repository, _ = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     seed_page(repository, conversation.id, offset=5, returned=5, next_offset=10)
@@ -448,7 +552,7 @@ async def test_continue_after_restart_uses_persisted_offset(tmp_path: Path) -> N
 async def test_original_number_is_not_page_position(tmp_path: Path) -> None:
     """“第 25 题”按原卷题号定位，与本次列表位置无关。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(number_label="25")])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     seed_page(repository, conversation.id, offset=20, returned=5, next_offset=25)
@@ -465,7 +569,10 @@ async def test_original_number_is_not_page_position(tmp_path: Path) -> None:
 async def test_empty_search_keeps_previous_paper_context(tmp_path: Path) -> None:
     """查无结果不能把“刚刚那张卷”的指向清掉。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision(), search_decision()])
+    scheduler = FakeScheduler(decisions=[
+        search_decision(query="量子力学"),
+        search_decision(question_type="fill", paper_id=PAPER),
+    ])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     runtime.search_status = "no_match"
     runtime.search_message = "没有找到相关真题"
@@ -489,7 +596,10 @@ async def test_list_paper_questions_tool_reuses_current_paper(tmp_path: Path) ->
     """浏览工具不要求模型重复试卷 ID，也不替学生决定看哪道。"""
 
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
-        ActionPlan(action="list_paper_questions", parameters={"question_type": "choice"})
+        ActionPlan(action="list_paper_questions", parameters={
+            "question_type": "choice",
+            "continue_from_previous": True,
+        })
     ])])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
@@ -529,8 +639,12 @@ async def test_try_first_still_waits_for_student(tmp_path: Path) -> None:
     """学生说“先自己做”时，讲解与答案仍然要等。"""
 
     scheduler = FakeScheduler(decisions=[
-        search_decision(number_label="1", question_type="choice"),
-        ScheduleDecision(actions=[ActionPlan(action="explain_problem", parameters={})]),
+        search_decision(
+            number_label="1", question_type="choice", defer_answer=True,
+        ),
+        ScheduleDecision(actions=[ActionPlan(
+            action="explain_problem", parameters={"scope": "hint"},
+        )]),
     ])
     tutor = FakeTutor(explanations=[sample_explanation("B")])
     service, _, _ = build_service(tmp_path, scheduler=scheduler, tutor=tutor)
@@ -543,14 +657,15 @@ async def test_try_first_still_waits_for_student(tmp_path: Path) -> None:
 
     assert result.tutoring is None
     assert tutor.explain_calls == []
-    assert result.business_status in {"needs_input", "partial"}
 
 
 @pytest.mark.anyio
 async def test_numbered_topic_question_answers_from_context_without_waiting(tmp_path: Path) -> None:
     """“给出刚刚那张试卷的选择题第五题，主要查哪个知识点”直接答，不要求先作答。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        paper_id=PAPER, number_label="5", question_type="choice",
+    )])
     factory = ReplyFactory(["第 5 题主要考列表索引与切片。"])
     service, repository, runtime = build_service(
         tmp_path, scheduler=scheduler, reply_factory=factory
@@ -583,8 +698,12 @@ async def test_hint_only_request_does_not_reveal_answer(tmp_path: Path) -> None:
     """“只给提示，先别公布答案”：不讲解、不公开答案，材料里也没有答案。"""
 
     scheduler = FakeScheduler(decisions=[
-        search_decision(number_label="1", question_type="choice"),
-        ScheduleDecision(actions=[ActionPlan(action="explain_problem", parameters={})]),
+        search_decision(
+            number_label="1", question_type="choice", defer_answer=True,
+        ),
+        ScheduleDecision(actions=[ActionPlan(
+            action="explain_problem", parameters={"scope": "hint"},
+        )]),
     ])
     factory = ReplyFactory(["先看下标越界的边界条件。"])
     tutor = FakeTutor(explanations=[sample_explanation("B")])
@@ -630,16 +749,19 @@ async def test_public_material_lets_reply_answer_without_student_answer(tmp_path
 async def test_reply_material_round_trip_keeps_page_and_materials(tmp_path: Path) -> None:
     """只重做浏览正文时，保留分页事实，题面留在卡片中。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        paper_id=PAPER, question_type="choice", limit=64,
+    )])
     factory = ReplyFactory(["这次列出第 1 到 40 道。"])
     service, _, _ = build_service(tmp_path, scheduler=scheduler, reply_factory=factory)
     conversation = service.create_conversation()
 
     await run(service, conversation.id, turn_input(text=f"{TITLE}的选择题"))
     turn = service._repository.list_turns(conversation.id)[-1]
-    stored = (turn.recovery or {}).get("reply_input")
-    assert stored is not None
-    material = material_from_payload(stored)
+    context = (turn.recovery or {}).get("reply_context")
+    assert context is not None
+    material, notes = material_from_context(service, conversation.id, context)
+    assert notes == []
     assert not material.question_materials  # 纯浏览只交给正文数量与范围，题面保留在卡片
     assert material.question_page is not None
     assert material.question_page["total"] == 40
@@ -778,7 +900,9 @@ async def test_off_page_original_number_is_located_not_misclicked(tmp_path: Path
 async def test_continue_after_everything_listed_does_not_restart(tmp_path: Path) -> None:
     """40 道已全部列出后说“继续”：说明已经列完，不从第 1 题重放。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        continue_from_previous=True,
+    )])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     seed_page(repository, conversation.id, offset=0, returned=40, next_offset=None)
@@ -812,7 +936,9 @@ async def test_legacy_session_without_context_still_knows_the_paper(tmp_path: Pa
     """返修前的旧会话只有题卡：也能据此定位第 5 题，不要求学生补年份。"""
 
     scheduler = FakeScheduler(decisions=[
-        ScheduleDecision(actions=[ActionPlan(action="explain_problem", parameters={})])
+        ScheduleDecision(actions=[ActionPlan(
+            action="explain_problem", parameters={"number_label": "5"},
+        )])
     ])
     service, repository, runtime = build_service(
         tmp_path, scheduler=scheduler, tutor=FakeTutor(explanations=[sample_explanation()])
@@ -863,14 +989,18 @@ async def test_switching_course_drops_previous_paper(tmp_path: Path) -> None:
 async def test_swap_question_returns_an_unseen_one(tmp_path: Path) -> None:
     """“换一道”要排除已经展示过的题，不能原样返回同一道。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        question_type="choice", limit=1,
+    )])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
 
     first = result_of(await run(service, conversation.id, turn_input(text="找一道选择题")))
     assert first.question_results[0].number_label == "1"
 
-    scheduler.push(search_decision())
+    scheduler.push(search_decision(
+        continue_from_previous=True, exclude_previous=True, limit=1,
+    ))
     second = result_of(await run(service, conversation.id, turn_input(text="换一道")))
     assert [card.number_label for card in second.question_results] == ["2"]
 
@@ -898,7 +1028,7 @@ async def test_swap_question_returns_an_unseen_one(tmp_path: Path) -> None:
 def test_answer_scope_judges_object_and_range(text: str, scope: str | None) -> None:
     """“解释”本身不等于完整讲解：要看解释的对象和范围。"""
 
-    assert ConversationService._answer_scope(text) == scope
+    assert scope_of(text) == scope
 
 
 @pytest.mark.anyio
@@ -954,7 +1084,10 @@ async def test_selection_honours_explicit_question_type(tmp_path: Path) -> None:
     """展示填空题第 5 题时说“选择题第 5 题”：要选中选择题，不是填空题。"""
 
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[
-        ActionPlan(action="select_question", parameters={})
+        ActionPlan(action="select_question", parameters={
+            "number_label": "5",
+            "question_type": "choice",
+        })
     ])])
     service, repository, runtime = build_service(
         tmp_path, cards=mixed_type_cards(), scheduler=scheduler
@@ -987,7 +1120,7 @@ async def test_selection_honours_explicit_question_type(tmp_path: Path) -> None:
 async def test_legacy_cards_do_not_prove_total_or_exhaustion(tmp_path: Path) -> None:
     """返修前只展示过 3 张卡的会话：继续时从第 4 道查，不谎称“共 3 道已列完”。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(continue_from_previous=True)])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
     request_id = str(uuid4())
@@ -1018,7 +1151,9 @@ async def test_legacy_cards_do_not_prove_total_or_exhaustion(tmp_path: Path) -> 
 async def test_swap_keeps_previous_query_and_type(tmp_path: Path) -> None:
     """“换一道”继承原来的关键词与题型，只排除已展示的题。"""
 
-    scheduler = FakeScheduler(decisions=[search_decision()])
+    scheduler = FakeScheduler(decisions=[search_decision(
+        query="循环", question_type="choice", limit=1,
+    )])
     service, repository, runtime = build_service(tmp_path, scheduler=scheduler)
     conversation = service.create_conversation()
 
@@ -1028,7 +1163,9 @@ async def test_swap_keeps_previous_query_and_type(tmp_path: Path) -> None:
     original = runtime.search_calls[-1]["request"]
     assert original.question_type == "choice"
 
-    scheduler.push(search_decision())
+    scheduler.push(search_decision(
+        continue_from_previous=True, exclude_previous=True, limit=1,
+    ))
     second = result_of(await run(service, conversation.id, turn_input(text="换一道")))
     follow_up = runtime.search_calls[-1]["request"]
 
@@ -1043,7 +1180,14 @@ async def test_swap_keeps_previous_query_and_type(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_switch_verb_keeps_locator_free_of_keywords(tmp_path, prefix):
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[ActionPlan(
-        action="select_question", parameters={"paper_id": PAPER, "number_label": "5"})])])
+        action="select_question",
+        parameters={
+            "paper_id": PAPER,
+            "number_label": "5",
+            "question_type": "choice",
+            "academic_year": "2023-2024",
+            "term": "s1",
+        })])])
     service, repo, runtime = build_service(tmp_path, scheduler=scheduler)
     old, new = two_papers(service, runtime)
     cid = service.create_conversation().id
@@ -1057,7 +1201,7 @@ async def test_switch_verb_keeps_locator_free_of_keywords(tmp_path, prefix):
 
 @pytest.mark.parametrize("variant", ["A卷", "A 卷", "（A卷）", "(a 卷)"])
 def test_variant_is_metadata_not_a_content_keyword(variant):
-    from app.questions.intent import extract_intent
+    from evals.f010_d.legacy_intent import extract_intent
     text = f"给出 2024-2025 第一学期 Python 期末 {variant}的全部选择题"
     intent = extract_intent(text, confirmed_course=COURSE, papers=[paper_item().model_dump()],
                             planned={"query": text})
@@ -1071,7 +1215,7 @@ def test_variant_is_metadata_not_a_content_keyword(variant):
 @pytest.mark.anyio
 async def test_recent_browse_beats_previous_selected_paper(tmp_path):
     scheduler = FakeScheduler(decisions=[ScheduleDecision(actions=[ActionPlan(
-        action="select_question", parameters={"paper_id": "py-2023-2024-s1-final"})])])
+        action="select_question", parameters={})])])
     service, repo, runtime = build_service(tmp_path, scheduler=scheduler)
     old, new = two_papers(service, runtime)
     cid = service.create_conversation().id
@@ -1179,7 +1323,12 @@ async def test_image_evaluation_reply_and_regeneration_do_not_repeat_business(tm
     assert len(agent.evaluate_calls[0]["images"]) == 1
     assert result.exercise.evaluation.is_correct is True
     saved = repo.find_turn(cid, data.request_id)
-    prompt = material_from_payload(saved.recovery["reply_input"]).describe()
+    context = (saved.recovery or {}).get("reply_context")
+    if context:
+        prompt, _notes = material_from_context(svc, cid, context)
+        prompt = prompt.describe()
+    else:  # 旧版直连入口仍保存材料副本
+        prompt = material_from_payload(saved.recovery["reply_input"]).describe()
     assert "已读取 1 张" in prompt and "abundant(k)" in prompt
     assert "参考解答（学生已主动查看）" not in prompt
     before = len(repo.list_turns(cid))

@@ -76,6 +76,39 @@ class ReplyMaterial:
     # F009：程序统计好的学习记忆事实。只描述记录，不含答案，也不含“掌握”结论。
     learning_memory: str | None = None
 
+    def describe_context(self) -> str:
+        """终局提示用的文字上下文：记忆、摘要、整卷浏览与等待状态。
+
+        不含本轮工具结果与讲解正文：前者已在同一循环的消息里，后者只在
+        学生本轮获准查看时由工具结果携带；回复适配器仍走 ``describe``。
+        """
+
+        lines: list[str] = []
+        if self.course:
+            lines.append(f"【当前课程】{self.course}")
+        if self.context_summary:
+            lines.append(f"【最近对话】{self.context_summary[:600]}")
+        if self.learning_memory:
+            lines.append("【学习记忆（程序统计，只描述已有记录）】")
+            lines.append(self.learning_memory[:1200])
+        if self.question_page:
+            lines.append(f"【整卷浏览】{_describe_page(self.question_page)}")
+        if self.answer_scope == "hint":
+            lines.append(
+                "【回答范围】只给提示：针对学生问的那道题给出一条能推动他往下想的"
+                "具体提示，不要公布答案、不要写完整代码或完整推导。"
+            )
+        elif self.answer_scope == "topic":
+            lines.append(
+                "【回答范围】只回答考点：直接说明这道题考查什么知识点、为什么考它；"
+                "不要展开完整解法，不要给出答案。"
+            )
+        if self.waiting_for:
+            lines.append(f"【等待学生】{self.waiting_for}")
+        if self.suggestions:
+            lines.append("【可用建议】" + "、".join(self.suggestions[:5]))
+        return "\n".join(lines)
+
     def describe(self) -> str:
         lines: list[str] = [f"【学生本轮发言】{self.user_text}"]
         if self.course:
@@ -164,6 +197,10 @@ _ACTION_LABELS = {
     "review_memory": "查看学习记忆",
     "correct_memory": "纠正学习记忆",
     "delete_memory": "移除学习记忆",
+    "view_workspace": "读取工作区",
+    "view_question_detail": "查看题目详情",
+    "list_shown_questions": "列出已展示题目",
+    "view_learning_summary": "查看学习摘要",
 }
 
 _STATUS_LABELS = {"success": "成功", "failed": "未完成", "clarification": "待学生确认"}
@@ -298,6 +335,8 @@ class StreamingReply:
         self._settings = settings
         self._model = model
         self._http_async_client = http_async_client
+        self.last_chunk: Any = None
+        self.last_finish_reason: str | None = None
 
     def _build_model(self) -> Any:
         return self._model or build_chat_model(
@@ -310,18 +349,31 @@ class StreamingReply:
         )
 
     async def stream(self, material: ReplyMaterial) -> AsyncIterator[str]:
-        model = self._build_model()
         messages = [
             {"role": "system", "content": REPLY_SYSTEM_PROMPT},
             {"role": "user", "content": material.describe() + "\n\n请写这段回复。"},
         ]
+        async for piece in self.stream_messages(messages):
+            yield piece
+
+    async def stream_messages(
+        self, messages: list[dict[str, Any]], *, note: str | None = None
+    ) -> AsyncIterator[str]:
+        """按给定消息流式生成；F010 C 的终局回复与测试替身回退共用这条路径。"""
+
+        model = self._build_model()
+        if note:
+            # 与调度器终局路径一致：学习记忆等文字上下文放在最后一条要求里。
+            messages = list(messages) + [
+                {"role": "user", "content": f"【补充要求】{note}"}
+            ]
         buffer = ""
         last_chunk: Any = None
         finish_reason: str | None = None
         async for chunk in model.astream(messages):
             last_chunk = chunk
-            finish_reason = _chunk_finish_reason(chunk) or finish_reason
-            piece = _chunk_text(chunk)
+            finish_reason = chunk_finish_reason(chunk) or finish_reason
+            piece = chunk_text(chunk)
             if not piece:
                 continue
             buffer += piece
@@ -333,10 +385,36 @@ class StreamingReply:
         if buffer:
             yield buffer
         if last_chunk is not None:
+            self.last_chunk = last_chunk
             log_usage("reply_stream", last_chunk)
+        self.last_finish_reason = finish_reason
         if finish_reason == "length":
             # 已达输出上限：已经产出的文字是真的，但不是完整回复。
             raise ReplyTruncated("length")
+
+
+def _chunk_finish_reason(chunk: Any) -> str | None:
+    """读取 LangChain 消息块的结束原因；不同供应商放在两个位置。"""
+
+    for holder in ("response_metadata", "generation_info"):
+        metadata = getattr(chunk, holder, None)
+        if isinstance(metadata, dict):
+            reason = metadata.get("finish_reason") or metadata.get("stop_reason")
+            if isinstance(reason, str) and reason:
+                return reason
+    return None
+
+
+def chunk_finish_reason(chunk: Any) -> str | None:
+    """公开别名：终局回复也要判断是否被输出上限截断。"""
+
+    return _chunk_finish_reason(chunk)
+
+
+def chunk_text(chunk: Any) -> str:
+    """公开别名：取一段消息块的文本内容。"""
+
+    return _chunk_text(chunk)
 
 
 def _chunk_finish_reason(chunk: Any) -> str | None:

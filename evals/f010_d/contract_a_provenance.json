@@ -1,0 +1,559 @@
+{
+  "frozen_cases_sha256": "fca505a0b07ddae484fa44fb7ea10389222bfda9c79d532d7bd5a5d9dca5b42f",
+  "frozen_runner_sha256": "83818b4a9d9711091e9a1bf423cb9c23459525a72e3fceb408b654a1e42a288b",
+  "approved_key_map_sha256": "b69916871173d1013986e7f4fb1201cdfca6dccbe78aaba076b9d22edb2e40e3",
+  "trace_source": "D:\\实习\\河海大学考试复习-f010cd\\tmp\\f010-d\\20261107-S1-A-param8b\\a-adapter.jsonl",
+  "trace_sha256": "9fd52c6d42a152b26cbb1b82f6002dd897712fb041caade2397bbed8a1b70560",
+  "static_parameter_changes": [
+    {
+      "key": "03:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "05:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1"
+      }
+    },
+    {
+      "key": "05:1:0:query_papers",
+      "changed_parameters": {
+        "variant": "B"
+      }
+    },
+    {
+      "key": "06:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1"
+      }
+    },
+    {
+      "key": "06:1:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final"
+      }
+    },
+    {
+      "key": "07:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1"
+      }
+    },
+    {
+      "key": "07:1:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "midterm",
+        "variant": "B"
+      }
+    },
+    {
+      "key": "09:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "09:1:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2019-2020",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "10:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "10:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "10:2:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2019-2020",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "11:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "11:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "11:1:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2023-2024",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "12:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "12:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "12:1:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2023-2024",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "12:1:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "12:2:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "13:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "13:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "14:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "14:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "14:2:0:list_paper_questions",
+      "changed_parameters": {
+        "continue_from_previous": true
+      }
+    },
+    {
+      "key": "15:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "16:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "17:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "17:3:0:search_questions",
+      "changed_parameters": {
+        "scope": "bank"
+      }
+    },
+    {
+      "key": "18:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "18:2:0:search_questions",
+      "changed_parameters": {
+        "scope": "bank"
+      }
+    },
+    {
+      "key": "20:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "20:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "20:2:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2023-2024",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "21:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "21:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "21:1:0:search_questions",
+      "changed_parameters": {
+        "scope": "bank"
+      }
+    },
+    {
+      "key": "22:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "22:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "23:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "23:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "24:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "24:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "25:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "25:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "26:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "26:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "27:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "27:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "28:0:0:query_papers",
+      "changed_parameters": {
+        "exam_type": "final",
+        "academic_year": "2024-2025",
+        "term": "s1",
+        "variant": "A"
+      }
+    },
+    {
+      "key": "28:0:0:list_paper_questions",
+      "changed_parameters": {
+        "course": "Python语言程序设计"
+      }
+    },
+    {
+      "key": "29:0:0:search_questions",
+      "changed_parameters": {
+        "scope": "bank"
+      }
+    }
+  ],
+  "explicit_replacements": [
+    "08",
+    "19",
+    "41",
+    "42",
+    "45",
+    "46",
+    "47",
+    "48"
+  ],
+  "explicit_cases_sha256": "bb7cd58a01b01cccd33284fc171f20130e325f9dce1e0a574e9c198cf505c78c",
+  "contract_cases_sha256": "0e52b3301719a2c096af42d349fe57b65955c614485111fe97591ee0b904750b",
+  "case_count": 48,
+  "rules": "Only previously approved parameter additions; eight separately reviewed explicit scenarios replace their original inputs. No automatic enrichment at replay time. 04 unchanged; all original grading functions reused.",
+  "explicit_selection_scope_additions": [
+    {
+      "case": "10",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "10",
+      "turn": 4,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "12",
+      "turn": 2,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "15",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "20",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "22",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "22",
+      "turn": 3,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "23",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "24",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "25",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "26",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "26",
+      "turn": 2,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "27",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    },
+    {
+      "case": "28",
+      "turn": 1,
+      "batch": 0,
+      "tool": "select_question",
+      "added": {
+        "question_type": "choice"
+      },
+      "reason": "独立新契约对照：明确传递原场景的选择题范围；不在生产补参，18的歧义请求保持缺省"
+    }
+  ]
+}
