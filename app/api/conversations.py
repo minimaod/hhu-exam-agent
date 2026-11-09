@@ -13,6 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.api.query import get_query_config
+from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.config import QueryConfigState
 from app.conversations.dispatch import DeepSeekIntentRouter
 from app.conversations.graph import SchedulerAgent
@@ -26,6 +28,7 @@ from app.conversations.models import (
     TurnKind,
 )
 from app.conversations.reply import StreamingReply
+from app.conversations.repository import ConversationRepository
 from app.conversations.service import (
     ConversationService,
     ConversationStoreState,
@@ -174,6 +177,7 @@ def get_conversation_service_state(
     request: Request,
     config: Annotated[QueryConfigState, Depends(get_query_config)],
     papers: Annotated[PaperService, Depends(get_paper_service)],
+    user: Annotated[User, Depends(require_user)],
 ) -> ConversationServiceState:
     """按启动时的数据库状态和查询配置组装服务状态。
 
@@ -181,11 +185,12 @@ def get_conversation_service_state(
     """
 
     state: ConversationStoreState = request.app.state.conversation_store
-    if state.repository is None:
+    if state.db_path is None or state.error is not None:
         return ConversationServiceState(
             service=None,
             error=state.error or "本地学习数据暂时不可用，请稍后再试。",
         )
+    repository = ConversationRepository(state.db_path).scoped(user.id)
 
     settings = config.settings
     make_query: Callable[[], QueryService] | None = None
@@ -225,7 +230,7 @@ def get_conversation_service_state(
         make_reply = _make_reply
 
     records = MistakeRecordService(
-        state.repository,
+        repository,
         papers,
         make_tutor=make_tutor,
         tutoring_error=config.error,
@@ -234,10 +239,12 @@ def get_conversation_service_state(
     runtime: QuestionRuntime | None = getattr(
         request.app.state, "question_runtime", None
     )
-    memory = LearningMemoryService(state.repository.db_path, papers=papers)
+    memory = LearningMemoryService(
+        state.db_path, papers=papers, owner_id=user.id
+    )
     return ConversationServiceState(
         service=ConversationService(
-            repository=state.repository,
+            repository=repository,
             make_query=make_query,
             query_error=config.error,
             make_tutor=make_tutor,
@@ -398,10 +405,9 @@ def reveal_exercise_solution(
     ],
 ) -> ExerciseView:
     service = require_service(state)
-    ex = service._repository.reveal_exercise_solution(
-        str(exercise_id), conversation_id=str(conversation_id)
+    return service.reveal_exercise_solution(
+        str(conversation_id), str(exercise_id)
     )
-    return service._build_exercise_view(ex, allow_solution=True)
 
 
 _QUESTION_HEADERS = {

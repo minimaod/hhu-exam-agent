@@ -13,6 +13,7 @@ import pytest
 from app.conversations.repository import ConversationRepository
 from app.memory.service import LearningMemoryService
 from tests.f009_support import Seed, plain_course_of
+from tests.f012_support import TEST_USER_ID
 
 
 class FakePapers:
@@ -108,6 +109,7 @@ def test_attempts_are_classified_by_evidence_not_by_encouragement(tmp_path: Path
         connection.row_factory = sqlite3.Row
         bundle = collect_all(
             connection,
+            owner_id=TEST_USER_ID,
             paper_lookup=lambda paper_id: (None, None),
             normalizer=KnowledgeNormalizer(None),
             corrections={},

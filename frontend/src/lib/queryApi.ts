@@ -12,6 +12,7 @@ import {
   type PaperItem,
 } from "./papersApi.ts";
 import { createSseParser } from "./sseParser.ts";
+import { apiFetch } from "./apiFetch.ts";
 
 const QUERY_PATH = "/api/query";
 const MAX_QUERY_LENGTH = 1000;
@@ -209,7 +210,7 @@ export async function streamQuery(
 
   let response: Response;
   try {
-    response = await fetch(QUERY_PATH, {
+    response = await apiFetch(QUERY_PATH, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

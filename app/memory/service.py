@@ -61,12 +61,13 @@ class LearningMemoryService:
         self,
         db_path: Path,
         *,
+        owner_id: str,
         papers: Any | None = None,
         taxonomy_path: Path | None = None,
         current_file: Path | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._repository = MemoryRepository(Path(db_path))
+        self._repository = MemoryRepository(Path(db_path), owner_id=owner_id)
         self._papers = papers
         self._taxonomy_path = taxonomy_path
         self._current_file = current_file
@@ -139,6 +140,7 @@ class LearningMemoryService:
         with self._repository.read() as connection:
             bundle = collect_all(
                 connection,
+                owner_id=self._repository.owner_id,
                 paper_lookup=self._lookup_paper,
                 normalizer=self._knowledge(),
                 corrections=self._repository.corrections(),
@@ -164,6 +166,7 @@ class LearningMemoryService:
         with self._repository.read() as connection:
             bundle = collect_evidence(
                 connection,
+                owner_id=self._repository.owner_id,
                 course=course,
                 paper_lookup=self._lookup_paper,
                 normalizer=self._knowledge(),

@@ -29,9 +29,13 @@ from fastapi.testclient import TestClient
 
 import app.config as query_config
 import app.conversations.repository as conversation_repository
+import app.images as images
+from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.main import app
 from app.papers.repository import PaperRepository
 from app.papers.service import PaperService, get_paper_service
+from tests.f012_support import TEST_USER_ID, TEST_USERNAME, ensure_test_user
 from tests.support import sample_record, write_catalog
 
 
@@ -84,6 +88,42 @@ def _isolate_question_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_attachments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """上传文件也只能写到用例自己的临时目录。"""
+
+    monkeypatch.setattr(images, "ATTACHMENTS_ROOT", tmp_path / "attachments")
+
+
+@pytest.fixture(autouse=True)
+def _allow_legacy_unscoped_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧测试直接构造无 owner 的仓库；生产 API 仍然传 scoped 仓库。"""
+
+    from app.conversations.service import ConversationService
+
+    original = ConversationService.__init__
+
+    def wrapped(self, *args, **kwargs):
+        kwargs.setdefault("allow_unscoped", True)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationService, "__init__", wrapped)
+
+    from app.memory.service import LearningMemoryService
+
+    original_memory = LearningMemoryService.__init__
+
+    def wrapped_memory(self, *args, **kwargs):
+        kwargs.setdefault("owner_id", TEST_USER_ID)
+        return original_memory(self, *args, **kwargs)
+
+    monkeypatch.setattr(LearningMemoryService, "__init__", wrapped_memory)
+
+
 @pytest.fixture
 def study_db_path(tmp_path: Path) -> Path:
     """当前用例使用的隔离数据库路径；多次启动应用会复用同一个文件。"""
@@ -120,8 +160,14 @@ def make_client() -> Iterator[Callable[[Path], TestClient]]:
         app.dependency_overrides[get_paper_service] = lambda: PaperService(
             PaperRepository(root)
         )
+        app.dependency_overrides[require_user] = lambda: User(
+            id=TEST_USER_ID,
+            username=TEST_USERNAME,
+            created_at="2026-01-01T00:00:00+00:00",
+        )
         client = TestClient(app)
         client.__enter__()
+        ensure_test_user(conversation_repository.DEFAULT_DB_PATH)
         clients.append(client)
         return client
 
@@ -138,10 +184,58 @@ def client(sample_root: Path, make_client: Callable[[Path], TestClient]) -> Test
     return make_client(sample_root)
 
 
+@pytest.fixture(autouse=True)
+def _default_legacy_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧测试默认以隔离用户身份运行；真实认证用例用 anon_client 清除。
+
+    这里同时包住 build_store_state，在数据库初始化后补测试用户，保证
+    旧测试直接造会话时 owner 外键有效。生产请求仍走真实 Cookie 会话。
+    """
+
+    import app.main as main_module
+
+    original = main_module.build_store_state
+
+    def build():
+        state = original()
+        if state.db_path is not None and state.error is None:
+            ensure_test_user(state.db_path)
+        return state
+
+    monkeypatch.setattr(main_module, "build_store_state", build)
+    app.dependency_overrides[require_user] = lambda: User(
+        id=TEST_USER_ID,
+        username=TEST_USERNAME,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    yield
+    app.dependency_overrides.pop(require_user, None)
+
+
 @pytest.fixture
 def real_client() -> Iterator[TestClient]:
     """使用项目真实 data/papers 的客户端；只读，不修改原始 PDF。"""
 
-    assert not app.dependency_overrides, "上一个用例遗留了依赖替换"
+    app.dependency_overrides.pop(require_user, None)
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def anon_client() -> Iterator[TestClient]:
+    """无认证 override 的真实客户端，用于认证/隔离/迁移启动用例。"""
+
+    app.dependency_overrides.clear()
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def legacy_client(
+    sample_root: Path, make_client: Callable[[Path], TestClient]
+) -> TestClient:
+    """旧测试使用的已登录客户端；override 只在本夹具内生效。"""
+
+    return make_client(sample_root)

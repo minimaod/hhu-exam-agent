@@ -80,31 +80,33 @@ type ConversationWorkspaceProps = {
   onOpenRecord: (recordId: string) => void;
   /** 从学习记忆跳回某次会话；只切到该会话，不复制任何内容。 */
   openConversationId?: string | null;
+  /** 按用户隔离的上次会话恢复键；测试可省略。 */
+  storageKey?: string | null;
 };
 
 const STORAGE_KEY = "hhu-exam-review.current-conversation";
 const MAX_FILES = 4;
 const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
 
-function readStoredId(): string | null {
+function readStoredId(key: string): string | null {
   try {
-    return window.localStorage.getItem(STORAGE_KEY);
+    return window.localStorage.getItem(key);
   } catch {
     return null;
   }
 }
 
-function writeStoredId(id: string): void {
+function writeStoredId(key: string, id: string): void {
   try {
-    window.localStorage.setItem(STORAGE_KEY, id);
+    window.localStorage.setItem(key, id);
   } catch {
     // 隐私模式等情况下无法持久化，只保留本次页面内的状态。
   }
 }
 
-function clearStoredId(): void {
+function clearStoredId(key: string): void {
   try {
-    window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(key);
   } catch {
     // 同上。
   }
@@ -153,7 +155,9 @@ export default function ConversationWorkspace({
   onDownload,
   onOpenRecord,
   openConversationId = null,
+  storageKey = STORAGE_KEY,
 }: ConversationWorkspaceProps) {
+  const activeStorageKey = storageKey ?? STORAGE_KEY;
   const [listState, setListState] = useState<ListState>({ phase: "loading" });
   const [listAttempt, setListAttempt] = useState(0);
   const [currentId, setCurrentId] = useState<string | null>(null);
@@ -244,7 +248,7 @@ export default function ConversationWorkspace({
         if (currentIdRef.current !== null) {
           return;
         }
-        const stored = readStoredId();
+        const stored = readStoredId(activeStorageKey);
         if (!stored) {
           return;
         }
@@ -252,7 +256,7 @@ export default function ConversationWorkspace({
           currentIdRef.current = stored;
           setCurrentId(stored);
         } else {
-          clearStoredId();
+          clearStoredId(activeStorageKey);
         }
       })
       .catch((error: unknown) => {
@@ -349,7 +353,7 @@ export default function ConversationWorkspace({
       currentIdRef.current = conversationId;
       setCurrentId(conversationId);
       setDetailState({ phase: "loading" });
-      writeStoredId(conversationId);
+      writeStoredId(activeStorageKey, conversationId);
     },
     [setPendingFiles, updateLive],
   );

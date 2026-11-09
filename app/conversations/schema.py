@@ -1,4 +1,4 @@
-"""本地学习数据库的结构与迁移（当前 v6）。
+"""本地学习数据库的结构与迁移（当前 v7）。
 
 只有两种数据库允许写入：真正的空库，或结构与目标版本完全兼容的库。旧版
 数据库在单个事务中逐级迁移到 v6；任何未知结构、损坏或迁移失败都只返回
@@ -29,6 +29,7 @@ v6（F009）只追加两张“记忆覆盖”表，不改旧列、不回填旧�
 import logging
 import sqlite3
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.conversations.errors import ConversationStorageError
@@ -36,7 +37,7 @@ from app.conversations.inputs import query_input
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _STORAGE_MESSAGE = "本地学习数据暂时不可用，请稍后再试。"
 _UPGRADE_MESSAGE = "本地学习数据的结构版本不兼容，请保留原文件并联系维护者。"
@@ -46,6 +47,9 @@ _UNKNOWN_MESSAGE = (
 )
 _MIGRATION_MESSAGE = (
     "本地学习数据的结构升级失败，已回滚并保留原数据；请停止使用并联系维护者。"
+)
+_MIGRATION_NEEDED_MESSAGE = (
+    "本地学习数据库仍为旧版本。请先停止服务，运行管理员迁移命令后再启动。"
 )
 
 # ---------------------------------------------------------------------------
@@ -496,6 +500,95 @@ _V6_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
 _V6_UNIQUE_SETS = set(_V5_UNIQUE_SETS)
 _V6_FOREIGN_KEYS = set(_V5_FOREIGN_KEYS)
 _V6_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = dict(_V5_REQUIRED_CHECKS)
+
+# ---------------------------------------------------------------------------
+# v7 结构（F012：账号、邀请码、登录会话与数据归属）
+# ---------------------------------------------------------------------------
+
+_V7_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V6_COLUMNS,
+    "conversations": ("id", "title", "created_at", "updated_at", "owner_id"),
+    "users": (
+        "id",
+        "username",
+        "username_normalized",
+        "password_hash",
+        "created_at",
+        "disabled_at",
+    ),
+    "invite_codes": (
+        "id",
+        "code_sha256",
+        "label",
+        "created_by",
+        "created_at",
+        "expires_at",
+        "used_at",
+        "used_by",
+    ),
+    "login_sessions": (
+        "id",
+        "user_id",
+        "token_sha256",
+        "created_at",
+        "expires_at",
+        "revoked_at",
+    ),
+    "memory_corrections": (
+        "owner_id",
+        "entry_key",
+        "course",
+        "knowledge_point",
+        "note",
+        "created_at",
+        "updated_at",
+    ),
+    "memory_exclusions": (
+        "owner_id",
+        "entry_key",
+        "reason",
+        "created_at",
+    ),
+}
+
+_V7_TABLES = frozenset(_V7_COLUMNS)
+_V7_INDEXES = frozenset(
+    _V6_INDEXES
+    | {
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+    }
+)
+
+_V7_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V6_PRIMARY_KEYS,
+    "conversations": ("id",),
+    "users": ("id",),
+    "invite_codes": ("id",),
+    "login_sessions": ("id",),
+    "memory_corrections": ("owner_id", "entry_key"),
+    "memory_exclusions": ("owner_id", "entry_key"),
+}
+
+_V7_UNIQUE_SETS = {
+    *_V6_UNIQUE_SETS,
+    ("username_normalized",),
+    ("code_sha256",),
+    ("token_sha256",),
+}
+
+_V7_FOREIGN_KEYS = {
+    *_V6_FOREIGN_KEYS,
+    ("owner_id", "users", "id"),
+    ("user_id", "users", "id"),
+    ("created_by", "users", "id"),
+    ("used_by", "users", "id"),
+}
+
+_V7_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = dict(_V6_REQUIRED_CHECKS)
 
 # ---------------------------------------------------------------------------
 # DDL
@@ -1120,12 +1213,193 @@ def _v5_migration_statements() -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
+# v7 DDL（F012 账号与归属）
+# ---------------------------------------------------------------------------
+
+_USERS = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    username_normalized TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    disabled_at TEXT
+)
+"""
+
+_USERS_USERNAME = """
+CREATE UNIQUE INDEX IF NOT EXISTS users_username
+    ON users(username_normalized)
+"""
+
+_INVITE_CODES = """
+CREATE TABLE IF NOT EXISTS invite_codes (
+    id TEXT PRIMARY KEY,
+    code_sha256 TEXT NOT NULL,
+    label TEXT,
+    created_by TEXT REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    used_at TEXT,
+    used_by TEXT REFERENCES users(id),
+    CHECK (used_at IS NULL OR used_by IS NOT NULL)
+)
+"""
+
+_INVITE_CODES_CODE = """
+CREATE UNIQUE INDEX IF NOT EXISTS invite_codes_code
+    ON invite_codes(code_sha256)
+"""
+
+_LOGIN_SESSIONS = """
+CREATE TABLE IF NOT EXISTS login_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+)
+"""
+
+_LOGIN_SESSIONS_TOKEN = """
+CREATE UNIQUE INDEX IF NOT EXISTS login_sessions_token
+    ON login_sessions(token_sha256)
+"""
+
+_LOGIN_SESSIONS_USER = """
+CREATE INDEX IF NOT EXISTS login_sessions_user
+    ON login_sessions(user_id, expires_at)
+"""
+
+_CONVERSATIONS_V7 = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    owner_id TEXT REFERENCES users(id)
+)
+"""
+
+_CONVERSATIONS_OWNER = """
+CREATE INDEX IF NOT EXISTS conversations_owner
+    ON conversations(owner_id, updated_at DESC)
+"""
+
+_MEMORY_CORRECTIONS_V7 = """
+CREATE TABLE IF NOT EXISTS memory_corrections (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    course TEXT,
+    knowledge_point TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_MEMORY_EXCLUSIONS_V7 = """
+CREATE TABLE IF NOT EXISTS memory_exclusions (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_MEMORY_CORRECTIONS_V7_TMP = """
+CREATE TABLE memory_corrections_v7 (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    course TEXT,
+    knowledge_point TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_MEMORY_EXCLUSIONS_V7_TMP = """
+CREATE TABLE memory_exclusions_v7 (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_CREATE_V7_STATEMENTS = (
+    _USERS,
+    _USERS_USERNAME,
+    _INVITE_CODES,
+    _INVITE_CODES_CODE,
+    _LOGIN_SESSIONS,
+    _LOGIN_SESSIONS_TOKEN,
+    _LOGIN_SESSIONS_USER,
+    _CONVERSATIONS_V7,
+    _CONVERSATIONS_OWNER,
+    *(
+        statement
+        for statement in _CREATE_V6_STATEMENTS
+        if statement
+        not in {
+            _CONVERSATIONS,
+            _MEMORY_CORRECTIONS,
+            _MEMORY_EXCLUSIONS,
+        }
+    ),
+    _MEMORY_CORRECTIONS_V7,
+    _MEMORY_EXCLUSIONS_V7,
+)
+
+_V7_MIGRATION_STATEMENTS = (
+    _USERS,
+    _USERS_USERNAME,
+    _INVITE_CODES,
+    _INVITE_CODES_CODE,
+    _LOGIN_SESSIONS,
+    _LOGIN_SESSIONS_TOKEN,
+    _LOGIN_SESSIONS_USER,
+    "ALTER TABLE conversations ADD COLUMN owner_id TEXT REFERENCES users(id)",
+    _CONVERSATIONS_OWNER,
+)
+
+
+def _v7_migration_statements() -> tuple[str, ...]:
+    return _V7_MIGRATION_STATEMENTS
+
+
+@dataclass(frozen=True)
+class SchemaOwner:
+    """v6→v7 迁移时创建/复用的管理员。"""
+
+    id: str
+    username: str
+    username_normalized: str
+    password_hash: str
+    created_at: str
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
 
-def initialize_database(db_path: Path) -> None:
-    """建库、校验或迁移到 v6，并恢复遗留运行中轮次。"""
+def initialize_database(
+    db_path: Path,
+    *,
+    migration_owner: SchemaOwner | None = None,
+) -> None:
+    """建库、校验或迁移到 v7，并恢复遗留运行中轮次。
+
+    旧库不会在普通启动中自动升级：调用方必须显式传入 ``migration_owner``，
+    这由管理员 CLI 提供。空库仍可直接创建 v7。
+    """
 
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1136,33 +1410,45 @@ def initialize_database(db_path: Path) -> None:
     try:
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
+            objects = _user_objects(connection)
         except sqlite3.DatabaseError as exc:
             raise ConversationStorageError(_STORAGE_MESSAGE) from exc
 
+        needs_migration = bool(objects) and version != SCHEMA_VERSION
+        if needs_migration and migration_owner is None:
+            raise ConversationStorageError(_MIGRATION_NEEDED_MESSAGE)
+
         if version == 0:
-            if not _user_objects(connection):
-                _create_v6(connection)
+            if not objects:
+                _create_v7(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v7(connection):
+                _adopt_version(connection, SCHEMA_VERSION)
                 _enable_wal(connection)
             elif _is_compatible_v6(connection):
-                _adopt_version(connection, SCHEMA_VERSION)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
                 _enable_wal(connection)
             elif _is_compatible_v5(connection):
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
                 _enable_wal(connection)
             elif _is_compatible_v4(connection):
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
                 _enable_wal(connection)
             elif _is_compatible_v3(connection):
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
                 _enable_wal(connection)
             elif _is_compatible_v2(connection):
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
                 _enable_wal(connection)
             elif _is_compatible_v1(connection):
                 _migrate_v1_to_v2(connection)
@@ -1170,6 +1456,7 @@ def initialize_database(db_path: Path) -> None:
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
                 _enable_wal(connection)
             else:
                 raise ConversationStorageError(_UNKNOWN_MESSAGE)
@@ -1181,6 +1468,7 @@ def initialize_database(db_path: Path) -> None:
             _migrate_v3_to_v4(connection)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
             _enable_wal(connection)
         elif version == 2:
             if not _is_compatible_v2(connection):
@@ -1189,6 +1477,7 @@ def initialize_database(db_path: Path) -> None:
             _migrate_v3_to_v4(connection)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
             _enable_wal(connection)
         elif version == 3:
             if not _is_compatible_v3(connection):
@@ -1196,20 +1485,28 @@ def initialize_database(db_path: Path) -> None:
             _migrate_v3_to_v4(connection)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
             _enable_wal(connection)
         elif version == 4:
             if not _is_compatible_v4(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
             _enable_wal(connection)
         elif version == 5:
             if not _is_compatible_v5(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _enable_wal(connection)
+        elif version == 6:
+            if not _is_compatible_v6(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
             _enable_wal(connection)
         elif version == SCHEMA_VERSION:
-            if not _is_compatible_v6(connection):
+            if not _is_compatible_v7(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _enable_wal(connection)
         else:
@@ -1218,6 +1515,12 @@ def initialize_database(db_path: Path) -> None:
         _recover_running(connection)
     finally:
         connection.close()
+
+
+def _require_owner(owner: SchemaOwner | None) -> SchemaOwner:
+    if owner is None:
+        raise ConversationStorageError(_MIGRATION_NEEDED_MESSAGE)
+    return owner
 
 
 def _open(db_path: Path) -> sqlite3.Connection:
@@ -1458,6 +1761,55 @@ def _is_compatible_v6(connection: sqlite3.Connection) -> bool:
     )
 
 
+def _is_compatible_v7(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V7_TABLES) | set(_V7_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V7_COLUMNS,
+            primary_keys=_V7_PRIMARY_KEYS,
+            unique_sets=_V7_UNIQUE_SETS,
+            foreign_keys=_V7_FOREIGN_KEYS,
+            required_checks=_V7_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
 def _check_common(
     connection: sqlite3.Connection,
     *,
@@ -1648,7 +2000,7 @@ def _create_v5(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _CREATE_V5_STATEMENTS:
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 5")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
@@ -1661,12 +2013,105 @@ def _create_v6(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _CREATE_V6_STATEMENTS:
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 6")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
             connection.rollback()
         raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _create_v7(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V7_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 7")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v6_to_v7(
+    connection: sqlite3.Connection, owner: SchemaOwner
+) -> None:
+    """单事务升级：建认证表、回填会话归属、重建记忆覆盖表。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _v7_migration_statements():
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO users (
+                id, username, username_normalized, password_hash,
+                created_at, disabled_at
+            ) VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                owner.id,
+                owner.username,
+                owner.username_normalized,
+                owner.password_hash,
+                owner.created_at,
+            ),
+        )
+        connection.execute(
+            "UPDATE conversations SET owner_id = ?", (owner.id,)
+        )
+        connection.execute(_MEMORY_CORRECTIONS_V7_TMP)
+        connection.execute(_MEMORY_EXCLUSIONS_V7_TMP)
+        connection.execute(
+            """
+            INSERT INTO memory_corrections_v7 (
+                owner_id, entry_key, course, knowledge_point, note,
+                created_at, updated_at
+            )
+            SELECT ?, entry_key, course, knowledge_point, note,
+                   created_at, updated_at
+            FROM memory_corrections
+            """,
+            (owner.id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO memory_exclusions_v7 (
+                owner_id, entry_key, reason, created_at
+            )
+            SELECT ?, entry_key, reason, created_at
+            FROM memory_exclusions
+            """,
+            (owner.id,),
+        )
+        connection.execute("DROP TABLE memory_corrections")
+        connection.execute("DROP TABLE memory_exclusions")
+        connection.execute(
+            "ALTER TABLE memory_corrections_v7 RENAME TO memory_corrections"
+        )
+        connection.execute(
+            "ALTER TABLE memory_exclusions_v7 RENAME TO memory_exclusions"
+        )
+        connection.execute("PRAGMA user_version = 7")
+
+        unowned = connection.execute(
+            "SELECT COUNT(*) FROM conversations WHERE owner_id IS NULL"
+        ).fetchone()[0]
+        if unowned:
+            raise ConversationStorageError(_MIGRATION_MESSAGE)
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise ConversationStorageError(_MIGRATION_MESSAGE)
+        connection.commit()
+    except ConversationStorageError:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        logger.warning("本地学习数据库 v6→v7 迁移失败：%s", exc)
+        raise ConversationStorageError(_MIGRATION_MESSAGE) from exc
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -1754,7 +2199,7 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _v5_migration_statements():
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 5")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
@@ -1770,7 +2215,7 @@ def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _v6_migration_statements():
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 6")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):

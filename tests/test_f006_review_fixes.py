@@ -96,8 +96,9 @@ def setup_service(
     exercises=(),
     evaluations=(),
 ):
-    repository = ConversationRepository(tmp_path / "study.sqlite3")
-    repository.initialize()
+    from tests.f012_support import scoped_repository
+
+    repository = scoped_repository(tmp_path / "study.sqlite3")
     papers = PaperService(PaperRepository(DEFAULT_PAPERS_ROOT))
     tutor = FakeTutor(
         understandings=understandings,
@@ -228,7 +229,7 @@ def install_http(
         from app.conversations.service import ConversationStoreState
 
         app.state.conversation_store = ConversationStoreState(
-            repository=repository, error=None
+            db_path=repository.db_path, error=None
         )
     return TestClient(app)
 

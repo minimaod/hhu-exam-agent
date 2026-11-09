@@ -15,6 +15,7 @@ from app.conversations.protocol import ActionPlan
 from app.conversations.service import _DynamicContext
 from app.memory.models import MemoryCorrectionRequest
 from tests.test_f009_agent_memory import build, prepared_for
+from tests.f012_support import TEST_USER_ID
 
 PY = "Python语言程序设计"
 MATH = "高等数学"
@@ -62,9 +63,9 @@ def test_legacy_alias_correction_row_is_readable(tmp_path: Path) -> None:
     seed.attempt(exercise, correct=False)
     with sqlite3.connect(memory.db_path) as connection:
         connection.execute(
-            "INSERT INTO memory_corrections (entry_key, course, knowledge_point, "
-            "note, created_at, updated_at) VALUES (?, 'Python', NULL, NULL, ?, ?)",
-            (f"exercise:{exercise}", "2026-10-31T00:00:00+00:00", "2026-10-31T00:00:00+00:00"),
+            "INSERT INTO memory_corrections (owner_id, entry_key, course, knowledge_point, "
+            "note, created_at, updated_at) VALUES (?, ?, 'Python', NULL, NULL, ?, ?)",
+            (TEST_USER_ID, f"exercise:{exercise}", "2026-10-31T00:00:00+00:00", "2026-10-31T00:00:00+00:00"),
         )
         connection.commit()
 

@@ -23,6 +23,7 @@ from app.api.conversations import (
 from app.conversations.dispatch import IntentDecision
 from app.conversations.errors import ConversationStorageError
 from app.conversations.repository import ConversationRepository
+from tests.f012_support import scoped_repository
 from app.conversations.service import ConversationService, TurnInput
 from app.main import app
 from app.mistakes.service import MistakeRecordService
@@ -61,8 +62,7 @@ class Env:
 @pytest.fixture
 def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_root: Path):
     monkeypatch.setattr(images, "ATTACHMENTS_ROOT", tmp_path / "attachments")
-    repository = ConversationRepository(tmp_path / "study.sqlite3")
-    repository.initialize()
+    repository = scoped_repository(tmp_path / "study.sqlite3")
     papers = PaperService(PaperRepository(sample_root))
     tutor = FakeTutor()
     router = FakeRouter([])
@@ -400,7 +400,7 @@ def test_cross_conversation_attachment_is_rejected(env: Env) -> None:
         text="带图题",
         attachments=[{"id": attachment["id"], "role": "statement"}],
     )
-    assert response.status_code == 422
+    assert response.status_code == 404
 
 
 def test_unregistered_paper_source_is_rejected(env: Env) -> None:

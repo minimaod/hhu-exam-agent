@@ -4,6 +4,9 @@ import LearningMemory from "./components/LearningMemory";
 import MistakeBook from "./components/MistakeBook";
 import PaperCard from "./components/PaperCard";
 import PaperFilters from "./components/PaperFilters";
+import AuthPage, { type AuthMode } from "./auth/AuthPage";
+import { AuthProvider, storageKeyFor, useAuth } from "./auth/AuthContext";
+import UserMenu from "./auth/UserMenu";
 import { fetchHealth, HealthCheckError } from "./lib/healthApi";
 import {
   downloadPaper,
@@ -35,11 +38,86 @@ type SubmittedQuery = {
 const INITIAL_QUERY: SubmittedQuery = { course: "", examType: "all", seq: 0 };
 
 export default function App() {
-  const [view, setView] = useState<View>("conversations");
+  return (
+    <AuthProvider>
+      <AppRoot />
+    </AuthProvider>
+  );
+}
+
+function AppRoot() {
+  const { user } = useAuth();
+  return <AppShell key={user?.id ?? "guest"} />;
+}
+
+function pathAuthMode(): AuthMode | null {
+  if (window.location.pathname === "/register") {
+    return "register";
+  }
+  if (window.location.pathname === "/login") {
+    return "login";
+  }
+  return null;
+}
+
+function AppShell() {
+  const { phase, user, error: authError, retry } = useAuth();
+  const [view, setView] = useState<View>(user ? "conversations" : "papers");
+  const [authMode, setAuthMode] = useState<AuthMode | null>(pathAuthMode());
+  const [pendingView, setPendingView] = useState<View | null>(null);
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
   const [openConversationId, setOpenConversationId] = useState<string | null>(
     null,
   );
+
+  const openAuth = useCallback((mode: AuthMode, nextView: View | null = null) => {
+    setPendingView(nextView);
+    setAuthMode(mode);
+    window.history.pushState(null, "", mode === "register" ? "/register" : "/login");
+  }, []);
+
+  const closeAuth = useCallback(() => {
+    setAuthMode(null);
+    window.history.replaceState(null, "", "/");
+  }, []);
+
+  useEffect(() => {
+    const onPop = () => setAuthMode(pathAuthMode());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  useEffect(() => {
+    if (phase === "authenticated") {
+      if (window.location.pathname === "/login" || window.location.pathname === "/register") {
+        window.history.replaceState(null, "", "/");
+      }
+      setAuthMode(null);
+      setView((current) => (current === "papers" ? "conversations" : current));
+    } else if (phase === "anonymous") {
+      setView("papers");
+    }
+  }, [phase]);
+
+  const handleNav = useCallback(
+    (key: View) => {
+      if (key !== "papers" && !user) {
+        openAuth("login", key);
+        return;
+      }
+      if (key === "mistakes") {
+        setSelectedRecordId(null);
+      }
+      setView(key);
+    },
+    [openAuth, user],
+  );
+
+  const handleAuthSuccess = useCallback(() => {
+    closeAuth();
+    setView(pendingView && pendingView !== "papers" ? pendingView : "conversations");
+    setPendingView(null);
+  }, [closeAuth, pendingView]);
 
   const [courseInput, setCourseInput] = useState("");
   const [examTypeInput, setExamTypeInput] = useState<ExamTypeFilter>("all");
@@ -230,12 +308,7 @@ export default function App() {
               <button
                 key={key}
                 type="button"
-                onClick={() => {
-                  if (key === "mistakes") {
-                    setSelectedRecordId(null);
-                  }
-                  setView(key);
-                }}
+                onClick={() => handleNav(key)}
                 aria-current={view === key ? "page" : undefined}
                 className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition sm:flex-none ${
                   view === key
@@ -247,6 +320,11 @@ export default function App() {
               </button>
             ))}
           </nav>
+
+          <UserMenu
+            onLogin={() => openAuth("login")}
+            onRegister={() => openAuth("register")}
+          />
 
           <div className="flex items-center gap-2 text-[11px] text-slate-500">
             <span
@@ -276,22 +354,50 @@ export default function App() {
         </header>
 
         <div className="mt-3 min-h-0 flex-1">
-          {view === "conversations" && (
+          {authMode ? (
+            <AuthPage
+              mode={authMode}
+              onSwitch={(mode) => {
+                setAuthMode(mode);
+                window.history.replaceState(
+                  null,
+                  "",
+                  mode === "register" ? "/register" : "/login",
+                );
+              }}
+              onSuccess={handleAuthSuccess}
+            />
+          ) : phase === "error" ? (
+            <div className="mx-auto mt-10 max-w-md rounded-2xl border border-rose-200 bg-rose-50 p-5 text-sm text-rose-800">
+              <p className="font-semibold">无法确认登录状态</p>
+              <p className="mt-1">{authError ?? "请稍后再试。"}</p>
+              <button
+                type="button"
+                onClick={retry}
+                className="mt-3 rounded-lg border border-rose-300 bg-white px-3 py-1.5"
+              >
+                重试
+              </button>
+            </div>
+          ) : (
+            <>
+          {view === "conversations" && user && (
             <ConversationWorkspace
               downloads={downloads}
               onDownload={handleDownload}
               onOpenRecord={openRecord}
               openConversationId={openConversationId}
+              storageKey={storageKeyFor(user.id)}
             />
           )}
 
-          {view === "memory" && (
+          {view === "memory" && user && (
             <div className="h-full min-h-0 overflow-y-auto pr-1">
               <LearningMemory onOpenConversation={openConversationFromMemory} />
             </div>
           )}
 
-          {view === "mistakes" && (
+          {view === "mistakes" && user && (
             <div className="h-full min-h-0 overflow-y-auto pr-1">
               <MistakeBook
                 selectedId={selectedRecordId}
@@ -409,6 +515,8 @@ export default function App() {
                 </p>
               </div>
             </div>
+          )}
+            </>
           )}
         </div>
       </main>

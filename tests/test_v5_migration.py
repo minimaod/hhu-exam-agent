@@ -9,6 +9,7 @@ import pytest
 
 from app.conversations import schema
 from app.conversations.errors import ConversationStorageError
+from tests.f012_support import TEST_MIGRATION_OWNER
 
 
 def build_v4(path: Path) -> None:
@@ -58,7 +59,7 @@ def _selection(question_id: str, *, active: int) -> tuple:
 def test_v4_migrates_to_v5_additively(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
     build_v4(path)
-    schema.initialize_database(path)
+    schema.initialize_database(path, migration_owner=TEST_MIGRATION_OWNER)
 
     connection = sqlite3.connect(path)
     try:
@@ -109,4 +110,4 @@ def test_newer_schema_is_rejected(tmp_path: Path) -> None:
     connection.execute("PRAGMA user_version = 99")
     connection.close()
     with pytest.raises(ConversationStorageError):
-        schema.initialize_database(path)
+        schema.initialize_database(path, migration_owner=TEST_MIGRATION_OWNER)

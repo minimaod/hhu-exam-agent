@@ -13,6 +13,7 @@ from app.api.conversations import (
     get_conversation_service_state,
 )
 from app.conversations.repository import ConversationRepository
+from tests.f012_support import scoped_repository
 from app.conversations.service import ConversationService
 from app.main import app
 from app.mistakes.service import MistakeRecordService
@@ -40,8 +41,7 @@ class Env:
 @pytest.fixture
 def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_root: Path):
     monkeypatch.setattr(images, "ATTACHMENTS_ROOT", tmp_path / "attachments")
-    repository = ConversationRepository(tmp_path / "study.sqlite3")
-    repository.initialize()
+    repository = scoped_repository(tmp_path / "study.sqlite3")
     papers = PaperService(PaperRepository(sample_root))
     tutor = FakeTutor()
     records = MistakeRecordService(

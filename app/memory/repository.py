@@ -28,12 +28,19 @@ Correction = tuple[str | None, str | None, str | None]
 
 
 class MemoryRepository:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, owner_id: str) -> None:
+        if not owner_id:
+            raise ConversationStorageError("缺少用户身份，不能访问学习记忆。")
         self._db_path = Path(db_path)
+        self._owner_id = owner_id
 
     @property
     def db_path(self) -> Path:
         return self._db_path
+
+    @property
+    def owner_id(self) -> str:
+        return self._owner_id
 
     @contextmanager
     def _open(self) -> Iterator[sqlite3.Connection]:
@@ -69,7 +76,9 @@ class MemoryRepository:
     def corrections(self) -> dict[str, Correction]:
         with self._open() as connection:
             rows = connection.execute(
-                "SELECT entry_key, course, knowledge_point, note FROM memory_corrections"
+                "SELECT entry_key, course, knowledge_point, note "
+                "FROM memory_corrections WHERE owner_id = ?",
+                (self._owner_id,),
             ).fetchall()
         return {
             str(row["entry_key"]): (
@@ -83,31 +92,48 @@ class MemoryRepository:
     def exclusions(self) -> set[str]:
         with self._open() as connection:
             rows = connection.execute(
-                "SELECT entry_key FROM memory_exclusions"
+                "SELECT entry_key FROM memory_exclusions WHERE owner_id = ?",
+                (self._owner_id,),
             ).fetchall()
         return {str(row["entry_key"]) for row in rows}
 
     def is_excluded(self, entry_key: str) -> bool:
         with self._open() as connection:
             row = connection.execute(
-                "SELECT 1 FROM memory_exclusions WHERE entry_key = ?",
-                (entry_key,),
+                "SELECT 1 FROM memory_exclusions "
+                "WHERE owner_id = ? AND entry_key = ?",
+                (self._owner_id, entry_key),
             ).fetchone()
         return row is not None
 
     def entry_exists(self, kind: str, source_id: str) -> bool:
-        """确认 entry_key 指向的真实记录还在（删除后仍可用：见 is_excluded）。"""
+        """确认 entry_key 指向的真实记录仍在，且属于当前用户。"""
 
-        table, column = {
-            "exercise": ("exercises", "id"),
-            "attempt": ("exercise_attempts", "id"),
-            "selfreport": ("problems", "id"),
-        }.get(kind, (None, None))
+        table, column, join = {
+            "exercise": (
+                "exercises",
+                "id",
+                "JOIN conversations c ON c.id = exercises.conversation_id",
+            ),
+            "attempt": (
+                "exercise_attempts",
+                "id",
+                "JOIN exercises e ON e.id = exercise_attempts.exercise_id "
+                "JOIN conversations c ON c.id = e.conversation_id",
+            ),
+            "selfreport": (
+                "problems",
+                "id",
+                "JOIN conversations c ON c.id = problems.conversation_id",
+            ),
+        }.get(kind, (None, None, None))
         if table is None:
             return False
         with self._open() as connection:
             row = connection.execute(
-                f"SELECT 1 FROM {table} WHERE {column} = ?", (source_id,)
+                f"SELECT 1 FROM {table} {join} "
+                f"WHERE {table}.{column} = ? AND c.owner_id = ?",
+                (source_id, self._owner_id),
             ).fetchone()
         return row is not None
 
@@ -131,8 +157,8 @@ class MemoryRepository:
         with self._open() as connection:
             row = connection.execute(
                 "SELECT course, knowledge_point, note FROM memory_corrections "
-                "WHERE entry_key = ?",
-                (entry_key,),
+                "WHERE owner_id = ? AND entry_key = ?",
+                (self._owner_id, entry_key),
             ).fetchone()
             current: Correction = (
                 (row["course"], row["knowledge_point"], row["note"])
@@ -148,14 +174,14 @@ class MemoryRepository:
             )
             connection.execute(
                 "INSERT INTO memory_corrections "
-                "(entry_key, course, knowledge_point, note, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(entry_key) DO UPDATE SET "
+                "(owner_id, entry_key, course, knowledge_point, note, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(owner_id, entry_key) DO UPDATE SET "
                 "course = excluded.course, "
                 "knowledge_point = excluded.knowledge_point, "
                 "note = excluded.note, "
                 "updated_at = excluded.updated_at",
-                (entry_key, *merged, now, now),
+                (self._owner_id, entry_key, *merged, now, now),
             )
             connection.commit()
         return merged
@@ -166,9 +192,9 @@ class MemoryRepository:
         now = datetime.now(timezone.utc).isoformat()
         with self._open() as connection:
             cursor = connection.execute(
-                "INSERT INTO memory_exclusions (entry_key, reason, created_at) "
-                "VALUES (?, ?, ?) ON CONFLICT(entry_key) DO NOTHING",
-                (entry_key, reason, now),
+                "INSERT INTO memory_exclusions (owner_id, entry_key, reason, created_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(owner_id, entry_key) DO NOTHING",
+                (self._owner_id, entry_key, reason, now),
             )
             connection.commit()
             return cursor.rowcount > 0

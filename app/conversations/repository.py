@@ -315,16 +315,54 @@ class RevisionRow:
 
 
 class ConversationRepository:
-    """按数据库路径读写会话、题目、附件与错题记录；测试可注入临时路径。"""
+    """按数据库路径读写会话、题目、附件与错题记录；测试可注入临时路径。
 
-    def __init__(self, db_path: Path) -> None:
+    HTTP/Agent 必须使用 ``scoped(owner_id)`` 构造的实例。无 owner 的实例
+    只保留给启动维护与底层存储测试；``ConversationService`` 会拒绝它。
+    """
+
+    def __init__(self, db_path: Path, *, owner_id: str | None = None) -> None:
         self._db_path = db_path
+        self._owner_id = owner_id
         # 仅在不含 await 的短同步区间使用，允许业务写入与动作检查点原子提交。
         self._action_connection: ContextVar[sqlite3.Connection | None] = ContextVar("action_connection", default=None)
 
     @property
     def db_path(self) -> Path:
         return self._db_path
+
+    @property
+    def owner_id(self) -> str | None:
+        return self._owner_id
+
+    def scoped(self, owner_id: str) -> "ConversationRepository":
+        if not owner_id:
+            raise ConversationStorageError("缺少用户身份，不能访问学习数据。")
+        return ConversationRepository(self._db_path, owner_id=owner_id)
+
+    def _owner_filter(
+        self, table: str, *, column: str = "conversation_id"
+    ) -> tuple[str, tuple[object, ...]]:
+        """返回追加到 WHERE 的 owner 条件与参数。"""
+
+        if self._owner_id is None:
+            return "", ()
+        return (
+            f" AND EXISTS (SELECT 1 FROM conversations c "
+            f"WHERE c.id = {table}.{column} AND c.owner_id = ?)",
+            (self._owner_id,),
+        )
+
+    def _assert_conversation_owned(
+        self, connection: sqlite3.Connection, conversation_id: str
+    ) -> None:
+        sql = "SELECT 1 FROM conversations WHERE id = ?"
+        params: list[object] = [conversation_id]
+        if self._owner_id is not None:
+            sql += " AND owner_id = ?"
+            params.append(self._owner_id)
+        if connection.execute(sql, params).fetchone() is None:
+            raise ConversationNotFoundError("会话不存在。")
 
     # ------------------------------------------------------------------
     # 连接与事务
@@ -405,8 +443,12 @@ class ConversationRepository:
     # 初始化
     # ------------------------------------------------------------------
 
-    def initialize(self) -> None:
-        schema.initialize_database(self._db_path)
+    def initialize(
+        self, *, migration_owner: schema.SchemaOwner | None = None
+    ) -> None:
+        schema.initialize_database(
+            self._db_path, migration_owner=migration_owner
+        )
 
     @contextmanager
     def action_write(self) -> Iterator[None]:
@@ -443,10 +485,10 @@ class ConversationRepository:
         with self._write() as connection:
             connection.execute(
                 """
-                INSERT INTO conversations (id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO conversations (id, title, created_at, updated_at, owner_id)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (conversation_id, DEFAULT_TITLE, now, now),
+                (conversation_id, DEFAULT_TITLE, now, now, self._owner_id),
             )
         return ConversationSummary(
             id=conversation_id,
@@ -457,23 +499,25 @@ class ConversationRepository:
 
     def list_conversations(self) -> list[ConversationSummary]:
         with self._read() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, title, created_at, updated_at FROM conversations
-                ORDER BY updated_at DESC, id ASC
-                """
-            ).fetchall()
+            sql = (
+                "SELECT id, title, created_at, updated_at FROM conversations"
+            )
+            params: list[object] = []
+            if self._owner_id is not None:
+                sql += " WHERE owner_id = ?"
+                params.append(self._owner_id)
+            sql += " ORDER BY updated_at DESC, id ASC"
+            rows = connection.execute(sql, params).fetchall()
         return [self._row_to_summary(row) for row in rows]
 
     def get_conversation(self, conversation_id: str) -> ConversationSummary | None:
         with self._read() as connection:
-            row = connection.execute(
-                """
-                SELECT id, title, created_at, updated_at FROM conversations
-                WHERE id = ?
-                """,
-                (conversation_id,),
-            ).fetchone()
+            sql = "SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?"
+            params: list[object] = [conversation_id]
+            if self._owner_id is not None:
+                sql += " AND owner_id = ?"
+                params.append(self._owner_id)
+            row = connection.execute(sql, params).fetchone()
         return None if row is None else self._row_to_summary(row)
 
     # ------------------------------------------------------------------
@@ -539,8 +583,10 @@ class ConversationRepository:
 
         with self._write() as connection:
             conversation = connection.execute(
-                "SELECT title FROM conversations WHERE id = ?",
-                (conversation_id,),
+                "SELECT title FROM conversations WHERE id = ?"
+                + (" AND owner_id = ?" if self._owner_id is not None else ""),
+                (conversation_id,)
+                + ((self._owner_id,) if self._owner_id is not None else ()),
             ).fetchone()
             if conversation is None:
                 raise ConversationNotFoundError("会话不存在。")
@@ -790,14 +836,7 @@ class ConversationRepository:
     ) -> AttachmentRecord:
         now = _now()
         with self._write() as connection:
-            if (
-                connection.execute(
-                    "SELECT 1 FROM conversations WHERE id = ?",
-                    (conversation_id,),
-                ).fetchone()
-                is None
-            ):
-                raise ConversationNotFoundError("会话不存在。")
+            self._assert_conversation_owned(connection, conversation_id)
 
             pending = connection.execute(
                 "SELECT COUNT(*) FROM attachments "
@@ -843,13 +882,18 @@ class ConversationRepository:
         self, conversation_id: str, attachment_id: str
     ) -> AttachmentRecord | None:
         with self._read() as connection:
-            row = connection.execute(
-                """
+            sql = """
                 SELECT * FROM attachments
                 WHERE id = ? AND conversation_id = ?
-                """,
-                (attachment_id, conversation_id),
-            ).fetchone()
+            """
+            params: list[object] = [attachment_id, conversation_id]
+            if self._owner_id is not None:
+                sql += (
+                    " AND EXISTS (SELECT 1 FROM conversations c "
+                    "WHERE c.id = attachments.conversation_id AND c.owner_id = ?)"
+                )
+                params.append(self._owner_id)
+            row = connection.execute(sql, params).fetchone()
         return None if row is None else self._row_to_attachment(row)
 
     def validate_attachment_selection(
@@ -884,7 +928,7 @@ class ConversationRepository:
         for attachment_id, role in selected:
             attachment = self.get_attachment(conversation_id, attachment_id)
             if attachment is None:
-                raise AttachmentInvalidError("图片不存在或不属于当前会话。")
+                raise AttachmentNotFoundError("图片不存在。")
             if attachment.size_bytes > MAX_IMAGE_BYTES:
                 raise AttachmentTooLargeError("单张图片不能超过 6 MiB。")
             total += attachment.size_bytes
@@ -1078,20 +1122,23 @@ class ConversationRepository:
     _PROBLEM_SELECT = "SELECT * FROM problems"
 
     def get_active_problem(self, conversation_id: str) -> ProblemRecord | None:
+        owner_sql, owner_params = self._owner_filter("problems")
         with self._read() as connection:
             row = connection.execute(
-                f"{self._PROBLEM_SELECT} WHERE conversation_id = ? AND active = 1",
-                (conversation_id,),
+                f"{self._PROBLEM_SELECT} WHERE conversation_id = ? AND active = 1"
+                + owner_sql,
+                (conversation_id, *owner_params),
             ).fetchone()
             if row is None:
                 return None
             return self._row_to_problem(connection, row)
 
     def get_problem(self, problem_id: str) -> ProblemRecord | None:
+        owner_sql, owner_params = self._owner_filter("problems")
         with self._read() as connection:
             row = connection.execute(
-                f"{self._PROBLEM_SELECT} WHERE id = ?",
-                (problem_id,),
+                f"{self._PROBLEM_SELECT} WHERE id = ?" + owner_sql,
+                (problem_id, *owner_params),
             ).fetchone()
             if row is None:
                 return None
@@ -1651,6 +1698,7 @@ class ConversationRepository:
 
         now = _now()
         with self._write() as connection:
+            self._assert_conversation_owned(connection, snapshot.conversation_id)
             existing = self._find_record_by_root(
                 connection, snapshot.conversation_id, snapshot.root_problem_id
             )
@@ -1723,9 +1771,11 @@ class ConversationRepository:
         return record, created
 
     def get_record(self, record_id: str) -> RecordRow | None:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._read() as connection:
             row = connection.execute(
-                f"{self._RECORD_SELECT} WHERE id = ?", (record_id,)
+                f"{self._RECORD_SELECT} WHERE id = ?" + owner_sql,
+                (record_id, *owner_params),
             ).fetchone()
             if row is None:
                 return None
@@ -1740,17 +1790,22 @@ class ConversationRepository:
             )
 
     def list_records(self, *, limit: int, offset: int) -> tuple[list[RecordRow], int]:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._read() as connection:
             total = int(
-                connection.execute("SELECT COUNT(*) FROM mistake_records").fetchone()[0]
+                connection.execute(
+                    "SELECT COUNT(*) FROM mistake_records WHERE 1=1" + owner_sql,
+                    owner_params,
+                ).fetchone()[0]
             )
             rows = connection.execute(
                 f"""
                 {self._RECORD_SELECT}
+                WHERE 1=1 {owner_sql}
                 ORDER BY created_at DESC, id ASC
                 LIMIT ? OFFSET ?
                 """,
-                (limit, offset),
+                (*owner_params, limit, offset),
             ).fetchall()
             records = [self._row_to_record(connection, row) for row in rows]
         return records, total
@@ -1765,9 +1820,11 @@ class ConversationRepository:
         self_reported_understood: bool | None = None,
     ) -> RecordRow:
         now = _now()
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._write() as connection:
             row = connection.execute(
-                f"{self._RECORD_SELECT} WHERE id = ?", (record_id,)
+                f"{self._RECORD_SELECT} WHERE id = ?" + owner_sql,
+                (record_id, *owner_params),
             ).fetchone()
             if row is None:
                 raise MistakeRecordNotFoundError("错题记录不存在。")
@@ -1825,9 +1882,11 @@ class ConversationRepository:
         """
 
         now = _now()
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._write() as connection:
             row = connection.execute(
-                f"{self._RECORD_SELECT} WHERE id = ?", (record_id,)
+                f"{self._RECORD_SELECT} WHERE id = ?" + owner_sql,
+                (record_id, *owner_params),
             ).fetchone()
             if row is None:
                 raise MistakeRecordNotFoundError("错题记录不存在。")
@@ -1930,9 +1989,11 @@ class ConversationRepository:
         return [self._row_to_revision(row) for row in rows]
 
     def delete_record(self, record_id: str) -> None:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._write() as connection:
             cursor = connection.execute(
-                "DELETE FROM mistake_records WHERE id = ?", (record_id,)
+                "DELETE FROM mistake_records WHERE id = ?" + owner_sql,
+                (record_id, *owner_params),
             )
             if cursor.rowcount != 1:
                 raise MistakeRecordNotFoundError("错题记录不存在。")
@@ -1943,12 +2004,13 @@ class ConversationRepository:
         conversation_id: str,
         root_problem_id: str,
     ) -> RecordRow | None:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         row = connection.execute(
             f"""
             {self._RECORD_SELECT}
-            WHERE conversation_id = ? AND root_problem_id = ?
+            WHERE conversation_id = ? AND root_problem_id = ? {owner_sql}
             """,
-            (conversation_id, root_problem_id),
+            (conversation_id, root_problem_id, *owner_params),
         ).fetchone()
         return None if row is None else self._row_to_record(connection, row)
 
@@ -2323,17 +2385,15 @@ class ConversationRepository:
     # F006：完成动态轮次、练习管理与上下文
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _check_conversation_exists(
-        connection: sqlite3.Connection, conversation_id: str
+        self, connection: sqlite3.Connection, conversation_id: str
     ) -> None:
-        if (
-            connection.execute(
-                "SELECT 1 FROM conversations WHERE id = ?",
-                (conversation_id,),
-            ).fetchone()
-            is None
-        ):
+        sql = "SELECT 1 FROM conversations WHERE id = ?"
+        params: list[object] = [conversation_id]
+        if self._owner_id is not None:
+            sql += " AND owner_id = ?"
+            params.append(self._owner_id)
+        if connection.execute(sql, params).fetchone() is None:
             raise ConversationNotFoundError("会话不存在。")
 
     def update_turn_reply(
@@ -2810,9 +2870,16 @@ class ConversationRepository:
 
     def get_exercise_attempt(self, attempt_id: str) -> ExerciseAttemptRecord | None:
         with self._read() as connection:
-            row = connection.execute(
-                "SELECT * FROM exercise_attempts WHERE id = ?", (attempt_id,)
-            ).fetchone()
+            sql = "SELECT * FROM exercise_attempts WHERE id = ?"
+            params: list[object] = [attempt_id]
+            if self._owner_id is not None:
+                sql += (
+                    " AND EXISTS (SELECT 1 FROM exercises e "
+                    "JOIN conversations c ON c.id = e.conversation_id "
+                    "WHERE e.id = exercise_attempts.exercise_id AND c.owner_id = ?)"
+                )
+                params.append(self._owner_id)
+            row = connection.execute(sql, params).fetchone()
             if row is None:
                 return None
             attachments = self._load_attempt_attachments(
@@ -3110,9 +3177,10 @@ class ConversationRepository:
     def _find_exercise(
         self, connection: sqlite3.Connection, exercise_id: str
     ) -> ExerciseRecord | None:
+        owner_sql, owner_params = self._owner_filter("exercises")
         row = connection.execute(
-            "SELECT * FROM exercises WHERE id = ?",
-            (exercise_id,),
+            "SELECT * FROM exercises WHERE id = ?" + owner_sql,
+            (exercise_id, *owner_params),
         ).fetchone()
         if row is None:
             return None
@@ -3386,10 +3454,16 @@ class ConversationRepository:
 
     def get_context(self, conversation_id: str) -> ContextRecord | None:
         with self._read() as connection:
-            row = connection.execute(
-                "SELECT * FROM conversation_contexts WHERE conversation_id = ?",
-                (conversation_id,),
-            ).fetchone()
+            sql = "SELECT * FROM conversation_contexts WHERE conversation_id = ?"
+            params: list[object] = [conversation_id]
+            if self._owner_id is not None:
+                sql += (
+                    " AND EXISTS (SELECT 1 FROM conversations c "
+                    "WHERE c.id = conversation_contexts.conversation_id "
+                    "AND c.owner_id = ?)"
+                )
+                params.append(self._owner_id)
+            row = connection.execute(sql, params).fetchone()
             if row is None:
                 return None
             return self._row_to_context(row)
@@ -3599,11 +3673,12 @@ class ConversationRepository:
             return self._row_to_question_selection(row)
 
     def get_active_question(self, conversation_id: str) -> QuestionSelection | None:
+        owner_sql, owner_params = self._owner_filter("question_selections")
         with self._read() as connection:
             row = connection.execute(
                 "SELECT * FROM question_selections "
-                "WHERE conversation_id = ? AND active = 1",
-                (conversation_id,),
+                "WHERE conversation_id = ? AND active = 1" + owner_sql,
+                (conversation_id, *owner_params),
             ).fetchone()
         return None if row is None else self._row_to_question_selection(row)
 
@@ -3689,25 +3764,31 @@ class ConversationRepository:
     def get_question_selection(
         self, conversation_id: str, question_id: str, *, build_id: str | None = None
     ) -> QuestionSelection | None:
+        owner_sql, owner_params = self._owner_filter("question_selections")
         with self._read() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM question_selections
                 WHERE conversation_id = ? AND question_id = ?
                   AND (? IS NULL OR build_id = ?)
+                """
+                + owner_sql
+                + """
                 ORDER BY created_at DESC, rowid DESC LIMIT 1
                 """,
-                (conversation_id, question_id, build_id, build_id),
+                (conversation_id, question_id, build_id, build_id, *owner_params),
             ).fetchone()
         return None if row is None else self._row_to_question_selection(row)
 
     def get_question_selection_by_id(
         self, conversation_id: str, selection_id: str
     ) -> QuestionSelection | None:
+        owner_sql, owner_params = self._owner_filter("question_selections")
         with self._read() as connection:
             row = connection.execute(
-                "SELECT * FROM question_selections WHERE id = ? AND conversation_id = ?",
-                (selection_id, conversation_id),
+                "SELECT * FROM question_selections WHERE id = ? AND conversation_id = ?"
+                + owner_sql,
+                (selection_id, conversation_id, *owner_params),
             ).fetchone()
         return None if row is None else self._row_to_question_selection(row)
 
@@ -3725,14 +3806,18 @@ class ConversationRepository:
         """
 
         with self._read() as connection:
+            owner_sql, owner_params = self._owner_filter("question_selections")
             row = connection.execute(
                 """
                 SELECT * FROM question_selections
                 WHERE conversation_id = ? AND question_id = ?
                   AND build_id = ? AND content_sha256 = ?
+                """
+                + owner_sql
+                + """
                 ORDER BY created_at ASC, rowid ASC LIMIT 1
                 """,
-                (conversation_id, question_id, build_id, content_sha256),
+                (conversation_id, question_id, build_id, content_sha256, *owner_params),
             ).fetchone()
         return None if row is None else self._row_to_question_selection(row)
 
@@ -3740,10 +3825,12 @@ class ConversationRepository:
         self, conversation_id: str, selection_id: str
     ) -> QuestionSelection | None:
         now = _now()
+        owner_sql, owner_params = self._owner_filter("question_selections")
         with self._write() as connection:
             row = connection.execute(
-                "SELECT * FROM question_selections WHERE id = ? AND conversation_id = ?",
-                (selection_id, conversation_id),
+                "SELECT * FROM question_selections WHERE id = ? AND conversation_id = ?"
+                + owner_sql,
+                (selection_id, conversation_id, *owner_params),
             ).fetchone()
             if row is None:
                 return None
@@ -3772,15 +3859,19 @@ class ConversationRepository:
         """只记录首次开放答案的事实；重复查看不覆盖首次时间与来源。"""
 
         now = _now()
+        owner_sql, owner_params = self._owner_filter("question_selections")
         with self._write() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM question_selections
                 WHERE conversation_id = ? AND question_id = ?
                   AND (? IS NULL OR id = ?)
+                """
+                + owner_sql
+                + """
                 ORDER BY created_at DESC, rowid DESC LIMIT 1
                 """,
-                (conversation_id, question_id, selection_id, selection_id),
+                (conversation_id, question_id, selection_id, selection_id, *owner_params),
             ).fetchone()
             if row is None:
                 return None
@@ -3802,6 +3893,35 @@ class ConversationRepository:
     def bind_question_problem(self, selection_id: str, problem_id: str) -> None:
         now = _now()
         with self._write() as connection:
+            owner = self._owner_id
+            if owner is None:
+                selection_row = connection.execute(
+                    "SELECT conversation_id FROM question_selections WHERE id = ?",
+                    (selection_id,),
+                ).fetchone()
+                problem_row = connection.execute(
+                    "SELECT conversation_id FROM problems WHERE id = ?",
+                    (problem_id,),
+                ).fetchone()
+            else:
+                selection_row = connection.execute(
+                    "SELECT qs.conversation_id FROM question_selections qs "
+                    "JOIN conversations c ON c.id = qs.conversation_id "
+                    "WHERE qs.id = ? AND c.owner_id = ?",
+                    (selection_id, owner),
+                ).fetchone()
+                problem_row = connection.execute(
+                    "SELECT p.conversation_id FROM problems p "
+                    "JOIN conversations c ON c.id = p.conversation_id "
+                    "WHERE p.id = ? AND c.owner_id = ?",
+                    (problem_id, owner),
+                ).fetchone()
+            if selection_row is None:
+                raise ConversationNotFoundError("题目选中记录不存在。")
+            if problem_row is None:
+                raise ProblemNotFoundError("题目不存在。")
+            if selection_row["conversation_id"] != problem_row["conversation_id"]:
+                raise ProblemNotFoundError("题目不属于当前会话。")
             connection.execute(
                 "UPDATE question_selections SET problem_id = ?, updated_at = ? WHERE id = ?",
                 (problem_id, now, selection_id),
@@ -3812,8 +3932,11 @@ class ConversationRepository:
     ) -> None:
         """来源查看事实存入已有选择快照，不改变题面、活动目标或数据库版本。"""
         with self._write() as connection:
+            owner_sql, owner_params = self._owner_filter("question_selections")
             row = connection.execute(
-                "SELECT snapshot_json FROM question_selections WHERE id = ?", (selection_id,)
+                "SELECT snapshot_json FROM question_selections WHERE id = ?"
+                + owner_sql,
+                (selection_id, *owner_params),
             ).fetchone()
             if row is None:
                 raise ConversationStorageError(_STORAGE_MESSAGE)
@@ -3838,6 +3961,7 @@ class ConversationRepository:
         now = _now()
         snapshot_json = json.dumps(card.public_snapshot(), ensure_ascii=False)
         with self._write() as connection:
+            self._get_exercise(connection, exercise_id)
             connection.execute(
                 """
                 INSERT INTO exercise_question_sources (
@@ -3878,10 +4002,17 @@ class ConversationRepository:
         self, exercise_id: str
     ) -> ExerciseSourceView | None:
         with self._read() as connection:
-            row = connection.execute(
-                "SELECT * FROM exercise_question_sources WHERE exercise_id = ?",
-                (exercise_id,),
-            ).fetchone()
+            sql = "SELECT * FROM exercise_question_sources WHERE exercise_id = ?"
+            params: list[object] = [exercise_id]
+            if self._owner_id is not None:
+                sql += (
+                    " AND EXISTS (SELECT 1 FROM exercises e "
+                    "JOIN conversations c ON c.id = e.conversation_id "
+                    "WHERE e.id = exercise_question_sources.exercise_id "
+                    "AND c.owner_id = ?)"
+                )
+                params.append(self._owner_id)
+            row = connection.execute(sql, params).fetchone()
         if row is None:
             return None
         snapshot: dict[str, Any] = {}
@@ -3909,6 +4040,13 @@ class ConversationRepository:
     ) -> None:
         now = _now()
         with self._write() as connection:
+            owner_sql, owner_params = self._owner_filter("mistake_records")
+            exists = connection.execute(
+                "SELECT 1 FROM mistake_records WHERE id = ?" + owner_sql,
+                (record_id, *owner_params),
+            ).fetchone()
+            if exists is None:
+                raise MistakeRecordNotFoundError("错题记录不存在。")
             connection.execute(
                 """
                 INSERT INTO record_question_sources (
@@ -3935,10 +4073,17 @@ class ConversationRepository:
 
     def get_record_question_source(self, record_id: str) -> RecordSourceView | None:
         with self._read() as connection:
-            row = connection.execute(
-                "SELECT * FROM record_question_sources WHERE record_id = ?",
-                (record_id,),
-            ).fetchone()
+            sql = "SELECT * FROM record_question_sources WHERE record_id = ?"
+            params: list[object] = [record_id]
+            if self._owner_id is not None:
+                sql += (
+                    " AND EXISTS (SELECT 1 FROM mistake_records r "
+                    "JOIN conversations c ON c.id = r.conversation_id "
+                    "WHERE r.id = record_question_sources.record_id "
+                    "AND c.owner_id = ?)"
+                )
+                params.append(self._owner_id)
+            row = connection.execute(sql, params).fetchone()
         if row is None:
             return None
         return RecordSourceView(

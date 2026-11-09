@@ -10,17 +10,20 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api.attachments import router as attachments_router
+from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
 from app.api.memory import router as memory_router
 from app.api.mistakes import router as mistakes_router
 from app.api.papers import router as papers_router
 from app.api.query import router as query_router
-from app.config import load_config_state
+from app.auth.dependencies import require_user
+from app.auth.service import AuthService, AuthSettings
+from app.config import load_auth_config_state, load_config_state
 from app.conversations.errors import (
     ActiveProblemConflictError,
     AttachmentInvalidError,
@@ -58,8 +61,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
 
     app.state.query_config = load_config_state()
+    app.state.auth_config = load_auth_config_state()
     app.state.conversation_store = build_store_state()
     app.state.question_runtime = build_question_runtime()
+    store = app.state.conversation_store
+    auth_config = app.state.auth_config
+    app.state.auth_service = None
+    if (
+        store.db_path is not None
+        and store.error is None
+        and auth_config.error is None
+    ):
+        app.state.auth_service = AuthService(
+            store.db_path,
+            AuthSettings(
+                cookie_name=auth_config.cookie_name,
+                cookie_secure=auth_config.cookie_secure,
+                session_ttl_days=auth_config.session_ttl_days,
+                allowed_origins=auth_config.allowed_origins,
+            ),
+        )
+        try:
+            app.state.auth_service.prune_sessions()
+        except Exception:
+            pass
     try:
         yield
     finally:
@@ -79,11 +104,22 @@ app = FastAPI(
 # 统一在 /api 下对外暴露；前端开发时由 Vite 代理到同一路径。
 app.include_router(health_router, prefix="/api")
 app.include_router(papers_router, prefix="/api")
-app.include_router(query_router, prefix="/api")
-app.include_router(conversations_router, prefix="/api")
-app.include_router(attachments_router, prefix="/api")
-app.include_router(mistakes_router, prefix="/api")
-app.include_router(memory_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
+app.include_router(
+    query_router, prefix="/api", dependencies=[Depends(require_user)]
+)
+app.include_router(
+    conversations_router, prefix="/api", dependencies=[Depends(require_user)]
+)
+app.include_router(
+    attachments_router, prefix="/api", dependencies=[Depends(require_user)]
+)
+app.include_router(
+    mistakes_router, prefix="/api", dependencies=[Depends(require_user)]
+)
+app.include_router(
+    memory_router, prefix="/api", dependencies=[Depends(require_user)]
+)
 
 
 def _detail_response(status_code: int, message: str) -> JSONResponse:

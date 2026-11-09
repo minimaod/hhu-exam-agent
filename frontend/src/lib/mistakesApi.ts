@@ -11,6 +11,7 @@ import type {
   Step,
 } from "./conversationsApi.ts";
 import { createSseParser } from "./sseParser.ts";
+import { apiFetch } from "./apiFetch.ts";
 
 const PATH = "/api/mistake-records";
 
@@ -277,7 +278,7 @@ export async function listMistakeRecords(
   params.set("offset", String(options.offset ?? 0));
   let response: Response;
   try {
-    response = await fetch(`${PATH}?${params}`, {
+    response = await apiFetch(`${PATH}?${params}`, {
       headers: { Accept: "application/json" },
       cache: "no-store",
       signal,
@@ -302,7 +303,7 @@ export async function getMistakeRecord(
 ): Promise<MistakeRecordDetail> {
   let response: Response;
   try {
-    response = await fetch(`${PATH}/${encodeURIComponent(recordId)}`, {
+    response = await apiFetch(`${PATH}/${encodeURIComponent(recordId)}`, {
       headers: { Accept: "application/json" },
       cache: "no-store",
       signal,
@@ -329,7 +330,7 @@ export async function updateMistakeRecord(
 ): Promise<MistakeRecordDetail> {
   let response: Response;
   try {
-    response = await fetch(`${PATH}/${encodeURIComponent(recordId)}`, {
+    response = await apiFetch(`${PATH}/${encodeURIComponent(recordId)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(patch),
@@ -349,7 +350,7 @@ export async function updateMistakeRecord(
 export async function deleteMistakeRecord(recordId: string): Promise<void> {
   let response: Response;
   try {
-    response = await fetch(`${PATH}/${encodeURIComponent(recordId)}`, {
+    response = await apiFetch(`${PATH}/${encodeURIComponent(recordId)}`, {
       method: "DELETE",
       headers: { Accept: "application/json" },
       cache: "no-store",
@@ -374,7 +375,7 @@ export async function adoptProblem(
 ): Promise<MistakeRecordDetail> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${PATH}/${encodeURIComponent(recordId)}/adopt-problem`,
       {
         method: "POST",
@@ -509,7 +510,7 @@ export async function streamRecordCorrection(
 
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${PATH}/${encodeURIComponent(options.recordId)}/corrections`,
       {
         method: "POST",

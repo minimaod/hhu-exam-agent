@@ -122,3 +122,63 @@ def load_config_state() -> QueryConfigState:
         return QueryConfigState(settings=load_query_settings(), error=None)
     except QueryConfigError as exc:
         return QueryConfigState(settings=None, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# F012：登录会话与 CSRF 配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_SESSION_TTL_DAYS = 14
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://127.0.0.1:18080",
+    "http://localhost:18080",
+)
+
+
+@dataclass(frozen=True)
+class AuthConfigState:
+    cookie_name: str = "hhu_session"
+    cookie_secure: bool = False
+    session_ttl_days: int = DEFAULT_SESSION_TTL_DAYS
+    allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
+    error: str | None = None
+
+
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("HHU_COOKIE_SECURE 只接受 true/false。")
+
+
+def load_auth_config_state() -> AuthConfigState:
+    """读取登录 Cookie 配置；非法值不阻止健康检查/试卷，但认证返回 503。"""
+
+    source = _SettingsSource(ENV_FILE)
+    try:
+        cookie_secure = _parse_bool(source.get("HHU_COOKIE_SECURE"), False)
+        ttl_raw = source.get("HHU_SESSION_TTL_DAYS")
+        ttl = DEFAULT_SESSION_TTL_DAYS if not ttl_raw else int(ttl_raw)
+        if not 1 <= ttl <= 365:
+            raise ValueError("HHU_SESSION_TTL_DAYS 必须在 1–365 之间。")
+        origins_raw = source.get("HHU_ALLOWED_ORIGINS")
+        origins = (
+            tuple(
+                item.strip().rstrip("/")
+                for item in origins_raw.split(",")
+                if item.strip()
+            )
+            if origins_raw
+            else DEFAULT_ALLOWED_ORIGINS
+        )
+        return AuthConfigState(
+            cookie_secure=cookie_secure,
+            session_ttl_days=ttl,
+            allowed_origins=origins,
+        )
+    except (ValueError, QueryConfigError) as exc:
+        return AuthConfigState(error=f"登录配置无效：{exc}")

@@ -2,6 +2,7 @@
 
 import { readErrorDetail } from "./papersApi.ts";
 import type { AttachmentMeta } from "./conversationsApi.ts";
+import { apiFetch } from "./apiFetch.ts";
 
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 const ALLOWED = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
@@ -48,7 +49,7 @@ export async function uploadAttachment(
 
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `/api/conversations/${encodeURIComponent(conversationId)}/attachments`,
       {
         method: "POST",

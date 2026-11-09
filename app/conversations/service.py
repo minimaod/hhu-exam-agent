@@ -38,6 +38,7 @@ from app.conversations.models import (
     ConversationDetail,
     ConversationListResponse,
     ConversationSummary,
+    ExerciseView,
     RecordRef,
     SuggestionItem,
     TurnErrorEvent,
@@ -126,7 +127,12 @@ class ConversationService(
         memory: Any | None = None,
         attachments_root: Path = ATTACHMENTS_ROOT,
         question_runtime: QuestionRuntime | None = None,
+        allow_unscoped: bool = False,
     ) -> None:
+        if repository.owner_id is None and not allow_unscoped:
+            raise ConversationStorageError(
+                "缺少用户身份，不能创建业务会话服务。"
+            )
         self._repository = repository
         self._make_query = make_query
         self._query_error = query_error
@@ -157,6 +163,10 @@ class ConversationService(
 
     def get_active_problem(self, conversation_id: str) -> ProblemRecord | None:
         return self._repository.get_active_problem(conversation_id)
+
+    def _require_owned_conversation(self, conversation_id: str) -> None:
+        if self._repository.get_conversation(conversation_id) is None:
+            raise ConversationNotFoundError("会话不存在。")
 
     def create_conversation(self) -> ConversationSummary:
         return self._repository.create_conversation()
@@ -224,6 +234,15 @@ class ConversationService(
             record=record_ref,
         )
 
+    def reveal_exercise_solution(
+        self, conversation_id: str, exercise_id: str
+    ) -> ExerciseView:
+        self._require_owned_conversation(conversation_id)
+        ex = self._repository.reveal_exercise_solution(
+            exercise_id, conversation_id=conversation_id
+        )
+        return self._build_exercise_view(ex, allow_solution=True)
+
     async def regenerate_reply(
         self, conversation_id: str, request_id: str
     ) -> dict[str, Any]:
@@ -233,6 +252,7 @@ class ConversationService(
         这里只复用当时的正文材料重新写一遍，因此不会产生重复副作用。
         """
 
+        self._require_owned_conversation(conversation_id)
         turn = self._repository.find_turn(conversation_id, request_id)
         if turn is None:
             raise ConversationNotFoundError("该轮次不存在。")

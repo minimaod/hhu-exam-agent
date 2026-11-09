@@ -250,9 +250,6 @@ async def correct_record(
     request: Request,
     records: RecordsDep,
 ) -> StreamingResponse:
-    if not records.tutoring_available():
-        raise TutoringUnavailableError("辅导模型尚未配置。")
-
     correction = CorrectionInput(
         statement_text=payload.statement_text,
         attachments=(
@@ -265,6 +262,9 @@ async def correct_record(
         solution_text=payload.solution_text,
     )
     records.validate_correction(str(record_id), correction)
+    if not records.tutoring_available():
+        raise TutoringUnavailableError("辅导模型尚未配置。")
+
     request_input = records.correction_input(correction)
 
     replay = records.find_correction_replay(

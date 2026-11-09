@@ -462,8 +462,9 @@ def test_stopping_marks_undone_turn_interrupted(
 
 
 def test_startup_marks_stale_running_turn_interrupted(study_db_path: Path) -> None:
-    repository = ConversationRepository(study_db_path)
-    repository.initialize()
+    from tests.f012_support import scoped_repository
+
+    repository = scoped_repository(study_db_path)
     conversation = repository.create_conversation()
     repository.start_turn(conversation.id, REQUEST_ONE, "我要复习高数")
 
@@ -585,9 +586,9 @@ def test_turn_response_has_no_key_or_disk_path(
 def _db_path_for(client: TestClient) -> Path:
     """读取当前测试实际使用的隔离数据库路径。"""
 
-    repository = app.state.conversation_store.repository
-    assert repository is not None
-    return repository.db_path
+    path = app.state.conversation_store.db_path
+    assert path is not None
+    return path
 
 
 def test_corrupt_stored_snapshot_returns_503(install_service, study_db_path: Path) -> None:

@@ -69,6 +69,7 @@ class QuestionFlowMixin:
     def question_asset(
         self, conversation_id: str, question_id: str, asset_id: str, build_id: str
     ):
+        self._require_owned_conversation(conversation_id)
         try:
             selection = self._require_question_selection(
                 conversation_id, question_id, build_id
@@ -88,6 +89,7 @@ class QuestionFlowMixin:
         self, conversation_id: str, question_id: str, build_id: str, kind: str, page: int
     ):
         """用户主动打开来源：验证原卷后才记查看事实，不改变当前选题。"""
+        self._require_owned_conversation(conversation_id)
         card = self._find_candidate_card(conversation_id, question_id, build_id)
         if card is None:
             raise QuestionNotFoundError("该来源不属于当前会话的题目。")
@@ -114,6 +116,7 @@ class QuestionFlowMixin:
     def question_answer(
         self, conversation_id: str, question_id: str, build_id: str
     ) -> QuestionCard:
+        self._require_owned_conversation(conversation_id)
         selection = self._require_question_selection(
             conversation_id, question_id, build_id
         )

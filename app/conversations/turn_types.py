@@ -115,13 +115,21 @@ class _AttemptPlan:
 
 @dataclass(frozen=True)
 class ConversationStoreState:
-    """启动时固定的数据库状态；存储不可用不阻止应用启动。"""
+    """启动时固定的数据库状态；存储不可用不阻止应用启动。
 
-    repository: ConversationRepository | None
+    这里只保留数据库路径，不把全库仓库交给 HTTP/Agent；请求依赖会按当前
+    用户构造 scoped 仓库。
+    """
+
+    db_path: Path | None
     error: str | None
 
 def build_store_state() -> ConversationStoreState:
-    """启动时调用：初始化数据库、恢复遗留轮次、清理过期待提交附件。"""
+    """启动时调用：初始化数据库、恢复遗留轮次、清理过期待提交附件。
+
+    旧库不会被自动升级：没有迁移管理员时返回错误，学习/认证接口 503，
+    健康检查与试卷目录仍可用。
+    """
 
     raw_path = os.environ.get("HHU_STUDY_DB")
     db_path = (
@@ -134,7 +142,7 @@ def build_store_state() -> ConversationStoreState:
         repository.initialize()
     except ConversationStorageError as exc:
         logger.warning("本地学习数据库不可用：%s", exc)
-        return ConversationStoreState(repository=None, error=str(exc))
+        return ConversationStoreState(db_path=db_path, error=str(exc))
 
     try:
         cutoff = (
@@ -145,7 +153,7 @@ def build_store_state() -> ConversationStoreState:
     except Exception:
         logger.warning("清理过期待提交附件失败，不影响应用启动。", exc_info=True)
 
-    return ConversationStoreState(repository=repository, error=None)
+    return ConversationStoreState(db_path=db_path, error=None)
 
 @dataclass(frozen=True)
 class ReplayTurn:

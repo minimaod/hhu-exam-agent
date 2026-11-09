@@ -1,3 +1,4 @@
+import { apiFetch } from "./apiFetch.ts";
 /**
  * F009 学习记忆接口。
  *
@@ -161,7 +162,7 @@ async function readDetail(response: Response): Promise<string> {
 async function request(path: string, init?: RequestInit): Promise<unknown> {
   let response: Response;
   try {
-    response = await fetch(path, init);
+    response = await apiFetch(path, init);
   } catch {
     throw new MemoryApiError("无法连接后端服务，请确认服务已启动。");
   }

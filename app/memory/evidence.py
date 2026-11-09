@@ -321,6 +321,7 @@ def _course_from_paper(
 def collect_evidence(
     connection: sqlite3.Connection,
     *,
+    owner_id: str,
     course: str | None,
     paper_lookup: PaperLookup,
     normalizer: KnowledgeNormalizer,
@@ -331,14 +332,11 @@ def collect_evidence(
     days: int = 30,
     limit: int = 50,
 ) -> EvidenceBundle:
-    """投影指定课程在时间窗内的证据；未知归属的条目单独返回。
-
-    ``course`` 为空表示“还没有选定课程”：此时不返回任何课程内容，只返回
-    待确认归属的条目，避免把多门课混成一份摘要。
-    """
+    """投影指定课程在时间窗内的证据；未知归属的条目单独返回。"""
 
     all_entries = collect_all(
         connection,
+        owner_id=owner_id,
         paper_lookup=paper_lookup,
         normalizer=normalizer,
         corrections=corrections,
@@ -358,6 +356,7 @@ def collect_evidence(
 def collect_all(
     connection: sqlite3.Connection,
     *,
+    owner_id: str,
     paper_lookup: PaperLookup,
     normalizer: KnowledgeNormalizer,
     corrections: dict[str, tuple[Any, Any, Any]],
@@ -369,12 +368,17 @@ def collect_all(
     newest_version = {
         str(row["root_problem_id"]): int(row["max_version"])
         for row in connection.execute(
-            "SELECT root_problem_id, MAX(version) AS max_version "
-            "FROM problems GROUP BY root_problem_id"
+            "SELECT p.root_problem_id, MAX(p.version) AS max_version "
+            "FROM problems p JOIN conversations c ON c.id = p.conversation_id "
+            "WHERE c.owner_id = ? GROUP BY p.root_problem_id",
+            (owner_id,),
         ).fetchall()
     }
     record_rows = connection.execute(
-        "SELECT id, problem_id FROM mistake_records WHERE problem_id IS NOT NULL"
+        "SELECT r.id, r.problem_id FROM mistake_records r "
+        "JOIN conversations c ON c.id = r.conversation_id "
+        "WHERE r.problem_id IS NOT NULL AND c.owner_id = ?",
+        (owner_id,),
     ).fetchall()
     record_by_problem = {str(row["problem_id"]): str(row["id"]) for row in record_rows}
 
@@ -387,9 +391,12 @@ def collect_all(
         "q.question_id, q.paper_id AS question_paper_id, "
         "q.build_id, q.snapshot_json "
         "FROM exercises e "
+        "JOIN conversations c ON c.id = e.conversation_id "
         "LEFT JOIN problems p ON p.id = e.problem_id "
         "LEFT JOIN exercise_question_sources q ON q.exercise_id = e.id "
-        "ORDER BY e.created_at DESC"
+        "WHERE c.owner_id = ? "
+        "ORDER BY e.created_at DESC",
+        (owner_id,),
     ).fetchall()
     attempts = _attempt_rows(connection, [str(row["id"]) for row in exercise_rows])
 
@@ -423,9 +430,11 @@ def collect_all(
         "SELECT p.id, p.conversation_id, p.root_problem_id, p.version, "
         "p.source_type, p.paper_id, p.source_title, p.statement_text, "
         "p.explanation_json, p.updated_at "
-        "FROM problems p WHERE p.self_reported_understood = 1 "
+        "FROM problems p JOIN conversations c ON c.id = p.conversation_id "
+        "WHERE p.self_reported_understood = 1 AND c.owner_id = ? "
         "AND NOT EXISTS (SELECT 1 FROM exercises e WHERE e.problem_id = p.id) "
-        "ORDER BY p.updated_at DESC"
+        "ORDER BY p.updated_at DESC",
+        (owner_id,),
     ).fetchall()
     for row in selfreport_rows:
         entry = _selfreport_entry(

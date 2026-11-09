@@ -13,6 +13,7 @@ import {
   type ResultEvent,
 } from "./queryApi.ts";
 import { createSseParser } from "./sseParser.ts";
+import { apiFetch } from "./apiFetch.ts";
 
 const CONVERSATIONS_PATH = "/api/conversations";
 const MAX_QUERY_LENGTH = 2000;
@@ -1169,7 +1170,7 @@ export async function createConversation(
 ): Promise<ConversationSummary> {
   let response: Response;
   try {
-    response = await fetch(CONVERSATIONS_PATH, {
+    response = await apiFetch(CONVERSATIONS_PATH, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: "{}",
@@ -1196,7 +1197,7 @@ export async function listConversations(
 ): Promise<ConversationListResponse> {
   let response: Response;
   try {
-    response = await fetch(CONVERSATIONS_PATH, {
+    response = await apiFetch(CONVERSATIONS_PATH, {
       method: "GET",
       headers: { Accept: "application/json" },
       cache: "no-store",
@@ -1223,7 +1224,7 @@ export async function getConversation(
 ): Promise<ConversationDetail> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}`,
       {
         method: "GET",
@@ -1584,7 +1585,7 @@ export async function streamTurn(
 
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(options.conversationId)}/turns`,
       {
         method: "POST",
@@ -1706,7 +1707,7 @@ export async function regenerateTurnReply(
 ): Promise<RegeneratedReply> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(requestId)}/reply`,
       {
         method: "POST",
@@ -1748,7 +1749,7 @@ export async function revealExerciseSolution(
 ): Promise<ExerciseView> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}/exercises/${encodeURIComponent(exerciseId)}/reveal`,
       {
         method: "POST",
