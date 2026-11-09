@@ -137,7 +137,7 @@ def build_store_state() -> ConversationStoreState:
         if raw_path
         else conversation_repository.DEFAULT_DB_PATH
     )
-    repository = ConversationRepository(db_path)
+    repository = ConversationRepository.for_maintenance(db_path)
     try:
         repository.initialize()
     except ConversationStorageError as exc:

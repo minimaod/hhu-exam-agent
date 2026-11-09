@@ -322,9 +322,16 @@ class ConversationRepository:
     只保留给启动维护与底层存储测试；``ConversationService`` 会拒绝它。
     """
 
-    def __init__(self, db_path: Path, *, owner_id: str | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        owner_id: str | None = None,
+        maintenance: bool = False,
+    ) -> None:
         self._db_path = db_path
         self._owner_id = owner_id
+        self._maintenance = maintenance
         # 仅在不含 await 的短同步区间使用，允许业务写入与动作检查点原子提交。
         self._action_connection: ContextVar[sqlite3.Connection | None] = ContextVar("action_connection", default=None)
 
@@ -340,6 +347,12 @@ class ConversationRepository:
         if not owner_id:
             raise ConversationStorageError("缺少用户身份，不能访问学习数据。")
         return ConversationRepository(self._db_path, owner_id=owner_id)
+
+    @classmethod
+    def for_maintenance(cls, db_path: Path) -> "ConversationRepository":
+        """仅供启动维护/迁移使用；不暴露给 HTTP/Agent。"""
+
+        return cls(db_path, maintenance=True)
 
     def _owner_filter(
         self, table: str, *, column: str = "conversation_id"
@@ -805,6 +818,32 @@ class ConversationRepository:
                 (now, conversation_id),
             )
 
+    def _assert_turn_refs(
+        self,
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        *,
+        problem_id: str | None = None,
+        exercise_id: str | None = None,
+        record_id: str | None = None,
+    ) -> None:
+        if problem_id is not None:
+            problem = self._get_problem(connection, problem_id)
+            if problem.conversation_id != conversation_id:
+                raise ProblemNotFoundError("题目不存在。")
+        if exercise_id is not None:
+            exercise = self._find_exercise(connection, exercise_id)
+            if exercise is None or exercise.conversation_id != conversation_id:
+                raise ProblemNotFoundError("练习题不存在。")
+        if record_id is not None:
+            row = connection.execute(
+                "SELECT 1 FROM mistake_records "
+                "WHERE id = ? AND conversation_id = ?",
+                (record_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                raise MistakeRecordNotFoundError("错题记录不存在。")
+
     def _complete_turn(
         self,
         connection: sqlite3.Connection,
@@ -818,6 +857,12 @@ class ConversationRepository:
         now: str,
     ) -> None:
         self._assert_conversation_owned(connection, conversation_id)
+        self._assert_turn_refs(
+            connection,
+            conversation_id,
+            problem_id=problem_id,
+            record_id=record_id,
+        )
         cursor = connection.execute(
             """
             UPDATE conversation_turns
@@ -1025,6 +1070,10 @@ class ConversationRepository:
     ) -> list[str]:
         """返回待清理附件的 stored_name；由调用方删除文件后再删行。"""
 
+        if not self._maintenance or self._owner_id is not None:
+            raise ConversationStorageError(
+                "附件清理只能由启动维护入口调用。"
+            )
         with self._read() as connection:
             rows = connection.execute(
                 """
@@ -1681,23 +1730,24 @@ class ConversationRepository:
     ) -> None:
         now = _now()
         with self._write() as connection:
+            target = self._get_problem(connection, problem.id)
             connection.execute(
-                "UPDATE problems SET updated_at = ? WHERE id = ?",
-                (now, problem.id),
+                "UPDATE problems SET updated_at = ? WHERE id = ? AND conversation_id = ?",
+                (now, target.id, target.conversation_id),
             )
             self._complete_turn(
                 connection,
-                problem.conversation_id,
+                target.conversation_id,
                 request_id,
                 output_json=output_json,
-                problem_id=problem.id,
+                problem_id=target.id,
                 kind="followup",
                 now=now,
             )
             self._append_record_followup(
                 connection,
-                conversation_id=problem.conversation_id,
-                root_problem_id=problem.root_problem_id,
+                conversation_id=target.conversation_id,
+                root_problem_id=target.root_problem_id,
                 question=question,
                 answer=answer,
                 created_at=now,
@@ -1712,22 +1762,23 @@ class ConversationRepository:
     ) -> None:
         now = _now()
         with self._write() as connection:
+            target = self._get_problem(connection, problem.id)
             connection.execute(
                 "UPDATE problems SET self_reported_understood = 1, updated_at = ? "
-                "WHERE id = ?",
-                (now, problem.id),
+                "WHERE id = ? AND conversation_id = ?",
+                (now, target.id, target.conversation_id),
             )
             self._complete_turn(
                 connection,
-                problem.conversation_id,
+                target.conversation_id,
                 request_id,
                 output_json=output_json,
-                problem_id=problem.id,
+                problem_id=target.id,
                 kind="feedback",
                 now=now,
             )
             record = self._find_record_by_root(
-                connection, problem.conversation_id, problem.root_problem_id
+                connection, target.conversation_id, target.root_problem_id
             )
             if record is not None:
                 feedback = dict(record.feedback)
@@ -2623,6 +2674,12 @@ class ConversationRepository:
 
         with self._write() as connection:
             self._assert_conversation_owned(connection, conversation_id)
+            self._assert_turn_refs(
+                connection,
+                conversation_id,
+                problem_id=problem_id,
+                exercise_id=exercise_id,
+            )
             previous = connection.execute(
                 "SELECT output_json FROM conversation_turns WHERE conversation_id=? AND request_id=?",
                 (conversation_id, request_id),

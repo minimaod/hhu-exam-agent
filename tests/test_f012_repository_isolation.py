@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from app.conversations import schema
 from app.conversations.errors import (
     AttachmentNotFoundError,
     ConversationNotFoundError,
+    ConversationStorageError,
     MistakeRecordNotFoundError,
     ProblemNotFoundError,
 )
@@ -477,3 +479,107 @@ def test_create_record_and_problem_reject_foreign_references(tmp_path: Path) -> 
             clarity="unclear",
             root_problem_id="p-a",
         )
+
+def test_complete_dynamic_turn_rejects_foreign_refs(tmp_path: Path) -> None:
+    db = _seed(tmp_path)
+    a_repo = ConversationRepository(db, owner_id=A)
+    b_repo = ConversationRepository(db, owner_id=B)
+    b_conv = b_repo.create_conversation().id
+    request = "22222222-2222-4222-8222-222222222222"
+    b_repo.start_turn(b_conv, request, "B 的轮次")
+
+    with pytest.raises(ProblemNotFoundError):
+        b_repo.complete_dynamic_turn(
+            b_conv, request, kind="dynamic", problem_id="p-a"
+        )
+    with pytest.raises(ProblemNotFoundError):
+        b_repo.complete_dynamic_turn(
+            b_conv, request, kind="dynamic", exercise_id="ex-a"
+        )
+    turn = b_repo.find_turn(b_conv, request)
+    assert turn is not None and turn.status == "running"
+
+    b_problem = b_repo.create_problem(
+        conversation_id=b_conv,
+        statement_text="B 的题",
+        status="awaiting_supplement",
+        clarity="unclear",
+    )
+    b_repo.complete_dynamic_turn(
+        b_conv,
+        request,
+        kind="dynamic",
+        problem_id=b_problem.id,
+        assistant_message="B 完成",
+    )
+    turn = b_repo.find_turn(b_conv, request)
+    assert turn is not None and turn.status == "completed"
+    assert turn.recovery is not None
+    assert a_repo.get_problem("p-a") is not None
+
+
+def test_feedback_and_followup_use_database_problem_owner(tmp_path: Path) -> None:
+    db = _seed(tmp_path)
+    a_repo = ConversationRepository(db, owner_id=A)
+    b_repo = ConversationRepository(db, owner_id=B)
+    a_problem = a_repo.get_problem("p-a")
+    assert a_problem is not None
+    b_conv = b_repo.create_conversation().id
+    forged = replace(a_problem, conversation_id=b_conv)
+    request = "33333333-3333-4333-8333-333333333333"
+    b_repo.start_turn(b_conv, request, "B 的反馈")
+    with pytest.raises(ProblemNotFoundError):
+        b_repo.save_feedback_turn(
+            problem=forged, request_id=request, output_json="{}"
+        )
+    turn = b_repo.find_turn(b_conv, request)
+    assert turn is not None and turn.status == "running"
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute(
+            "SELECT self_reported_understood FROM problems WHERE id='p-a'"
+        ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+    a_conv = a_repo.list_conversations()[0].id
+    from tests.test_conversation_store import build_result
+
+    a_repo.complete_turn(a_conv, REQUEST, build_result())
+    a_req = "44444444-4444-4444-8444-444444444444"
+    a_repo.start_turn(a_conv, a_req, "A 的反馈")
+    a_repo.save_feedback_turn(
+        problem=a_problem, request_id=a_req, output_json="{}"
+    )
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute(
+            "SELECT self_reported_understood FROM problems WHERE id='p-a'"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+    b_repo.interrupt_turn(b_conv, request)
+    b_repo.start_turn(b_conv, "55555555-5555-4555-8555-555555555555", "B 追问")
+    with pytest.raises(ProblemNotFoundError):
+        b_repo.save_followup_turn(
+            problem=forged,
+            request_id="55555555-5555-4555-8555-555555555555",
+            question="问",
+            answer="答",
+            output_json="{}",
+        )
+
+
+def test_cleanup_pending_attachments_is_maintenance_only(tmp_path: Path) -> None:
+    db = _seed(tmp_path)
+    b_repo = ConversationRepository(db, owner_id=B)
+    with pytest.raises(ConversationStorageError):
+        b_repo.cleanup_pending_attachments("2026-12-01T00:00:00+00:00")
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute(
+            "SELECT pending FROM attachments WHERE id='att-a'"
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()

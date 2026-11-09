@@ -104,7 +104,31 @@ async def test_exercise_solution_marker_never_reaches_next_reply_messages(
     harness = make_harness(tmp_path, cards=[card])
     conversation = harness.service.create_conversation().id
     now = datetime.now(timezone.utc)
+    harness.repo.create_problem(
+        conversation_id=conversation,
+        statement_text="写一个求和函数",
+        id="p-boundary",
+        status="awaiting_supplement",
+        clarity="unclear",
+    )
+    harness.repo.create_exercise(
+        id="ex-boundary",
+        conversation_id=conversation,
+        problem_id="p-boundary",
+        root_problem_id="p-boundary",
+        statement_text="写一个求和函数",
+        reference_solution_text=f"参考解答：{EXERCISE_MARKER}",
+        knowledge_point="循环",
+    )
     harness.repo.start_turn(conversation, "req-exercise", "看看这道练习", kind="dynamic")
+    import sqlite3
+
+    with sqlite3.connect(harness.db) as connection:
+        connection.execute(
+            "UPDATE exercises SET status='revealed', revealed_solution_at=? WHERE id='ex-boundary'",
+            (now.isoformat(),),
+        )
+        connection.commit()
     harness.repo.complete_dynamic_turn(
         conversation,
         "req-exercise",
