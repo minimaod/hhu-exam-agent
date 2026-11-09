@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.auth.errors import InviteInvalidError
@@ -219,6 +220,57 @@ def test_csrf_rejects_missing_header_and_bad_origin(anon_client: TestClient) -> 
         "/api/conversations", json={}, headers=TEST_CSRF_HEADERS
     )
     assert ok.status_code == 201
+
+
+def test_vite_origin_is_allowed_for_local_login(anon_client: TestClient) -> None:
+    db = _db_for(anon_client)
+    code = create_invite(db)
+    response = anon_client.post(
+        "/api/auth/register",
+        json={"invite_code": code, "username": "vite-user", "password": TEST_PASSWORD},
+        headers={
+            **TEST_CSRF_HEADERS,
+            "Origin": "http://127.0.0.1:5173",
+        },
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_login_failure_performs_one_slow_hash_equivalent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.auth.service import AuthService, AuthSettings
+
+    db = tmp_path / "study.sqlite3"
+    schema.initialize_database(db)
+    service = AuthService(db, AuthSettings())
+    _, code = service.create_invite()
+    service.register(invite_code=code, username="alice", password=TEST_PASSWORD)
+
+    calls = {"verify": 0, "dummy": 0}
+    original_verify = __import__("app.auth.service", fromlist=["verify_password"]).verify_password
+    original_dummy = __import__("app.auth.service", fromlist=["dummy_verify"]).dummy_verify
+
+    def verify(password, stored):
+        calls["verify"] += 1
+        return original_verify(password, stored)
+
+    def dummy(password):
+        calls["dummy"] += 1
+        return original_dummy(password)
+
+    monkeypatch.setattr("app.auth.service.verify_password", verify)
+    monkeypatch.setattr("app.auth.service.dummy_verify", dummy)
+    from app.auth.errors import InvalidCredentialsError
+
+    with pytest.raises(InvalidCredentialsError):
+        service.login(username="alice", password="wrong-password")
+    assert calls == {"verify": 1, "dummy": 0}
+
+    calls.update(verify=0, dummy=0)
+    with pytest.raises(InvalidCredentialsError):
+        service.login(username="nobody", password="wrong-password")
+    assert calls == {"verify": 0, "dummy": 1}
 
 
 def test_cookie_secure_flag_follows_config(

@@ -132,6 +132,8 @@ DEFAULT_SESSION_TTL_DAYS = 14
 DEFAULT_ALLOWED_ORIGINS = (
     "http://127.0.0.1:18080",
     "http://localhost:18080",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
 )
 
 

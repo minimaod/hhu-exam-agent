@@ -93,20 +93,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
-    try {
-      await apiLogout();
-    } finally {
-      if (user) {
-        try {
-          window.localStorage.removeItem(`${STORAGE_PREFIX}.${user.id}`);
-        } catch {
-          // 隐私模式下无法清理，不影响内存状态。
-        }
+    // 只有服务端确认退出（204/401）才切换界面；网络错误或 5xx 时保留
+    // 当前用户，避免服务端会话仍有效却在刷新后“自动登录”。
+    await apiLogout();
+    if (user) {
+      try {
+        window.localStorage.removeItem(`${STORAGE_PREFIX}.${user.id}`);
+      } catch {
+        // 隐私模式下无法清理，不影响内存状态。
       }
-      setUser(null);
-      setPhase("anonymous");
-      window.history.replaceState(null, "", "/login");
     }
+    setUser(null);
+    setPhase("anonymous");
+    window.history.replaceState(null, "", "/login");
   }, [user]);
 
   const retry = useCallback(() => setAttempt((value) => value + 1), []);

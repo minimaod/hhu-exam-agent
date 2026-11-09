@@ -139,50 +139,96 @@ def migrate_database(
     try:
         schema.initialize_database(db_path, migration_owner=owner)
     except ConversationStorageError as exc:
-        raise ConversationStorageError(
-            f"迁移失败，原库已回滚保留；备份：{backup_path}；原因：{exc}"
+        raise MigrationRolledBackError(
+            f"迁移事务已回滚，数据库仍为 v6；备份：{backup_path}；原因：{exc}"
         ) from exc
     try:
         conversations, memory_rows = _assert_v7(db_path)
     except ConversationStorageError as exc:
-        raise ConversationStorageError(
-            f"迁移已提交但提交后校验失败：{exc}；请从备份恢复：{backup_path}"
+        raise MigrationCommittedCheckError(
+            f"迁移已提交为 v7，但提交后校验失败：{exc}；请从备份恢复：{backup_path}"
         ) from exc
     return MigrationReport(
         7, False, backup_path, conversations, memory_rows
     )
 
 
+class MigrationRolledBackError(ConversationStorageError):
+    """迁移事务失败，原库仍为 v6。"""
+
+
+class MigrationCommittedCheckError(ConversationStorageError):
+    """事务已提交为 v7，但提交后校验失败。"""
+
+
 def restore_backup(backup_path: Path, db_path: Path) -> None:
-    """恢复备份，并清除目标旁的旧 WAL/SHM，避免旧日志覆盖新库。"""
+    """安全恢复：先复制并校验待恢复副本，再替换；失败恢复原库。"""
 
     if not backup_path.is_file():
         raise ConversationStorageError("备份文件不存在。")
-    check = sqlite3.connect(f"file:{backup_path.as_posix()}?mode=ro", uri=True)
-    try:
-        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise ConversationStorageError("备份完整性检查失败。")
-    finally:
-        check.close()
 
+    def check(path: Path) -> None:
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ConversationStorageError("数据库完整性检查失败。")
+        finally:
+            connection.close()
+
+    check(backup_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in ("-wal", "-shm"):
-        stale = Path(str(db_path) + suffix)
-        if stale.exists():
-            stale.unlink()
-
-    if db_path.exists():
-        pre = db_path.with_name(
-            f"{db_path.name}.pre-restore-{_now_tag()}"
-        )
-        os.replace(db_path, pre)
-
     temp = db_path.with_name(f"{db_path.name}.restore-tmp")
     if temp.exists():
         temp.unlink()
-    temp.write_bytes(backup_path.read_bytes())
-    os.replace(temp, db_path)
+    try:
+        temp.write_bytes(backup_path.read_bytes())
+        check(temp)
+    except Exception:
+        if temp.exists():
+            temp.unlink()
+        raise
 
+    pre: Path | None = None
+    pre_wal: Path | None = None
+    pre_shm: Path | None = None
+    try:
+        if db_path.exists():
+            # 先把当前库 WAL 中已提交的数据合并进主文件；失败则不动目标。
+            current = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                current.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            finally:
+                current.close()
+            pre = db_path.with_name(f"{db_path.name}.pre-restore-{_now_tag()}")
+            os.replace(db_path, pre)
+            for suffix, target in (("-wal", "wal"), ("-shm", "shm")):
+                source = Path(str(db_path) + suffix)
+                if source.exists():
+                    moved = Path(str(pre) + suffix)
+                    os.replace(source, moved)
+                    if target == "wal":
+                        pre_wal = moved
+                    else:
+                        pre_shm = moved
+        os.replace(temp, db_path)
+        check(db_path)
+    except Exception:
+        if temp.exists():
+            temp.unlink()
+        # 回滚：尽量把恢复前的库（含 WAL）放回原路径。
+        if pre is not None:
+            if db_path.exists():
+                failed = db_path.with_name(
+                    f"{db_path.name}.failed-restore-{_now_tag()}"
+                )
+                os.replace(db_path, failed)
+            os.replace(pre, db_path)
+            for moved, suffix in ((pre_wal, "-wal"), (pre_shm, "-shm")):
+                if moved is not None and moved.exists():
+                    os.replace(moved, Path(str(db_path) + suffix))
+        raise
+
+    # 新库旁不应残留旧日志；恢复前的库保留在 pre-restore 路径。
     for suffix in ("-wal", "-shm"):
         stale = Path(str(db_path) + suffix)
         if stale.exists():

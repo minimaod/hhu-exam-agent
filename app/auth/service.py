@@ -63,8 +63,10 @@ class AuthService:
             dummy_verify(password)
             raise InvalidCredentialsError(_INVALID_CREDENTIALS)
         stored = self._repository.get_password_hash(user.id)
-        if user.disabled or stored is None or not verify_password(password, stored):
+        if user.disabled or stored is None:
             dummy_verify(password)
+            raise InvalidCredentialsError(_INVALID_CREDENTIALS)
+        if not verify_password(password, stored):
             raise InvalidCredentialsError(_INVALID_CREDENTIALS)
         return user, self._issue(user)
 

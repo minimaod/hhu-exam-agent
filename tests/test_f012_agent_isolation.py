@@ -16,6 +16,7 @@ from app.conversations.errors import (
 )
 from app.conversations.repository import ConversationRepository
 from app.conversations.service import ConversationService, TurnInput
+from app.conversations.graph import SchedulerAgent
 from app.memory.models import MemoryCorrectionRequest
 from app.memory.service import LearningMemoryService
 from app.tutoring.models import Source
@@ -26,6 +27,8 @@ from tests.f012_support import (
     owner_snapshot,
     scoped_repository,
 )
+from tests.test_f010b_support import dummy_request, make_harness, turn_input
+from tests.tool_fakes import FakeToolModel, tool_call
 from tests.test_f012_route_matrix import _seed_a_world
 
 
@@ -165,3 +168,48 @@ def test_memory_correct_and_delete_are_owner_scoped(tmp_path: Path) -> None:
         )
     with pytest.raises(MemoryEntryNotFoundError):
         b_memory.delete("exercise", world["exercise"])
+
+
+@pytest.mark.anyio
+async def test_agent_tool_dispatch_rejects_a_workspace_reference(
+    tmp_path: Path,
+) -> None:
+    """真实 SchedulerAgent 走工具分发；B 的工作区没有 A 的 Q1 引用。"""
+
+    db = tmp_path / "study.sqlite3"
+    schema.initialize_database(db)
+    ensure_owner(db, "owner-a")
+    world = _seed_a_world(db, "owner-a")
+    before = owner_snapshot(db, "owner-a")
+
+    model = FakeToolModel(
+        [
+            {
+                "tool_calls": [
+                    tool_call("view_question_detail", {"ref": "Q1"}, call_id="c1")
+                ]
+            },
+            {"content": "这道题不在当前工作区。"},
+        ]
+    )
+    harness = make_harness(
+        tmp_path,
+        owner_id="owner-b",
+        scheduler=SchedulerAgent(model=model),
+    )
+    conversation = harness.service.create_conversation().id
+    prepared = harness.service.prepare_turn(
+        conversation, turn_input("看看第一题")
+    )
+    events = [
+        event
+        async for event in harness.service.stream_prepared(
+            prepared, dummy_request()
+        )
+    ]
+    result = next(event for event in events if event.type == "result")
+    assert result.composite_results
+    assert result.composite_results[0].status in ("failed", "clarification")
+    assert model.calls, "真实 SchedulerAgent 应至少调用一次工具模型"
+    assert owner_snapshot(db, "owner-a")["digest"] == before["digest"]
+    assert harness.service.list_conversations().total == 1

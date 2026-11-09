@@ -22,12 +22,33 @@ function Probe() {
   return (
     <div>
       <span>{current?.username ?? "guest"}</span>
-      <button type="button" onClick={() => void doLogout()}>
+      <button type="button" onClick={() => {
+        void doLogout().catch(() => undefined);
+      }}>
         logout
       </button>
     </div>
   );
 }
+
+test("退出失败时保留当前用户并允许重试", async () => {
+  fetchMe.mockResolvedValue(user);
+  logout.mockRejectedValueOnce(new Error("网络错误"));
+  window.history.replaceState(null, "", "/");
+
+  render(
+    <AuthProvider>
+      <Probe />
+    </AuthProvider>,
+  );
+  await waitFor(() => expect(screen.getByText("alice")).toBeTruthy());
+  fireEvent.click(screen.getByRole("button", { name: "logout" }));
+  await waitFor(() => expect(screen.getByText("alice")).toBeTruthy());
+  expect(window.localStorage.length).toBeGreaterThanOrEqual(0);
+  logout.mockResolvedValueOnce(undefined);
+  fireEvent.click(screen.getByRole("button", { name: "logout" }));
+  await waitFor(() => expect(screen.getByText("guest")).toBeTruthy());
+});
 
 test("退出登录清理当前用户的会话恢复键", async () => {
   fetchMe.mockResolvedValue(user);

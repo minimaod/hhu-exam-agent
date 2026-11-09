@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from app.auth.migrate import backup_database, migrate_database, restore_backup
+from app.auth.migrate import (
+    MigrationCommittedCheckError,
+    MigrationRolledBackError,
+    backup_database,
+    migrate_database,
+    restore_backup,
+)
 from app.conversations import schema
 from app.conversations.errors import ConversationStorageError
 
@@ -91,7 +97,7 @@ def test_migration_failure_rolls_back_and_backup_restores(
     monkeypatch.setattr(
         schema, "_v7_migration_statements", lambda: ("CREATE TABLE broken (",)
     )
-    with pytest.raises(ConversationStorageError):
+    with pytest.raises(MigrationRolledBackError):
         migrate_database(db, owner=owner(), backup_dir=backup_dir)
 
     connection = sqlite3.connect(db)
@@ -195,5 +201,104 @@ def test_startup_refuses_old_database_and_keeps_public_endpoints(
     connection = sqlite3.connect(db)
     try:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    finally:
+        connection.close()
+
+
+def test_restore_write_failure_keeps_current_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "study.sqlite3"
+    build_v6(db)
+    backup = backup_database(db, tmp_path / "backups")
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            "INSERT INTO conversations VALUES ('current-row','当前行','2026-01-03','2026-01-03')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    real_replace = __import__("os").replace
+
+    def fail_temp_replace(src, dst):
+        if str(src).endswith(".restore-tmp"):
+            raise OSError("injected restore write failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("app.auth.migrate.os.replace", fail_temp_replace)
+    with pytest.raises(OSError):
+        restore_backup(backup, db)
+
+    assert db.is_file()
+    connection = sqlite3.connect(db)
+    try:
+        ids = {row[0] for row in connection.execute("SELECT id FROM conversations")}
+        assert "current-row" in ids
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    finally:
+        connection.close()
+
+
+def test_restore_checkpoints_current_wal_before_replacing(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    db = tmp_path / "study.sqlite3"
+    build_v6(db, wal=True)
+    backup = backup_database(db, tmp_path / "backups")
+
+    # 写入一行的已提交页留在 WAL；在写入连接关闭前把主文件和 WAL 一起
+    # 复制成“当前库”，得到确实存在未合并 WAL 的恢复目标。
+    writer = sqlite3.connect(db)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL").fetchone()
+        writer.execute("PRAGMA wal_autocheckpoint=0").fetchone()
+        writer.execute(
+            "INSERT INTO conversations VALUES ('wal-current','WAL 当前行','2026-01-04','2026-01-04')"
+        )
+        writer.commit()
+        current = tmp_path / "current.sqlite3"
+        shutil.copyfile(db, current)
+        shutil.copyfile(Path(str(db) + "-wal"), Path(str(current) + "-wal"))
+    finally:
+        writer.close()
+    assert Path(str(current) + "-wal").stat().st_size > 0
+
+    restore_backup(backup, current)
+    connection = sqlite3.connect(current)
+    try:
+        ids = {row[0] for row in connection.execute("SELECT id FROM conversations")}
+        assert ids == {"conv-1"}
+    finally:
+        connection.close()
+
+    pre_files = list(tmp_path.glob("current.sqlite3.pre-restore-*"))
+    candidates = [p for p in pre_files if not p.name.endswith(("-wal", "-shm"))]
+    assert candidates
+    connection = sqlite3.connect(candidates[0])
+    try:
+        ids = {row[0] for row in connection.execute("SELECT id FROM conversations")}
+        assert "wal-current" in ids
+    finally:
+        connection.close()
+
+
+def test_post_commit_check_reports_committed_v7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "study.sqlite3"
+    build_v6(db)
+    monkeypatch.setattr(
+        "app.auth.migrate._assert_v7",
+        lambda path: (_ for _ in ()).throw(ConversationStorageError("注入检查失败")),
+    )
+    with pytest.raises(MigrationCommittedCheckError):
+        migrate_database(db, owner=owner(), backup_dir=tmp_path / "backups")
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
     finally:
         connection.close()

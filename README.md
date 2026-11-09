@@ -89,14 +89,14 @@ pnpm dev
 
 ```powershell
 # 已 v6 的库迁移到 v7（会先备份到 data/local/backups）
-uv run python -m app.auth.cli migrate --admin-username admin --database data/local/study.sqlite3
+uv run python -m app.auth.cli --database data/local/study.sqlite3 migrate --admin-username admin
 
 # 生成一次性邀请码（原文只显示一次）
-uv run python -m app.auth.cli create-invite --label "给同学" --expires-in-days 7
+uv run python -m app.auth.cli --database data/local/study.sqlite3 create-invite --label "给同学" --expires-in-days 7
 
-uv run python -m app.auth.cli list-users
-uv run python -m app.auth.cli disable-user --username <用户名>
-uv run python -m app.auth.cli restore --backup <备份>/study.sqlite3 --yes
+uv run python -m app.auth.cli --database data/local/study.sqlite3 list-users
+uv run python -m app.auth.cli --database data/local/study.sqlite3 disable-user --username <用户名>
+uv run python -m app.auth.cli --database data/local/study.sqlite3 restore --backup <备份>/study.sqlite3 --yes
 ```
 
 写请求需要 `X-HHU-CSRF: 1`（前端自动添加）；Session Cookie 为 HttpOnly、SameSite=Lax。HTTPS 环境把 `HHU_COOKIE_SECURE` 设为 true。正式学习库迁移需另行批准。Nginx 前端 location 需要 `try_files $uri $uri/ /index.html;`，否则直接打开或刷新 `/login`、`/register` 会 404。

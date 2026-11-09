@@ -88,10 +88,16 @@ def make_harness(
     replies: list[str] | None = None,
     memory: Any | None = None,
     scheduler: Any | None = None,
+    owner_id: str | None = None,
 ) -> Harness:
     db = tmp_path / "study.sqlite3"
-    repo = ConversationRepository(db)
-    repo.initialize()
+    if owner_id is None:
+        repo = ConversationRepository(db)
+        repo.initialize()
+    else:
+        from tests.f012_support import scoped_repository
+
+        repo = scoped_repository(db, owner_id=owner_id)
     papers = PaperService(PaperRepository(DEFAULT_PAPERS_ROOT))
     questions = FakeQuestionRuntime(cards or [sample_card()])
     tutor = FakeTutor(

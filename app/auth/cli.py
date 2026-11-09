@@ -18,7 +18,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from app.auth.migrate import migrate_database, restore_backup
+from app.auth.migrate import (
+    MigrationCommittedCheckError,
+    MigrationRolledBackError,
+    migrate_database,
+    restore_backup,
+)
 from app.auth.passwords import (
     AuthPasswordError,
     hash_password,
@@ -37,9 +42,13 @@ def _default_db() -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_DB_PATH
 
 
-def _read_password() -> str:
-    first = getpass.getpass("管理员密码：")
-    second = getpass.getpass("再次输入：")
+def _read_password(args: argparse.Namespace) -> str:
+    if getattr(args, "admin_password_stdin", False):
+        first = sys.stdin.readline().rstrip("\r\n")
+        second = sys.stdin.readline().rstrip("\r\n")
+    else:
+        first = getpass.getpass("管理员密码：")
+        second = getpass.getpass("再次输入：")
     if first != second:
         raise SystemExit("两次密码不一致。")
     return first
@@ -51,7 +60,7 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
         raise SystemExit(f"数据库不存在：{db_path}")
     try:
         username = validate_username(args.admin_username)
-        password = _read_password()
+        password = _read_password(args)
         validate_password(password)
         owner = schema.SchemaOwner(
             id=str(uuid4()),
@@ -67,6 +76,12 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
             if args.backup_dir
             else db_path.parent / "backups",
         )
+    except MigrationCommittedCheckError as exc:
+        print(f"迁移已提交为 v7，但提交后检查失败：{exc}", file=sys.stderr)
+        return 1
+    except MigrationRolledBackError as exc:
+        print(f"迁移失败，事务已回滚，数据库仍为 v6：{exc}", file=sys.stderr)
+        return 1
     except (AuthPasswordError, ConversationStorageError) as exc:
         print(f"迁移失败：{exc}", file=sys.stderr)
         return 1
@@ -135,6 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
     migrate = sub.add_parser("migrate", help="v6→v7 迁移（自动备份）")
     migrate.add_argument("--admin-username", required=True)
     migrate.add_argument("--backup-dir")
+    migrate.add_argument(
+        "--admin-password-stdin",
+        action="store_true",
+        help="从标准输入读两行密码（自动化用；默认交互输入）",
+    )
     migrate.set_defaults(func=_cmd_migrate)
 
     invite = sub.add_parser("create-invite", help="生成一次性邀请码")
