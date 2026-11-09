@@ -71,6 +71,7 @@ DEFAULT_TITLE = "新会话"
 TITLE_MAX_LENGTH = 30
 CONNECT_TIMEOUT_SECONDS = 5.0
 _VALID_ROLES = frozenset({"statement", "solution", "supplement"})
+_VALID_ATTEMPT_ROLES = frozenset({"student_solution", "student_answer"})
 # 明确的试卷状态：未定位（换卷失败）与待澄清（A/B 卷等）。它们优先于更早的
 # 成功记录，避免“旧卷复活”和“澄清条件丢失”。
 _PAPER_STATE_STATUSES = frozenset({"unlocated", "clarify_paper"})
@@ -1068,7 +1069,7 @@ class ConversationRepository:
                 (attachment_id, conversation_id),
             ).fetchone()
             if row is None:
-                raise AttachmentInvalidError("附件不存在或不属于当前会话。")
+                raise AttachmentNotFoundError("图片不存在。")
             connection.execute(
                 """
                 INSERT OR IGNORE INTO turn_attachments
@@ -1097,7 +1098,7 @@ class ConversationRepository:
                 (attachment_id, conversation_id),
             ).fetchone()
             if row is None:
-                raise AttachmentInvalidError("附件不存在或不属于当前会话。")
+                raise AttachmentNotFoundError("图片不存在。")
         connection.execute(
             "DELETE FROM problem_attachments WHERE problem_id = ?",
             (problem_id,),
@@ -1131,7 +1132,7 @@ class ConversationRepository:
                 (attachment_id, conversation_id),
             ).fetchone()
             if row is None:
-                raise AttachmentInvalidError("附件不存在或不属于当前会话。")
+                raise AttachmentNotFoundError("图片不存在。")
         connection.execute(
             "DELETE FROM mistake_record_attachments WHERE record_id = ?",
             (record_id,),
@@ -1289,6 +1290,19 @@ class ConversationRepository:
     ) -> ProblemRecord:
         """插入新题或纠正版本，并让旧活动题目让位。不结束轮次。"""
 
+        for referenced_id in (
+            problem.root_problem_id,
+            problem.supersedes_problem_id,
+        ):
+            if referenced_id is None:
+                continue
+            row = connection.execute(
+                "SELECT conversation_id FROM problems WHERE id = ?",
+                (referenced_id,),
+            ).fetchone()
+            if row is None or str(row["conversation_id"]) != conversation_id:
+                raise ProblemNotFoundError("题目不存在。")
+
         connection.execute(
             "UPDATE question_selections SET active = 0 WHERE conversation_id = ?",
             (conversation_id,),
@@ -1381,11 +1395,14 @@ class ConversationRepository:
     ) -> ProblemRecord:
         """更新同一逻辑版本的题干/讲解/附件。不结束轮次。"""
 
+        owner_sql, owner_params = self._owner_filter("problems")
         row = connection.execute(
-            f"{self._PROBLEM_SELECT} WHERE id = ?", (problem.id,)
+            f"{self._PROBLEM_SELECT} WHERE id = ?" + owner_sql,
+            (problem.id, *owner_params),
         ).fetchone()
         if row is None:
             raise ProblemNotFoundError("题目不存在。")
+        db_conversation_id = str(row["conversation_id"])
 
         connection.execute(
             """
@@ -1419,7 +1436,7 @@ class ConversationRepository:
             ),
         )
         self._replace_problem_attachments(
-            connection, problem.id, problem.conversation_id, attachments
+            connection, problem.id, db_conversation_id, attachments
         )
         updated_row = connection.execute(
             f"{self._PROBLEM_SELECT} WHERE id = ?", (problem.id,)
@@ -1560,6 +1577,15 @@ class ConversationRepository:
 
         with self._write() as connection:
             self._check_conversation_exists(connection, conversation_id)
+            for referenced_id in (root_problem_id, supersedes_problem_id):
+                if referenced_id is None:
+                    continue
+                row = connection.execute(
+                    "SELECT conversation_id FROM problems WHERE id = ?",
+                    (referenced_id,),
+                ).fetchone()
+                if row is None or str(row["conversation_id"]) != conversation_id:
+                    raise ProblemNotFoundError("题目不存在。")
             connection.execute(
                 "UPDATE problems SET active = 0 WHERE conversation_id = ? AND active = 1",
                 (conversation_id,),
@@ -1759,6 +1785,12 @@ class ConversationRepository:
         now = _now()
         with self._write() as connection:
             self._assert_conversation_owned(connection, snapshot.conversation_id)
+            problem = self._get_problem(connection, snapshot.problem_id)
+            if (
+                problem.conversation_id != snapshot.conversation_id
+                or problem.root_problem_id != snapshot.root_problem_id
+            ):
+                raise ProblemNotFoundError("题目不存在。")
             existing = self._find_record_by_root(
                 connection, snapshot.conversation_id, snapshot.root_problem_id
             )
@@ -1970,6 +2002,15 @@ class ConversationRepository:
                 return self._load_record(connection, record_id), False
 
             current = self._row_to_record(connection, row)
+            db_conversation_id = current.conversation_id
+            if new_snapshot.conversation_id != db_conversation_id:
+                raise MistakeRecordNotFoundError("错题记录不存在。")
+            problem = self._get_problem(connection, new_snapshot.problem_id)
+            if (
+                problem.conversation_id != db_conversation_id
+                or problem.root_problem_id != new_snapshot.root_problem_id
+            ):
+                raise ProblemNotFoundError("题目不存在。")
             snapshot = self._record_snapshot(current)
             snapshot["_request_input"] = request_input
             connection.execute(
@@ -2018,7 +2059,7 @@ class ConversationRepository:
             self._replace_record_attachments(
                 connection,
                 record_id,
-                new_snapshot.conversation_id,
+                db_conversation_id,
                 new_snapshot.attachments,
             )
             updated = self._load_record(connection, record_id)
@@ -2746,6 +2787,23 @@ class ConversationRepository:
             (exercise_id,),
         ).fetchall()
 
+    def _validate_attempt_attachments(
+        self,
+        connection: sqlite3.Connection,
+        exercise_id: str,
+        attachments: Sequence[tuple[str, str]],
+    ) -> None:
+        exercise = self._get_exercise(connection, exercise_id)
+        for attachment_id, role in attachments:
+            if role not in _VALID_ATTEMPT_ROLES:
+                raise AttachmentInvalidError("附件角色不合法。")
+            row = connection.execute(
+                "SELECT 1 FROM attachments WHERE id = ? AND conversation_id = ?",
+                (attachment_id, exercise.conversation_id),
+            ).fetchone()
+            if row is None:
+                raise AttachmentNotFoundError("图片不存在。")
+
     def _insert_attempt(
         self,
         connection: sqlite3.Connection,
@@ -2760,6 +2818,7 @@ class ConversationRepository:
         request_id: str | None = None,
     ) -> str:
         self._get_exercise(connection, exercise_id)
+        self._validate_attempt_attachments(connection, exercise_id, attachments)
         rows = self._attempt_rows(connection, exercise_id)
         next_no = (rows[-1]["attempt_no"] + 1) if rows else 1
         if next_no == 1 and kind != "initial":
@@ -2861,6 +2920,9 @@ class ConversationRepository:
         if row is None:
             raise ProblemNotFoundError("未找到这次作答记录。")
         self._assert_attempt_owned(connection, attempt_id)
+        self._validate_attempt_attachments(
+            connection, str(row["exercise_id"]), attachments
+        )
         if row["evaluation_json"] is not None:
             raise ConversationConflictError("这次作答已经完成评价，不能覆盖原结果。")
         now = _now()
@@ -3686,6 +3748,10 @@ class ConversationRepository:
         snapshot_json = json.dumps(card.public_snapshot(), ensure_ascii=False)
         with self._write() as connection:
             self._check_conversation_exists(connection, conversation_id)
+            if problem_id is not None:
+                problem = self._get_problem(connection, problem_id)
+                if problem.conversation_id != conversation_id:
+                    raise ProblemNotFoundError("题目不存在。")
             existing = connection.execute(
                 """
                 SELECT * FROM question_selections
