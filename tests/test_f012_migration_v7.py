@@ -286,6 +286,111 @@ def test_restore_checkpoints_current_wal_before_replacing(
         connection.close()
 
 
+def test_restore_first_move_failure_keeps_current_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "study.sqlite3"
+    build_v6(db)
+    backup = backup_database(db, tmp_path / "backups")
+    real_replace = __import__("os").replace
+
+    def fail_first_move(src, dst):
+        if Path(src) == db and ".pre-restore-" in str(dst):
+            raise OSError("injected first move failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("app.auth.migrate.os.replace", fail_first_move)
+    with pytest.raises(ConversationStorageError):
+        restore_backup(backup, db)
+
+    # 首步移动失败时，异常处理不能再次移动当前库。
+    assert db.is_file()
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute(
+            "SELECT title FROM conversations"
+        ).fetchone()[0] == "旧会话"
+    finally:
+        connection.close()
+
+
+def test_restore_stops_when_checkpoint_is_busy(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "study.sqlite3"
+    build_v6(db, wal=True)
+    backup = backup_database(db, tmp_path / "backups")
+    reader = sqlite3.connect(db)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM conversations").fetchone()
+    try:
+        with pytest.raises(ConversationStorageError):
+            restore_backup(backup, db)
+    finally:
+        reader.rollback()
+        reader.close()
+    assert db.is_file()
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute(
+            "SELECT title FROM conversations"
+        ).fetchone()[0] == "旧会话"
+    finally:
+        connection.close()
+
+
+def test_restore_stops_when_checkpoint_returns_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "study.sqlite3"
+    build_v6(db)
+    backup = backup_database(db, tmp_path / "backups")
+    real_connect = sqlite3.connect
+
+    class BusyConnection:
+        def execute(self, sql, *args):
+            if "wal_checkpoint" in sql:
+                class Cursor:
+                    def fetchone(self):
+                        return (1, 0, 0)
+
+                return Cursor()
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def close(self):
+            return None
+
+    def connect(path, *args, **kwargs):
+        if str(path) == str(db):
+            return BusyConnection()
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr("app.auth.migrate.sqlite3.connect", connect)
+    with pytest.raises(ConversationStorageError):
+        restore_backup(backup, db)
+    assert db.is_file()
+
+
+def test_post_commit_startup_failure_reports_v7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "study.sqlite3"
+    build_v6(db)
+
+    def fail_recover(connection):
+        raise ConversationStorageError("注入轮次恢复失败")
+
+    monkeypatch.setattr(schema, "_recover_running", fail_recover)
+    with pytest.raises(MigrationCommittedCheckError):
+        migrate_database(db, owner=owner(), backup_dir=tmp_path / "backups")
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+    finally:
+        connection.close()
+
+
 def test_post_commit_check_reports_committed_v7(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

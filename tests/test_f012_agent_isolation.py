@@ -27,7 +27,13 @@ from tests.f012_support import (
     owner_snapshot,
     scoped_repository,
 )
-from tests.test_f010b_support import dummy_request, make_harness, turn_input
+from tests.test_f010b_support import (
+    dummy_request,
+    make_harness,
+    seed_question_turn,
+    turn_input,
+)
+from tests.question_fakes import sample_card
 from tests.tool_fakes import FakeToolModel, tool_call
 from tests.test_f012_route_matrix import _seed_a_world
 
@@ -213,3 +219,88 @@ async def test_agent_tool_dispatch_rejects_a_workspace_reference(
     assert model.calls, "真实 SchedulerAgent 应至少调用一次工具模型"
     assert owner_snapshot(db, "owner-a")["digest"] == before["digest"]
     assert harness.service.list_conversations().total == 1
+
+
+@pytest.mark.anyio
+async def test_a_workspace_q1_and_source_are_usable_b_denied(
+    tmp_path: Path,
+) -> None:
+    """先证明 A 的 Q1/来源/重生成可用，再证明 B 使用同一资源被拒绝。"""
+
+    card = sample_card()
+    a_harness = make_harness(tmp_path, owner_id="owner-a")
+    a_conv = a_harness.service.create_conversation().id
+    seed_question_turn(a_harness.repo, a_conv, [card])
+    a_harness.repo.update_turn_reply(
+        a_conv,
+        "req-seed",
+        assistant_message="A 的旧正文",
+        reply_meta={},
+        reply_input={"user_text": "看看这道题", "results": []},
+    )
+
+    # A 能打开自己工作区的来源，并能重生成正文。
+    source = a_harness.service.question_source(
+        a_conv, card.question_id, card.build_id, "statement", 1
+    )
+    assert source.page == 1
+    regenerated = await a_harness.service.regenerate_reply(a_conv, "req-seed")
+    assert regenerated["assistant_message"]
+
+    a_model = FakeToolModel(
+        [
+            {
+                "tool_calls": [
+                    tool_call("view_question_detail", {"ref": "Q1"}, call_id="a1")
+                ]
+            },
+            {"content": "A 可以看到这道题。"},
+        ]
+    )
+    a_harness.service._make_scheduler = lambda: SchedulerAgent(model=a_model)
+    prepared = a_harness.service.prepare_turn(
+        a_conv, turn_input("看看第一题")
+    )
+    a_events = [
+        event
+        async for event in a_harness.service.stream_prepared(
+            prepared, dummy_request()
+        )
+    ]
+    a_result = next(event for event in a_events if event.type == "result")
+    assert a_result.composite_results[0].status == "success"
+
+    b_model = FakeToolModel(
+        [
+            {
+                "tool_calls": [
+                    tool_call("view_question_detail", {"ref": "Q1"}, call_id="b1")
+                ]
+            },
+            {"content": "B 看不到这道题。"},
+        ]
+    )
+    b_harness = make_harness(
+        tmp_path,
+        owner_id="owner-b",
+        scheduler=SchedulerAgent(model=b_model),
+    )
+    b_conv = b_harness.service.create_conversation().id
+    with pytest.raises(ConversationNotFoundError):
+        b_harness.service.question_source(
+            a_conv, card.question_id, card.build_id, "statement", 1
+        )
+    with pytest.raises(ConversationNotFoundError):
+        await b_harness.service.regenerate_reply(a_conv, "req-seed")
+
+    b_prepared = b_harness.service.prepare_turn(
+        b_conv, turn_input("看看第一题")
+    )
+    b_events = [
+        event
+        async for event in b_harness.service.stream_prepared(
+            b_prepared, dummy_request()
+        )
+    ]
+    b_result = next(event for event in b_events if event.type == "result")
+    assert b_result.composite_results[0].status in ("failed", "clarification")

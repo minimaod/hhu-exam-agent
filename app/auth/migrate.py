@@ -52,7 +52,11 @@ def backup_database(db_path: Path, backup_dir: Path) -> Path:
 
     source = sqlite3.connect(db_path, timeout=5.0)
     try:
-        source.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is not None and int(checkpoint[0]) != 0:
+            raise ConversationStorageError(
+                "当前数据库仍在使用，WAL 无法合并；请停止服务后再备份。"
+            )
         target_dir = backup_dir / f"f012-v6-{_now_tag()}-{uuid.uuid4().hex[:6]}"
         target_dir.mkdir(parents=True, exist_ok=False)
         target = target_dir / "study.sqlite3"
@@ -139,6 +143,12 @@ def migrate_database(
     try:
         schema.initialize_database(db_path, migration_owner=owner)
     except ConversationStorageError as exc:
+        actual_version = _read_version(db_path)
+        if actual_version == 7:
+            raise MigrationCommittedCheckError(
+                "迁移事务已提交为 v7，但提交后的启动处理失败；"
+                f"请检查数据库后再决定是否从备份恢复：{backup_path}；原因：{exc}"
+            ) from exc
         raise MigrationRolledBackError(
             f"迁移事务已回滚，数据库仍为 v6；备份：{backup_path}；原因：{exc}"
         ) from exc
@@ -191,16 +201,32 @@ def restore_backup(backup_path: Path, db_path: Path) -> None:
     pre: Path | None = None
     pre_wal: Path | None = None
     pre_shm: Path | None = None
+    moved_current = False
+    moved_wal = False
+    moved_shm = False
+    installed = False
     try:
         if db_path.exists():
             # 先把当前库 WAL 中已提交的数据合并进主文件；失败则不动目标。
             current = sqlite3.connect(db_path, timeout=5.0)
             try:
-                current.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                checkpoint = current.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if checkpoint is not None and int(checkpoint[0]) != 0:
+                    raise ConversationStorageError(
+                        "当前数据库仍在使用，WAL 无法合并；请停止服务后再恢复。"
+                    )
             finally:
                 current.close()
             pre = db_path.with_name(f"{db_path.name}.pre-restore-{_now_tag()}")
-            os.replace(db_path, pre)
+            try:
+                os.replace(db_path, pre)
+            except OSError as exc:
+                raise ConversationStorageError(
+                    "当前数据库仍被占用，无法替换；请停止服务后再恢复。"
+                ) from exc
+            moved_current = True
             for suffix, target in (("-wal", "wal"), ("-shm", "shm")):
                 source = Path(str(db_path) + suffix)
                 if source.exists():
@@ -208,24 +234,33 @@ def restore_backup(backup_path: Path, db_path: Path) -> None:
                     os.replace(source, moved)
                     if target == "wal":
                         pre_wal = moved
+                        moved_wal = True
                     else:
                         pre_shm = moved
+                        moved_shm = True
         os.replace(temp, db_path)
+        installed = True
         check(db_path)
     except Exception:
         if temp.exists():
             temp.unlink()
-        # 回滚：尽量把恢复前的库（含 WAL）放回原路径。
-        if pre is not None:
-            if db_path.exists():
+        # 只撤销已经成功的移动；首步失败时绝不再次移动当前库。
+        if moved_current:
+            if installed and db_path.exists():
                 failed = db_path.with_name(
                     f"{db_path.name}.failed-restore-{_now_tag()}"
                 )
                 os.replace(db_path, failed)
-            os.replace(pre, db_path)
-            for moved, suffix in ((pre_wal, "-wal"), (pre_shm, "-shm")):
-                if moved is not None and moved.exists():
-                    os.replace(moved, Path(str(db_path) + suffix))
+            os.replace(pre, db_path)  # type: ignore[arg-type]
+            if moved_wal and pre_wal is not None and pre_wal.exists():
+                os.replace(pre_wal, Path(str(db_path) + "-wal"))
+            if moved_shm and pre_shm is not None and pre_shm.exists():
+                os.replace(pre_shm, Path(str(db_path) + "-shm"))
+        elif installed and db_path.exists():
+            failed = db_path.with_name(
+                f"{db_path.name}.failed-restore-{_now_tag()}"
+            )
+            os.replace(db_path, failed)
         raise
 
     # 新库旁不应残留旧日志；恢复前的库保留在 pre-restore 路径。

@@ -980,32 +980,42 @@ class ConversationRepository:
     def list_attachments_for_problem(
         self, problem_id: str
     ) -> list[AttachmentRecord]:
+        owner_sql, owner_params = self._owner_filter("problems")
         with self._read() as connection:
             rows = connection.execute(
                 """
                 SELECT a.*, pa.role AS role
                 FROM problem_attachments pa
                 JOIN attachments a ON a.id = pa.attachment_id
+                JOIN problems ON problems.id = pa.problem_id
                 WHERE pa.problem_id = ?
+                """
+                + owner_sql
+                + """
                 ORDER BY pa.role ASC, a.id ASC
                 """,
-                (problem_id,),
+                (problem_id, *owner_params),
             ).fetchall()
         return [self._row_to_attachment(row, row["role"]) for row in rows]
 
     def list_attachments_for_record(
         self, record_id: str
     ) -> list[AttachmentRecord]:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._read() as connection:
             rows = connection.execute(
                 """
                 SELECT a.*, ma.role AS role
                 FROM mistake_record_attachments ma
                 JOIN attachments a ON a.id = ma.attachment_id
+                JOIN mistake_records ON mistake_records.id = ma.record_id
                 WHERE ma.record_id = ?
+                """
+                + owner_sql
+                + """
                 ORDER BY ma.role ASC, a.id ASC
                 """,
-                (record_id,),
+                (record_id, *owner_params),
             ).fetchall()
         return [self._row_to_attachment(row, row["role"]) for row in rows]
 
@@ -2017,24 +2027,38 @@ class ConversationRepository:
     def find_record_revision(
         self, record_id: str, request_id: str
     ) -> RevisionRow | None:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._read() as connection:
             row = connection.execute(
                 """
-                SELECT * FROM mistake_record_revisions
-                WHERE record_id = ? AND request_id = ?
-                """,
-                (record_id, request_id),
+                SELECT mistake_record_revisions.*
+                FROM mistake_record_revisions
+                JOIN mistake_records
+                  ON mistake_records.id = mistake_record_revisions.record_id
+                WHERE mistake_record_revisions.record_id = ?
+                  AND mistake_record_revisions.request_id = ?
+                """
+                + owner_sql,
+                (record_id, request_id, *owner_params),
             ).fetchone()
         return None if row is None else self._row_to_revision(row)
 
     def list_record_revisions(self, record_id: str) -> list[RevisionRow]:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._read() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM mistake_record_revisions
-                WHERE record_id = ? ORDER BY id ASC
+                SELECT mistake_record_revisions.*
+                FROM mistake_record_revisions
+                JOIN mistake_records
+                  ON mistake_records.id = mistake_record_revisions.record_id
+                WHERE mistake_record_revisions.record_id = ?
+                """
+                + owner_sql
+                + """
+                ORDER BY mistake_record_revisions.id ASC
                 """,
-                (record_id,),
+                (record_id, *owner_params),
             ).fetchall()
         return [self._row_to_revision(row) for row in rows]
 
@@ -2615,6 +2639,12 @@ class ConversationRepository:
         now = _now()
         with self._write() as connection:
             self._check_conversation_exists(connection, conversation_id)
+            problem = self._get_problem(connection, problem_id)
+            if (
+                problem.conversation_id != conversation_id
+                or problem.root_problem_id != root_problem_id
+            ):
+                raise ProblemNotFoundError("题目不存在。")
             connection.execute(
                 """
                 INSERT INTO exercises (
@@ -2667,6 +2697,7 @@ class ConversationRepository:
 
         now = _now()
         with self._write() as connection:
+            self._check_conversation_exists(connection, conversation_id)
             connection.execute(
                 "UPDATE conversation_contexts SET active_exercise_id = NULL, "
                 "updated_at = ? WHERE conversation_id = ?",
@@ -3556,6 +3587,14 @@ class ConversationRepository:
         now = _now()
         with self._write() as connection:
             self._check_conversation_exists(connection, conversation_id)
+            if active_problem_id is not None:
+                problem = self._get_problem(connection, active_problem_id)
+                if problem.conversation_id != conversation_id:
+                    raise ProblemNotFoundError("题目不存在。")
+            if active_exercise_id is not None:
+                exercise = self._get_exercise(connection, active_exercise_id)
+                if exercise.conversation_id != conversation_id:
+                    raise ProblemNotFoundError("练习题不存在。")
             existing = connection.execute(
                 "SELECT * FROM conversation_contexts WHERE conversation_id = ?",
                 (conversation_id,),

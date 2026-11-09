@@ -375,37 +375,35 @@ def test_a_b_isolation_on_owned_routes(anon_client: TestClient, sample_root: Pat
             json={"request_id": "22222222-2222-4222-8222-222222222222", "kind": "exercise_answer", "exercise_id": world["exercise"], "student_answer": "B 的答案"},
             headers=TEST_CSRF_HEADERS,
         ).status_code == 404
-        assert b.get("/api/mistake-records").json()["total"] == 0
-        assert b.get("/api/conversations").json()["total"] == 1
-        collection_executed = {
-            ("GET", "/api/conversations"),
+        collection_executed: set[tuple[str, str]] = {
             ("POST", "/api/conversations"),
-            ("GET", "/api/mistake-records"),
-            ("POST", "/api/mistake-records"),
-            ("GET", "/api/learning-memory"),
-            ("GET", "/api/learning-memory/courses"),
         }
+        collection_executed.add(("GET", "/api/conversations"))
+        assert b.get("/api/conversations").json()["total"] == 1
+        collection_executed.add(("GET", "/api/mistake-records"))
         assert b.get("/api/mistake-records").status_code == 200
+        collection_executed.add(("POST", "/api/mistake-records"))
         assert b.post(
             "/api/mistake-records",
             json={"request_id": "33333333-3333-4333-8333-333333333333", "conversation_id": a_conversation},
             headers=TEST_CSRF_HEADERS,
         ).status_code == 404
+        collection_executed.add(("GET", "/api/learning-memory"))
         assert b.get("/api/learning-memory").status_code == 200
+        collection_executed.add(("GET", "/api/learning-memory/courses"))
         assert b.get("/api/learning-memory/courses").status_code == 200
         assert collection_executed == COLLECTION_ROUTES
 
-        session_executed = {
-            ("GET", "/api/me"),
-            ("POST", "/api/auth/logout"),
-            ("POST", "/api/query"),
-        }
+        session_executed: set[tuple[str, str]] = set()
+        session_executed.add(("GET", "/api/me"))
         assert a.get("/api/me").json()["username"] == "alice"
         assert a_repo.find_turn(a_conversation, a_req) is not None
         assert a_repo.get_active_problem(world["conversation"]) is not None
+        session_executed.add(("POST", "/api/query"))
         assert a.post(
             "/api/query", json={"query": "高数"}, headers=TEST_CSRF_HEADERS
         ).status_code == 503
+        session_executed.add(("POST", "/api/auth/logout"))
         assert a.post("/api/auth/logout", headers=TEST_CSRF_HEADERS).status_code == 204
         assert a.get("/api/me").status_code == 401
         assert session_executed == SESSION_ROUTES

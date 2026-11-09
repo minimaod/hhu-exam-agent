@@ -32,6 +32,16 @@ def _seed(tmp_path: Path) -> Path:
     try:
         connection.execute(
             """
+            INSERT INTO problems (
+                id, conversation_id, root_problem_id, version, statement_text,
+                status, clarity, source_type, active, created_at, updated_at
+            ) VALUES ('p-a', ?, 'p-a', 1, 'A 的题目', 'awaiting_supplement',
+                      'unclear', 'none', 1, '2026-01-01', '2026-01-01')
+            """,
+            (conversation.id,),
+        )
+        connection.execute(
+            """
             INSERT INTO exercises (
                 id, conversation_id, problem_id, root_problem_id, statement_text,
                 reference_solution_text, knowledge_point, status, created_at, updated_at
@@ -49,6 +59,26 @@ def _seed(tmp_path: Path) -> Path:
                       '2026-01-01', '2026-01-01')
             """,
             (),
+        )
+        connection.execute(
+            "INSERT INTO conversation_contexts (conversation_id, active_exercise_id, updated_at) "
+            "VALUES (?, 'ex-a', '2026-01-01')",
+            (conversation.id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO mistake_records (
+                id, conversation_id, problem_id, root_problem_id, problem_version,
+                request_id, title, statement_text, source_json, created_at, updated_at
+            ) VALUES ('rec-a', ?, 'p-a', 'p-a', 1, 'req-a', 'A 的错题',
+                      'A 的题目', '{}', '2026-01-01', '2026-01-01')
+            """,
+            (conversation.id,),
+        )
+        connection.execute(
+            "INSERT INTO mistake_record_revisions "
+            "(id, record_id, request_id, reason, snapshot_json, created_at) "
+            "VALUES (1, 'rec-a', 'req-r', 'correction', '{}', '2026-01-01')"
         )
         connection.commit()
     finally:
@@ -100,3 +130,40 @@ def test_scoped_repository_rejects_attempt_evaluation_writes(tmp_path: Path) -> 
     finally:
         connection.close()
     assert row == (None, "A 的答案")
+
+
+def test_repository_rejects_cross_user_revisions_active_pointer_and_exercise(
+    tmp_path: Path,
+) -> None:
+    db = _seed(tmp_path)
+    a_repo = ConversationRepository(db, owner_id=A)
+    b_repo = ConversationRepository(db, owner_id=B)
+    a_conv = a_repo.list_conversations()[0].id
+    b_conv = b_repo.create_conversation().id
+    before = owner_snapshot(db, A)
+
+    assert b_repo.list_record_revisions("rec-a") == []
+    assert b_repo.find_record_revision("rec-a", "req-r") is None
+    assert b_repo.list_attachments_for_problem("p-a") == []
+    assert b_repo.list_attachments_for_record("rec-a") == []
+
+    with pytest.raises(ConversationNotFoundError):
+        b_repo.clear_active_exercise(a_conv)
+    with pytest.raises(ProblemNotFoundError):
+        b_repo.create_exercise(
+            id="ex-b",
+            conversation_id=b_conv,
+            problem_id="p-a",
+            root_problem_id="p-a",
+            statement_text="B 伪造练习",
+            reference_solution_text="参考",
+            knowledge_point="循环",
+        )
+    with pytest.raises(ProblemNotFoundError):
+        b_repo.upsert_context(b_conv, active_problem_id="p-a")
+    with pytest.raises(ProblemNotFoundError):
+        b_repo.upsert_context(b_conv, active_exercise_id="ex-a")
+
+    assert a_repo.get_active_exercise(a_conv) is not None
+    assert a_repo.list_record_revisions("rec-a")
+    assert owner_snapshot(db, A)["digest"] == before["digest"]
