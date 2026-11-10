@@ -56,9 +56,15 @@ test("访客可以浏览试卷库，进入个人工作区时要求登录", async
 
   fireEvent.click(screen.getByRole("button", { name: "学习会话" }));
   await waitFor(() => expect(screen.getByText("登录学习工作区")).toBeTruthy());
+  expect(window.location.pathname).toBe("/login");
+
+  fireEvent.click(screen.getByRole("button", { name: "试卷库" }));
+  expect(screen.queryByRole("heading", { name: "登录学习工作区" })).toBeNull();
+  expect(screen.getByText("共 1 份试卷")).toBeTruthy();
+  expect(window.location.pathname).toBe("/");
 });
 
-test("直接打开 /register 显示注册页（刷新路径）", async () => {
+test("直接打开 /register 后可以返回试卷库", async () => {
   window.history.replaceState(null, "", "/register");
   fetchMe.mockResolvedValue(null);
   fetchHealth.mockResolvedValue({ status: "ok", service: "hhu-exam-review" });
@@ -66,5 +72,9 @@ test("直接打开 /register 显示注册页（刷新路径）", async () => {
 
   render(<App />);
   await waitFor(() => expect(screen.getByText("用邀请码注册")).toBeTruthy());
-  window.history.replaceState(null, "", "/");
+
+  fireEvent.click(screen.getByRole("button", { name: "试卷库" }));
+  expect(screen.queryByRole("heading", { name: "用邀请码注册" })).toBeNull();
+  expect(screen.getByText("已登记的试卷")).toBeTruthy();
+  expect(window.location.pathname).toBe("/");
 });

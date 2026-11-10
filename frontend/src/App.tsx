@@ -105,12 +105,16 @@ function AppShell() {
         openAuth("login", key);
         return;
       }
+      if (key === "papers" && authMode !== null) {
+        closeAuth();
+        setPendingView(null);
+      }
       if (key === "mistakes") {
         setSelectedRecordId(null);
       }
       setView(key);
     },
-    [openAuth, user],
+    [authMode, closeAuth, openAuth, user],
   );
 
   const handleAuthSuccess = useCallback(() => {
