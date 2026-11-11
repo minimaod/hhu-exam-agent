@@ -38,6 +38,7 @@ from app.conversations.tools import (
 from app.llm import build_chat_model, log_usage, map_provider_error, response_text
 from app.papers.courses import normalize_course
 from app.querying.errors import QueryError
+from app.quota.errors import QuotaError
 
 __all__ = [
     "ActionOutcome",
@@ -463,6 +464,8 @@ class SchedulerAgent:
         try:
             response = await bound.ainvoke(self._messages)
         except Exception as exc:
+            if isinstance(exc, QueryError):
+                raise
             mapped = map_provider_error(exc)
             if mapped:
                 raise mapped from exc
@@ -696,7 +699,8 @@ class DynamicReviewGraph:
         except Exception as exc:
             # 第一次决策失败说明本轮无法开始；重决策失败则保留已执行结果，
             # 由回复节点如实说明“后续建议失败”，而不是丢弃已完成操作。
-            if rounds == 1:
+            # 额度相关错误必须继续向上抛出，不能被当成普通重决策失败。
+            if rounds == 1 or isinstance(exc, QuotaError):
                 raise
             return {
                 "rounds": rounds,

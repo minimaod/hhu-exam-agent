@@ -20,6 +20,7 @@ from app.conversations.errors import (
     AttachmentStorageError,
     ConversationNotFoundError,
 )
+from app.quota.errors import QuotaStorageError
 from app.conversations.repository import ConversationRepository
 from app.conversations.service import ConversationStoreState
 from app import images
@@ -62,6 +63,13 @@ async def upload_attachment(
     if repository.get_conversation(str(conversation_id)) is None:
         raise ConversationNotFoundError("会话不存在。")
 
+    gate = getattr(request.app.state, "usage_gate", None)
+    usage_config = getattr(request.app.state, "usage_config", None)
+    if gate is None:
+        raise QuotaStorageError()
+    if getattr(usage_config, "error", None):
+        raise AttachmentStorageError("用量限制配置暂时不可用，请稍后再试。")
+
     data = await file.read(MAX_IMAGE_BYTES + 1)
     if len(data) > MAX_IMAGE_BYTES:
         from app.conversations.errors import AttachmentTooLargeError
@@ -85,6 +93,9 @@ async def upload_attachment(
             height=image.height,
             size_bytes=len(image.data),
             sha256=image.sha256,
+            quota_check=lambda connection: gate.check_and_insert_image(
+                connection, user.id
+            ),
         )
     except Exception:
         delete_attachment(_root(), stored_name)

@@ -14,6 +14,11 @@ import {
 } from "./queryApi.ts";
 import { createSseParser } from "./sseParser.ts";
 import { apiFetch } from "./apiFetch.ts";
+import {
+  parseQuotaFailure,
+  parseQuotaInfo,
+  type QuotaInfo,
+} from "./usageApi.ts";
 
 const CONVERSATIONS_PATH = "/api/conversations";
 const MAX_QUERY_LENGTH = 2000;
@@ -56,7 +61,7 @@ export type TurnKind =
   | "explain_question"
   | "view_question_answer";
 export type TurnErrorCode = QueryErrorCode | "STORAGE_UNAVAILABLE" | "TUTORING_FAILED" | "BUSINESS_REJECTED"
-  | "QUESTION_SEARCH_FAILED" | "QUESTION_BANK_UNAVAILABLE";
+  | "QUESTION_SEARCH_FAILED" | "QUESTION_BANK_UNAVAILABLE" | "TURN_IN_PROGRESS";
 export type TurnStage =
   | "dispatching"
   | "scheduling"
@@ -465,6 +470,8 @@ export type TurnErrorEvent = {
   request_id: string;
   code: TurnErrorCode;
   message: string;
+  quota?: QuotaInfo | null;
+  saved?: boolean;
 };
 
 export type TurnEvent =
@@ -498,15 +505,24 @@ export type StreamTurnOptions = {
 export class ConversationsApiError extends Error {
   readonly status: number | undefined;
   readonly code: string | undefined;
+  readonly quota: QuotaInfo | null;
+  readonly saved: boolean;
 
   constructor(
     message: string,
-    options: { status?: number; code?: string } = {},
+    options: {
+      status?: number;
+      code?: string;
+      quota?: QuotaInfo | null;
+      saved?: boolean;
+    } = {},
   ) {
     super(message);
     this.name = "ConversationsApiError";
     this.status = options.status;
     this.code = options.code;
+    this.quota = options.quota ?? null;
+    this.saved = options.saved ?? false;
   }
 }
 
@@ -1122,7 +1138,11 @@ function isTurnErrorCode(value: unknown): value is TurnErrorCode {
     value === "BUSINESS_REJECTED" ||
     value === "QUESTION_SEARCH_FAILED" ||
     value === "QUESTION_BANK_UNAVAILABLE" ||
-    value === "STORAGE_UNAVAILABLE"
+    value === "STORAGE_UNAVAILABLE" ||
+    value === "MODEL_QUOTA_EXCEEDED" ||
+    value === "IMAGE_QUOTA_EXCEEDED" ||
+    value === "QUOTA_STORAGE_UNAVAILABLE" ||
+    value === "TURN_IN_PROGRESS"
   );
 }
 
@@ -1159,9 +1179,15 @@ async function readJson(response: Response, description: string): Promise<unknow
 
 async function ensureOk(response: Response): Promise<void> {
   if (!response.ok) {
-    throw new ConversationsApiError(await readErrorDetail(response), {
-      status: response.status,
-    });
+    const failure = await parseQuotaFailure(response.clone());
+    throw new ConversationsApiError(
+      failure?.message ?? (await readErrorDetail(response)),
+      {
+        status: response.status,
+        code: failure?.code ?? undefined,
+        quota: failure?.quota,
+      },
+    );
   }
 }
 
@@ -1317,6 +1343,8 @@ export function parseTurnEvent(
       request_id: requestId,
       code: payload.code,
       message: payload.message,
+      quota: parseQuotaInfo(payload.quota),
+      saved: payload.saved === true,
     };
   }
 
@@ -1639,7 +1667,11 @@ export async function streamTurn(
         continue;
       }
       if (event.type === "error") {
-        throw new ConversationsApiError(event.message, { code: event.code });
+        throw new ConversationsApiError(event.message, {
+          code: event.code,
+          quota: event.quota,
+          saved: event.saved,
+        });
       }
       return event;
     }

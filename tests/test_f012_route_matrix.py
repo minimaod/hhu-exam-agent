@@ -57,6 +57,7 @@ PRIVATE_ROUTES = {
     ("GET", "/api/learning-memory/courses"),
     ("PATCH", "/api/learning-memory/{kind}/{source_id}"),
     ("DELETE", "/api/learning-memory/{kind}/{source_id}"),
+    ("GET", "/api/usage/today"),
 }
 
 ALL_ROUTES = PUBLIC_ROUTES | PRIVATE_ROUTES
@@ -94,6 +95,7 @@ SESSION_ROUTES = {
     ("POST", "/api/query"),
     ("POST", "/api/auth/logout"),
     ("GET", "/api/me"),
+    ("GET", "/api/usage/today"),
 }
 
 
@@ -128,7 +130,7 @@ def collect_api_operations(application: FastAPI) -> set[tuple[str, str]]:
 
 def test_actual_route_matrix_matches_plan() -> None:
     actual = collect_api_operations(app)
-    assert len(actual) == 30
+    assert len(actual) == 31
     assert actual == ALL_ROUTES
 
 
@@ -397,6 +399,10 @@ def test_a_b_isolation_on_owned_routes(anon_client: TestClient, sample_root: Pat
         session_executed: set[tuple[str, str]] = set()
         session_executed.add(("GET", "/api/me"))
         assert a.get("/api/me").json()["username"] == "alice"
+        session_executed.add(("GET", "/api/usage/today"))
+        usage = a.get("/api/usage/today")
+        assert usage.status_code == 200, usage.text
+        assert usage.json()["requests"]["remaining"] >= 0
         assert a_repo.find_turn(a_conversation, a_req) is not None
         assert a_repo.get_active_problem(world["conversation"]) is not None
         session_executed.add(("POST", "/api/query"))

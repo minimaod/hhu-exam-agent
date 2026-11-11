@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.conversations.models import ExerciseView
-from app.querying.models import ErrorCode
+from app.querying.models import ErrorCode, QuotaInfo
 from app.tutoring.models import (
     AttachmentView,
     Explanation,
@@ -111,6 +111,7 @@ class RecordCorrectionErrorEvent(BaseModel):
     request_id: str
     code: RecordCorrectionErrorCode
     message: str
+    quota: QuotaInfo | None = None
 
 
 RecordCorrectionEvent = (

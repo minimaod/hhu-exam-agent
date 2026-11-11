@@ -12,6 +12,7 @@ import type {
 } from "./conversationsApi.ts";
 import { createSseParser } from "./sseParser.ts";
 import { apiFetch } from "./apiFetch.ts";
+import { parseQuotaInfo, type QuotaInfo } from "./usageApi.ts";
 
 const PATH = "/api/mistake-records";
 
@@ -115,6 +116,7 @@ export type RecordCorrectionErrorEvent = {
   request_id: string;
   code: string;
   message: string;
+  quota?: QuotaInfo | null;
 };
 
 export type RecordCorrectionEvent =
@@ -444,6 +446,7 @@ function parseCorrectionEvent(
       request_id: requestId,
       code: payload.code,
       message: payload.message,
+      quota: parseQuotaInfo(payload.quota),
     };
   }
 

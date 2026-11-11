@@ -8,6 +8,7 @@ from app.auth.models import User
 from app.auth.service import AuthService
 from app.config import AuthConfigState
 from app.security.csrf import require_csrf
+from app.quota.transport import set_actor
 
 
 def get_auth_config(request: Request) -> AuthConfigState:
@@ -43,6 +44,7 @@ def require_user(request: Request) -> User:
     if user is None:
         raise HTTPException(status_code=401, detail="请先登录。")
     require_csrf(request, config)
+    set_actor(user.id)
     return user
 
 

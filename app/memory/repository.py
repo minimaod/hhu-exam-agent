@@ -14,7 +14,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from app.conversations.errors import ConversationStorageError
 from app.papers.courses import normalize_course
@@ -148,6 +148,7 @@ class MemoryRepository:
         course: object = UNSET,
         knowledge_point: object = UNSET,
         note: object = UNSET,
+        checkpoint: Callable[[sqlite3.Connection], None] | None = None,
     ) -> Correction:
         now = datetime.now(timezone.utc).isoformat()
         if course is not UNSET and course is not None and str(course) != "":
@@ -183,10 +184,19 @@ class MemoryRepository:
                 "updated_at = excluded.updated_at",
                 (self._owner_id, entry_key, *merged, now, now),
             )
+            if checkpoint is not None:
+                # 与记忆写入同一连接/事务：检查点失败时整笔回滚。
+                checkpoint(connection)
             connection.commit()
         return merged
 
-    def add_exclusion(self, entry_key: str, reason: str | None = None) -> bool:
+    def add_exclusion(
+        self,
+        entry_key: str,
+        reason: str | None = None,
+        *,
+        checkpoint: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> bool:
         """写入持续排除；返回 True 表示本次新写入，False 表示之前已排除。"""
 
         now = datetime.now(timezone.utc).isoformat()
@@ -196,5 +206,7 @@ class MemoryRepository:
                 "VALUES (?, ?, ?, ?) ON CONFLICT(owner_id, entry_key) DO NOTHING",
                 (self._owner_id, entry_key, reason, now),
             )
+            if checkpoint is not None:
+                checkpoint(connection)
             connection.commit()
             return cursor.rowcount > 0

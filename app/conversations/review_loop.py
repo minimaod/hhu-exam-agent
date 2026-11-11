@@ -68,6 +68,7 @@ from app.conversations.turn_types import (
 )
 from app.memory.models import parse_entry_id
 from app.querying.errors import QueryError
+from app.quota.errors import QuotaError, quota_of
 from app.questions.errors import QuestionError
 from app.streaming import (
     SENTINEL,
@@ -225,6 +226,7 @@ class ReviewLoopMixin:
             )
 
         try:
+            ctx: _DynamicContext | None = None
             emit("scheduling", "正在根据上下文分析复习需求")
             assert self._make_scheduler is not None
             if prepared.recovery:
@@ -465,10 +467,69 @@ class ReviewLoopMixin:
                 {"reply": reply_meta, "reply_context": reply_context}
             )
         except ConversationStorageError:
-            queue.put_nowait(_storage_error_event(prepared))
+            saved = bool(
+                (getattr(ctx, "recovery", None) or {}).get("business_saved")
+            )
+            if saved:
+                message = "业务结果已保存，但执行记录暂时无法保存，请稍后刷新。"
+                try:
+                    self._repository.fail_turn(
+                        prepared.conversation_id,
+                        prepared.request_id,
+                        "STORAGE_UNAVAILABLE",
+                        message,
+                    )
+                    state.saved = True
+                except ConversationStorageError:
+                    logger.warning("执行记录保存失败，轮次留给启动恢复", exc_info=True)
+                queue.put_nowait(
+                    TurnErrorEvent(
+                        conversation_id=prepared.conversation_id,
+                        request_id=prepared.request_id,
+                        code="STORAGE_UNAVAILABLE",
+                        message=message,
+                        saved=True,
+                    )
+                )
+            else:
+                queue.put_nowait(_storage_error_event(prepared))
+            return
+        except QuotaError as exc:
+            saved = bool((getattr(ctx, "recovery", None) or {}).get("business_saved"))
+            if state.saved:
+                # 业务轮次已经完成，只差正文；保留 completed，通知前端可重生成。
+                queue.put_nowait(
+                    TurnErrorEvent(
+                        conversation_id=prepared.conversation_id,
+                        request_id=prepared.request_id,
+                        code=exc.code,  # type: ignore[arg-type]
+                        message=exc.message,
+                        quota=quota_of(exc),  # type: ignore[arg-type]
+                        saved=True,
+                    )
+                )
+            else:
+                queue.put_nowait(
+                    self._failure_event(
+                        prepared,
+                        exc.code,
+                        exc.message,
+                        state,
+                        quota=quota_of(exc),
+                        saved=saved,
+                    )
+                )
             return
         except QueryError as exc:
-            queue.put_nowait(self._failure_event(prepared, exc.code, exc.message, state))
+            queue.put_nowait(
+                self._failure_event(
+                    prepared,
+                    exc.code,
+                    exc.message,
+                    state,
+                    quota=quota_of(exc),
+                )
+            )
             return
         except Exception:
             logger.exception("动态复习调度执行失败")
@@ -519,6 +580,59 @@ class ReviewLoopMixin:
                 ctx.recovery["pending"] = []
             self._repository.save_recovery(prepared.conversation_id, prepared.request_id, ctx.recovery)
         return outcome
+
+    def _memory_checkpoint(
+        self,
+        prepared: ExecuteTurn,
+        ctx: _DynamicContext,
+        action_name: str,
+    ):
+        """记忆写入的同一个 SQLite 事务里保存动作检查点。
+
+        检查点同时写入“动作成功”的恢复结果：即使记忆提交后再保存最终
+        展示结果失败，重试也不会把已执行的记忆动作当成未完成。
+        检查点失败时抛出，记忆服务回滚整笔写入。
+        """
+
+        def checkpoint(connection) -> None:
+            previous = None
+            had_business_saved = bool(
+                ctx.recovery.get("business_saved")
+            )
+            if ctx.action_index >= 0:
+                entry = ctx.recovery["actions"][ctx.action_index]
+                previous = entry.get("outcome")
+                entry["outcome"] = ActionOutcome(
+                    action_name,
+                    "success",
+                    "学习记忆操作已保存",
+                    {},
+                ).to_dict()
+            ctx.recovery["business_saved"] = True
+            try:
+                self._repository.save_recovery_on(
+                    connection,
+                    prepared.conversation_id,
+                    prepared.request_id,
+                    ctx.recovery,
+                    merge=True,
+                )
+            except Exception:
+                # 只回滚本次新增的标记；同一轮前面已经成功保存的业务结果
+                # 不能被后一项检查点失败抹掉。
+                if had_business_saved:
+                    ctx.recovery["business_saved"] = True
+                else:
+                    ctx.recovery.pop("business_saved", None)
+                if ctx.action_index >= 0:
+                    entry = ctx.recovery["actions"][ctx.action_index]
+                    if previous is None:
+                        entry.pop("outcome", None)
+                    else:
+                        entry["outcome"] = previous
+                raise
+
+        return checkpoint
 
     # ------------------------------------------------------------------
     # F010 C：终局回复
@@ -612,6 +726,8 @@ class ReviewLoopMixin:
             mode = "truncated"
             reason = "length"
         except QueryError as exc:
+            if isinstance(exc, QuotaError):
+                raise
             logger.warning("终局回复不可用：%s", exc.code)
             mode = "fallback" if not pieces else "incomplete"
             failure_reason = (
@@ -874,6 +990,8 @@ class ReviewLoopMixin:
         except (ConversationConflictError, ProblemNotFoundError, ProblemNotReadyError) as exc:
             outcome = ActionOutcome(action.action, "failed", str(exc), error_code="BUSINESS_REJECTED", needs_user=True)
         except QueryError as exc:
+            if isinstance(exc, QuotaError):
+                raise
             outcome = ActionOutcome(action.action, "failed", exc.message, error_code=exc.code, retryable=exc.code in RECOVERABLE_CODES)
         except QuestionError as exc:
             outcome = ActionOutcome(
@@ -1327,7 +1445,9 @@ class ReviewLoopMixin:
 
         if name == "reveal_solution":
             with self._repository.action_write():
-                return self._action_result(prepared, ctx, self._dynamic_reveal(ctx))
+                outcome = self._dynamic_reveal(ctx)
+                ctx.recovery["business_saved"] = True
+                return self._action_result(prepared, ctx, outcome)
 
         if name == "record_mistake":
             with self._repository.action_write():
@@ -1349,6 +1469,7 @@ class ReviewLoopMixin:
                     problem_id=active.id,
                     message="已为您记录“我懂了”反馈。随时可以继续追问、练题或保存题目。",
                 )
+                ctx.recovery["business_saved"] = True
                 return self._action_result(prepared, ctx, ActionOutcome(
                     name,
                     "success",
@@ -1370,15 +1491,28 @@ class ReviewLoopMixin:
             )
 
         if name == "correct_memory":
-            # 记忆写入走独立连接，不占用会话库的写事务，避免与恢复记录互锁。
-            return self._action_result(
-                prepared, ctx, self._memory_correct_outcome(prepared, action, ctx)
+            # 记忆写入走独立连接，但检查点使用同一连接/事务：检查点失败时
+            # 记忆写入回滚，避免数据库与恢复记录不一致。
+            outcome = self._memory_correct_outcome(
+                prepared,
+                action,
+                ctx,
+                checkpoint=self._memory_checkpoint(prepared, ctx, name),
             )
+            if outcome.status == "success":
+                ctx.recovery["business_saved"] = True
+            return self._action_result(prepared, ctx, outcome)
 
         if name == "delete_memory":
-            return self._action_result(
-                prepared, ctx, self._memory_delete_outcome(prepared, action, ctx)
+            outcome = self._memory_delete_outcome(
+                prepared,
+                action,
+                ctx,
+                checkpoint=self._memory_checkpoint(prepared, ctx, name),
             )
+            if outcome.status == "success":
+                ctx.recovery["business_saved"] = True
+            return self._action_result(prepared, ctx, outcome)
 
         if name == "view_workspace":
             return self._view_workspace_outcome(prepared, action, ctx)

@@ -56,6 +56,7 @@ from app.mistakes.models import (
 from app.papers.errors import CatalogUnavailableError
 from app.papers.service import PaperService
 from app.querying.errors import QueryError
+from app.quota.errors import quota_of
 from app.streaming import SENTINEL, stream_events
 from app.tutoring.llm import DeepSeekTutor
 from app.tutoring.models import (
@@ -662,6 +663,7 @@ class MistakeRecordService:
                     request_id=request_id,
                     code=exc.code,
                     message=exc.message,
+                    quota=quota_of(exc),  # type: ignore[arg-type]
                 )
             )
         except TutoringUnavailableError as exc:

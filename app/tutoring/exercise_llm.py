@@ -163,7 +163,14 @@ class DeepSeekExerciseAgent:
                 "生成的练习题格式不符合约定，请重试。",
             ) from exc
         except Exception as exc:
-            raise map_provider_error(exc) from exc
+            if isinstance(exc, QueryError):
+                raise
+            mapped = map_provider_error(exc)
+            if mapped is not None:
+                raise mapped from exc
+            raise QueryError(
+                "MODEL_UNAVAILABLE", "模型服务暂时不可用，请稍后重试。"
+            ) from exc
 
     async def evaluate_answer(
         self,
@@ -232,4 +239,11 @@ class DeepSeekExerciseAgent:
                 "作答评价结果格式不符合约定，请重试。",
             ) from exc
         except Exception as exc:
-            raise map_provider_error(exc) from exc
+            if isinstance(exc, QueryError):
+                raise
+            mapped = map_provider_error(exc)
+            if mapped is not None:
+                raise mapped from exc
+            raise QueryError(
+                "MODEL_UNAVAILABLE", "模型服务暂时不可用，请稍后重试。"
+            ) from exc

@@ -184,3 +184,58 @@ def load_auth_config_state() -> AuthConfigState:
         )
     except (ValueError, QueryConfigError) as exc:
         return AuthConfigState(error=f"登录配置无效：{exc}")
+
+
+# ---------------------------------------------------------------------------
+# F013：模型与图片用量配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODEL_DAILY_LIMIT = 30
+DEFAULT_SITE_DAILY_LIMIT = 500
+DEFAULT_IMAGE_DAILY_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class UsageConfigState:
+    model_requests: int = DEFAULT_MODEL_DAILY_LIMIT
+    site_requests: int = DEFAULT_SITE_DAILY_LIMIT
+    images: int = DEFAULT_IMAGE_DAILY_LIMIT
+    error: str | None = None
+
+
+def _parse_limit(raw: str | None, name: str, default: int) -> int:
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是非负整数。") from exc
+    if value < 0:
+        raise ValueError(f"{name} 必须是非负整数。")
+    return value
+
+
+def load_usage_config_state() -> UsageConfigState:
+    """读取额度配置；非法值不阻止健康检查和试卷，但模型入口返回 503。"""
+
+    source = _SettingsSource(ENV_FILE)
+    try:
+        return UsageConfigState(
+            model_requests=_parse_limit(
+                source.get("HHU_MODEL_DAILY_LIMIT"),
+                "HHU_MODEL_DAILY_LIMIT",
+                DEFAULT_MODEL_DAILY_LIMIT,
+            ),
+            site_requests=_parse_limit(
+                source.get("HHU_SITE_DAILY_LIMIT"),
+                "HHU_SITE_DAILY_LIMIT",
+                DEFAULT_SITE_DAILY_LIMIT,
+            ),
+            images=_parse_limit(
+                source.get("HHU_IMAGE_DAILY_LIMIT"),
+                "HHU_IMAGE_DAILY_LIMIT",
+                DEFAULT_IMAGE_DAILY_LIMIT,
+            ),
+        )
+    except (ValueError, QueryConfigError) as exc:
+        return UsageConfigState(error=f"用量配置无效：{exc}")

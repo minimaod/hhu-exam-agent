@@ -195,6 +195,7 @@ class ExplainMixin:
                 ctx.problem_id = saved.id
                 ctx.tutoring = payload
                 questions = "；".join(payload.questions)
+                ctx.recovery["business_saved"] = True
                 return self._action_result(prepared, ctx, ActionOutcome(
                     name,
                     "clarification",
@@ -267,6 +268,7 @@ class ExplainMixin:
                 request_id=prepared.request_id,
                 target_id=saved.id,
             )
+            ctx.recovery["business_saved"] = True
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
                 "success",

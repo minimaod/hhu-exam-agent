@@ -13,7 +13,10 @@ from app.api.conversations import (
     get_conversation_service_state,
     require_service,
 )
+from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.conversations.errors import (
+    ConversationQueryUnavailableError,
     ConversationStorageError,
     MistakeRecordConflictError,
     ProblemNotFoundError,
@@ -27,6 +30,7 @@ from app.mistakes.models import (
 )
 from app.mistakes.service import CorrectionInput, MistakeRecordService
 from app.querying.service import SSE_HEADERS
+from app.quota.transport import bind_actor
 from app.sse import encode_sse_event
 from app.tutoring.models import Source
 
@@ -249,6 +253,7 @@ async def correct_record(
     payload: CorrectionRequest,
     request: Request,
     records: RecordsDep,
+    user: Annotated[User, Depends(require_user)],
 ) -> StreamingResponse:
     correction = CorrectionInput(
         statement_text=payload.statement_text,
@@ -292,14 +297,32 @@ async def correct_record(
     if not acquired:
         raise MistakeRecordConflictError("该记录正在纠正，请稍后再试。")
 
+    usage_config = getattr(request.app.state, "usage_config", None)
+    usage_error = getattr(usage_config, "error", None)
+    if usage_error:
+        await records.release_correction(str(record_id))
+        raise ConversationQueryUnavailableError(usage_error)
+    gate = getattr(request.app.state, "usage_gate", None)
+    if gate is None:
+        await records.release_correction(str(record_id))
+        raise ConversationQueryUnavailableError("用量限制尚未配置。")
+    try:
+        gate.ensure_available(user.id)
+    except Exception:
+        await records.release_correction(str(record_id))
+        raise
+
     async def encode_corrections():
-        async for event in records.corrections(
-            str(record_id),
-            str(payload.request_id),
-            correction,
-            request,
-        ):
-            yield encode_sse_event(event)
+        # 认证依赖可能在同步线程执行，ContextVar 不会自动回到响应任务；
+        # 这里用已验证的用户显式绑定，保证真实供应商请求能按账号记账。
+        with bind_actor(user.id, request_id=str(payload.request_id)):
+            async for event in records.corrections(
+                str(record_id),
+                str(payload.request_id),
+                correction,
+                request,
+            ):
+                yield encode_sse_event(event)
 
     return StreamingResponse(
         encode_corrections(),

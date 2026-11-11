@@ -10,6 +10,7 @@ import ConversationList from "./ConversationList";
 import ConversationTurn from "./ConversationTurn";
 import AssistantDraft from "./AssistantDraft";
 import TurnComposer, { type PendingFile } from "./TurnComposer";
+import UsageNotice from "./UsageNotice";
 import {
   ConversationsApiError,
   createConversation,
@@ -42,6 +43,13 @@ import {
   classifySuggestion,
   type DownloadStates,
 } from "../lib/display";
+import {
+  fetchUsage,
+  millisecondsUntilReset,
+  quotaBlocksImages,
+  quotaBlocksRequests,
+  type UsageSnapshot,
+} from "../lib/usageApi";
 
 type ListState =
   | { phase: "loading" }
@@ -167,6 +175,8 @@ export default function ConversationWorkspace({
   const [live, setLive] = useState<LiveState | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -390,6 +400,48 @@ export default function ConversationWorkspace({
     openConversation(openConversationId);
   }, [openConversationId, openConversation]);
 
+  const refreshUsage = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const snapshot = await fetchUsage(signal);
+      setUsage(snapshot);
+      setUsageError(null);
+    } catch (error) {
+      if (isAbortError(error)) return;
+      setUsageError(
+        error instanceof Error ? error.message : "读取今日用量失败，请稍后重试。",
+      );
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void refreshUsage(controller.signal);
+    return () => controller.abort();
+  }, [refreshUsage]);
+
+  useEffect(() => {
+    if (!usage) return;
+    const timer = window.setTimeout(
+      () => void refreshUsage(),
+      Math.min(millisecondsUntilReset(usage.reset_at), 2_147_000_000),
+    );
+    return () => window.clearTimeout(timer);
+  }, [usage, refreshUsage]);
+
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible") {
+        void refreshUsage();
+      }
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [refreshUsage]);
+
   const sourceOptions = useMemo(() => {
     const map = new Map<string, PaperItem>();
     if (detailState.phase === "ready") {
@@ -524,6 +576,18 @@ export default function ConversationWorkspace({
       }
       const conversationId = currentIdRef.current;
       if (!conversationId) {
+        return;
+      }
+      // 题卡选中、查看答案、保存错题等操作后端明确不调用模型；额度耗尽时
+      // 仍应可用。普通聊天和生成/评价练习继续受额度限制。
+      const modelFree =
+        options.questionAction === "record" ||
+        kindOverride === "select_question" ||
+        kindOverride === "view_question_answer" ||
+        kindOverride === "record" ||
+        kindOverride === "feedback" ||
+        kindOverride === "reveal_solution";
+      if (!modelFree && quotaBlocksRequests(usage)) {
         return;
       }
 
@@ -721,6 +785,23 @@ export default function ConversationWorkspace({
         updateLive(null);
         setStreamDraft(interruptedDraft);
         setErrorNotice(toMessage(error));
+        if (
+          error instanceof ConversationsApiError &&
+          (error.code === "MODEL_QUOTA_EXCEEDED" ||
+            error.code === "QUOTA_STORAGE_UNAVAILABLE" ||
+            error.code === "IMAGE_QUOTA_EXCEEDED")
+        ) {
+          void refreshUsage();
+          if (error.saved) {
+            const savedDetail = await loadDetail(conversationId);
+            if (!isCurrentOperation(conversationId, sequence)) {
+              return;
+            }
+            if (savedDetail) {
+              setNotice("本轮已保存的业务结果已载入；额度恢复后可继续。");
+            }
+          }
+        }
 
         const uncertain =
           !(error instanceof ConversationsApiError) ||
@@ -754,6 +835,7 @@ export default function ConversationWorkspace({
           setSubmitting(false);
           abortRef.current = null;
         }
+        void refreshUsage();
       }
     },
     [
@@ -763,6 +845,7 @@ export default function ConversationWorkspace({
       loadDetail,
       mode,
       refreshList,
+      refreshUsage,
       setPendingFiles,
       solutionText,
       sourceOptions,
@@ -771,6 +854,7 @@ export default function ConversationWorkspace({
       scrollToBottom,
       targetProblem,
       updateLive,
+      usage,
     ],
   );
 
@@ -1144,8 +1228,12 @@ export default function ConversationWorkspace({
   const currentConversation =
     detailState.phase === "ready" ? detailState.detail.conversation : null;
   const canSubmit =
-    currentId !== null && detailState.phase === "ready" && !submitting;
+    currentId !== null &&
+    detailState.phase === "ready" &&
+    !submitting &&
+    !quotaBlocksRequests(usage);
   const busy = submitting || live !== null;
+  const imagesBlocked = quotaBlocksImages(usage);
 
   // 每道练习只保留一张题目主卡；其余出现该练习的轮次按 request_id 对应到具体一次作答，
   // 渲染成紧凑回执。历史数据没有 request_id 时回退为“查看完整题目”链接，不丢记录。
@@ -1472,11 +1560,14 @@ export default function ConversationWorkspace({
                 data-testid="composer"
                 className="shrink-0 border-t border-slate-200/70 bg-[#f6f4ee] pt-2"
               >
+                <UsageNotice usage={usage} error={usageError} />
                 {renderErrorNotice()}
                 <TurnComposer
                   value={draft}
                   running={busy}
                   disabled={!canSubmit}
+                  quotaBlocked={quotaBlocksRequests(usage)}
+                  imagesBlocked={imagesBlocked}
                   disabledReason={composerDisabledReason}
                   confirmedCourse={confirmedCourse}
                   activeProblem={activeProblem}

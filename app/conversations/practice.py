@@ -28,6 +28,7 @@ from app.conversations.models import (
     ExerciseEvaluation,
     ExerciseView,
     RECOVERABLE_CODES,
+    TurnErrorEvent,
     TurnEvent,
     TurnMessageDeltaEvent,
     TurnProgressEvent,
@@ -49,6 +50,7 @@ from app.conversations.turn_types import (
     _storage_error_event,
 )
 from app.querying.errors import QueryError
+from app.quota.errors import QuotaError, quota_of
 from app.questions.cards import compose_statement
 from app.tutoring.exercise_dedup import (
     MAX_GENERATION_ATTEMPTS,
@@ -595,6 +597,7 @@ class PracticeMixin:
                     source_version=self.questions.source_version or "",
                 )
             ctx.exercise_view = self._build_exercise_view(exercise)
+            ctx.recovery["business_saved"] = True
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
                 "success",
@@ -646,7 +649,7 @@ class PracticeMixin:
             ))
 
         emit("evaluating_exercise", "正在评价您的作答与推导过程")
-        saved, attempt = self._save_exercise_attempt(prepared, exercise, plan)
+        saved, attempt = self._save_exercise_attempt(prepared, exercise, plan, ctx)
         images = load_images(
             attempt.attachments,
             root=self._attachments_root,
@@ -683,6 +686,8 @@ class PracticeMixin:
                 attempt_kind=attempt.kind,
             )
         except Exception as exc:
+            if isinstance(exc, QuotaError):
+                raise
             logger.warning("作答评价失败：%s", exc)
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
@@ -822,21 +827,30 @@ class PracticeMixin:
         if feedback and len(feedback) > 2000:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name, "clarification", "备注超过 2000 字，请缩短后再保存。", needs_user=True))
-        try:
-            detail, created, needs_update = self._records.create_from_problem(
-                request_id=prepared.request_id,
-                conversation_id=prepared.conversation_id,
-                problem_id=active.id,
-                feedback_text=feedback,
-            )
-        except MistakeRecordConflictError:
-            return self._action_result(prepared, ctx, ActionOutcome(
-                name, "success", "该题目已在错题本中。", {"problem_id": active.id}
-            ))
-        if not created and feedback is not None:
-            detail = self._records.update_metadata(
-                detail.id, title=None, source=None, feedback_text=feedback,
-                self_reported_understood=None,
+        with self._repository.action_write():
+            try:
+                detail, created, needs_update = self._records.create_from_problem(
+                    request_id=prepared.request_id,
+                    conversation_id=prepared.conversation_id,
+                    problem_id=active.id,
+                    feedback_text=feedback,
+                )
+            except MistakeRecordConflictError:
+                ctx.recovery["business_saved"] = True
+                self._repository.mark_business_saved(
+                    prepared.conversation_id, prepared.request_id
+                )
+                return self._action_result(prepared, ctx, ActionOutcome(
+                    name, "success", "该题目已在错题本中。", {"problem_id": active.id}
+                ))
+            if not created and feedback is not None:
+                detail = self._records.update_metadata(
+                    detail.id, title=None, source=None, feedback_text=feedback,
+                    self_reported_understood=None,
+                )
+            ctx.recovery["business_saved"] = True
+            self._repository.mark_business_saved(
+                prepared.conversation_id, prepared.request_id
             )
         record_row = self._repository.get_record(detail.id)
         if record_row is None:
@@ -1050,6 +1064,18 @@ class PracticeMixin:
                 attempt_kind=attempt.kind,
             )
         except Exception as exc:
+            if isinstance(exc, QuotaError):
+                # 作答已经保存；给出带 saved 的终止错误，允许额度恢复后
+                # 用同一 attempt 只补评价，不能让生成器直接抛出断流。
+                yield self._failure_event(
+                    prepared,
+                    exc.code,
+                    "作答已保存，但评价因额度限制未完成；额度恢复后可重试。",
+                    state,
+                    quota=quota_of(exc),
+                    saved=True,
+                )
+                return
             logger.warning("评价作答失败，作答已保存：%s", exc)
             saved_view = self._build_exercise_view(saved)
             code = exc.code if isinstance(exc, QueryError) else "TUTORING_FAILED"
@@ -1125,11 +1151,23 @@ class PracticeMixin:
                 stage="composing_reply", message="正在组织作答评价",
             )
             meta = {}
-            async for piece in self._reply_pieces(self._make_reply(), material, meta):
-                yield TurnMessageDeltaEvent(
-                    conversation_id=prepared.conversation_id, request_id=prepared.request_id,
-                    seq=int(meta["deltas"]), delta=piece[:400],
+            try:
+                async for piece in self._reply_pieces(self._make_reply(), material, meta):
+                    yield TurnMessageDeltaEvent(
+                        conversation_id=prepared.conversation_id, request_id=prepared.request_id,
+                        seq=int(meta["deltas"]), delta=piece[:400],
+                    )
+            except QuotaError as exc:
+                # 评价和轮次已经保存，只差正文；保留 completed，通知可重生成。
+                yield TurnErrorEvent(
+                    conversation_id=prepared.conversation_id,
+                    request_id=prepared.request_id,
+                    code=exc.code,  # type: ignore[arg-type]
+                    message=exc.message,
+                    quota=quota_of(exc),  # type: ignore[arg-type]
+                    saved=True,
                 )
+                return
             text = str(meta.pop("text", "") or "")
             message = text or message
             self._repository.update_turn_reply(
@@ -1153,7 +1191,11 @@ class PracticeMixin:
         )
 
     def _save_exercise_attempt(
-        self, prepared: ExecuteTurn, ex: ExerciseRecord, plan: _AttemptPlan
+        self,
+        prepared: ExecuteTurn,
+        ex: ExerciseRecord,
+        plan: _AttemptPlan,
+        ctx: _DynamicContext | None = None,
     ) -> tuple[ExerciseRecord, ExerciseAttemptRecord]:
         """保存尝试或复用已有尝试；复用不写库、不覆盖原答案。"""
 
@@ -1190,6 +1232,12 @@ class PracticeMixin:
                 prepared.conversation_id,
                 prepared.request_id,
                 {"input": original_input, "exercise_id": ex.id},
+                merge=True,
+            )
+            if ctx is not None:
+                ctx.recovery["business_saved"] = True
+            self._repository.mark_business_saved(
+                prepared.conversation_id, prepared.request_id
             )
         return saved, attempt
 

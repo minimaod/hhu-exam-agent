@@ -25,6 +25,7 @@ from app.conversations.turn_types import (
     _DynamicContext,
 )
 from app.questions.models import QuestionCard
+from app.quota.errors import QuotaError
 
 logger = logging.getLogger("app.conversations.service")
 
@@ -233,6 +234,9 @@ class NarrationMixin:
                 text="".join(pieces).strip(),
             )
             return
+        except QuotaError:
+            # 额度错误必须成为终止错误事件，不能伪装成普通正文失败。
+            raise
         except Exception:
             logger.warning("最终回复生成失败", exc_info=True)
             text = "".join(pieces).strip()

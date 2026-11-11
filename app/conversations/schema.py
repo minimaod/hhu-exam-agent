@@ -37,7 +37,7 @@ from app.conversations.inputs import query_input
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _STORAGE_MESSAGE = "本地学习数据暂时不可用，请稍后再试。"
 _UPGRADE_MESSAGE = "本地学习数据的结构版本不兼容，请保留原文件并联系维护者。"
@@ -589,6 +589,67 @@ _V7_FOREIGN_KEYS = {
 }
 
 _V7_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = dict(_V6_REQUIRED_CHECKS)
+
+# ---------------------------------------------------------------------------
+# v8 结构（F013：模型用量、临时额度与每账号执行占用）
+# ---------------------------------------------------------------------------
+
+_V8_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V7_COLUMNS,
+    "model_usage_events": (
+        "id",
+        "owner_id",
+        "usage_date",
+        "created_at",
+        "kind",
+        "conversation_id",
+        "request_id",
+    ),
+    "model_quota_overrides": (
+        "owner_id",
+        "daily_requests",
+        "daily_images",
+        "expires_on",
+        "updated_at",
+    ),
+    "user_active_turns": (
+        "owner_id",
+        "conversation_id",
+        "request_id",
+        "lease_token",
+        "started_at",
+    ),
+}
+
+_V8_TABLES = frozenset(_V8_COLUMNS)
+_V8_INDEXES = frozenset(
+    _V7_INDEXES
+    | {
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+    }
+)
+
+_V8_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V7_PRIMARY_KEYS,
+    "model_usage_events": ("id",),
+    "model_quota_overrides": ("owner_id",),
+    "user_active_turns": ("owner_id",),
+}
+
+_V8_UNIQUE_SETS = {
+    *_V7_UNIQUE_SETS,
+    ("lease_token",),
+}
+
+_V8_FOREIGN_KEYS = {
+    *_V7_FOREIGN_KEYS,
+    ("owner_id", "users", "id"),
+    ("conversation_id", "conversations", "id"),
+}
+
+_V8_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = dict(_V7_REQUIRED_CHECKS)
 
 # ---------------------------------------------------------------------------
 # DDL
@@ -1374,6 +1435,81 @@ def _v7_migration_statements() -> tuple[str, ...]:
     return _V7_MIGRATION_STATEMENTS
 
 
+# ---------------------------------------------------------------------------
+# v8 DDL（F013 用量）
+# ---------------------------------------------------------------------------
+
+_MODEL_USAGE_EVENTS = """
+CREATE TABLE IF NOT EXISTS model_usage_events (
+    id INTEGER PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    usage_date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('model_request', 'image_upload')),
+    conversation_id TEXT,
+    request_id TEXT
+)
+"""
+
+_MODEL_USAGE_USER_DAY = """
+CREATE INDEX IF NOT EXISTS model_usage_user_day
+    ON model_usage_events(owner_id, usage_date, kind)
+"""
+
+_MODEL_USAGE_SITE_DAY = """
+CREATE INDEX IF NOT EXISTS model_usage_site_day
+    ON model_usage_events(usage_date, kind)
+"""
+
+_MODEL_QUOTA_OVERRIDES = """
+CREATE TABLE IF NOT EXISTS model_quota_overrides (
+    owner_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    daily_requests INTEGER CHECK (daily_requests IS NULL OR daily_requests >= 0),
+    daily_images INTEGER CHECK (daily_images IS NULL OR daily_images >= 0),
+    expires_on TEXT,
+    updated_at TEXT NOT NULL
+)
+"""
+
+_USER_ACTIVE_TURNS = """
+CREATE TABLE IF NOT EXISTS user_active_turns (
+    owner_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    lease_token TEXT NOT NULL UNIQUE,
+    started_at TEXT NOT NULL
+)
+"""
+
+_USER_ACTIVE_TURNS_REQUEST = """
+CREATE INDEX IF NOT EXISTS user_active_turns_request
+    ON user_active_turns(request_id)
+"""
+
+_CREATE_V8_STATEMENTS = (
+    *_CREATE_V7_STATEMENTS,
+    _MODEL_USAGE_EVENTS,
+    _MODEL_USAGE_USER_DAY,
+    _MODEL_USAGE_SITE_DAY,
+    _MODEL_QUOTA_OVERRIDES,
+    _USER_ACTIVE_TURNS,
+    _USER_ACTIVE_TURNS_REQUEST,
+)
+
+_V8_MIGRATION_STATEMENTS = (
+    _MODEL_USAGE_EVENTS,
+    _MODEL_USAGE_USER_DAY,
+    _MODEL_USAGE_SITE_DAY,
+    _MODEL_QUOTA_OVERRIDES,
+    _USER_ACTIVE_TURNS,
+    _USER_ACTIVE_TURNS_REQUEST,
+)
+
+
+def _v8_migration_statements() -> tuple[str, ...]:
+    return _V8_MIGRATION_STATEMENTS
+
+
 @dataclass(frozen=True)
 class SchemaOwner:
     """v6→v7 迁移时创建/复用的管理员。"""
@@ -1395,10 +1531,10 @@ def initialize_database(
     *,
     migration_owner: SchemaOwner | None = None,
 ) -> None:
-    """建库、校验或迁移到 v7，并恢复遗留运行中轮次。
+    """建库、校验或迁移到 v8，并恢复遗留运行中轮次。
 
-    旧库不会在普通启动中自动升级：调用方必须显式传入 ``migration_owner``，
-    这由管理员 CLI 提供。空库仍可直接创建 v7。
+    旧库不会在普通启动中自动升级：v6 及更早需要管理员账号，v7→v8 不需要。
+    空库仍可直接创建 v8。
     """
 
     try:
@@ -1414,34 +1550,37 @@ def initialize_database(
         except sqlite3.DatabaseError as exc:
             raise ConversationStorageError(_STORAGE_MESSAGE) from exc
 
-        needs_migration = bool(objects) and version != SCHEMA_VERSION
-        if needs_migration and migration_owner is None:
-            raise ConversationStorageError(_MIGRATION_NEEDED_MESSAGE)
-
         if version == 0:
             if not objects:
-                _create_v7(connection)
+                _create_v8(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v8(connection):
+                _adopt_version(connection, SCHEMA_VERSION)
                 _enable_wal(connection)
             elif _is_compatible_v7(connection):
-                _adopt_version(connection, SCHEMA_VERSION)
+                _migrate_v7_to_v8(connection)
                 _enable_wal(connection)
             elif _is_compatible_v6(connection):
                 _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
                 _enable_wal(connection)
             elif _is_compatible_v5(connection):
                 _migrate_v5_to_v6(connection)
                 _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
                 _enable_wal(connection)
             elif _is_compatible_v4(connection):
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
                 _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
                 _enable_wal(connection)
             elif _is_compatible_v3(connection):
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
                 _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
                 _enable_wal(connection)
             elif _is_compatible_v2(connection):
                 _migrate_v2_to_v3(connection)
@@ -1449,6 +1588,7 @@ def initialize_database(
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
                 _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
                 _enable_wal(connection)
             elif _is_compatible_v1(connection):
                 _migrate_v1_to_v2(connection)
@@ -1457,6 +1597,7 @@ def initialize_database(
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
                 _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
                 _enable_wal(connection)
             else:
                 raise ConversationStorageError(_UNKNOWN_MESSAGE)
@@ -1469,6 +1610,7 @@ def initialize_database(
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
             _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
             _enable_wal(connection)
         elif version == 2:
             if not _is_compatible_v2(connection):
@@ -1478,6 +1620,7 @@ def initialize_database(
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
             _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
             _enable_wal(connection)
         elif version == 3:
             if not _is_compatible_v3(connection):
@@ -1486,6 +1629,7 @@ def initialize_database(
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
             _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
             _enable_wal(connection)
         elif version == 4:
             if not _is_compatible_v4(connection):
@@ -1493,20 +1637,28 @@ def initialize_database(
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
             _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
             _enable_wal(connection)
         elif version == 5:
             if not _is_compatible_v5(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v5_to_v6(connection)
             _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
             _enable_wal(connection)
         elif version == 6:
             if not _is_compatible_v6(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
+            _enable_wal(connection)
+        elif version == 7:
+            if not _is_compatible_v7(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v7_to_v8(connection)
             _enable_wal(connection)
         elif version == SCHEMA_VERSION:
-            if not _is_compatible_v7(connection):
+            if not _is_compatible_v8(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _enable_wal(connection)
         else:
@@ -1810,6 +1962,58 @@ def _is_compatible_v7(connection: sqlite3.Connection) -> bool:
     )
 
 
+def _is_compatible_v8(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V8_TABLES) | set(_V8_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V8_COLUMNS,
+            primary_keys=_V8_PRIMARY_KEYS,
+            unique_sets=_V8_UNIQUE_SETS,
+            foreign_keys=_V8_FOREIGN_KEYS,
+            required_checks=_V8_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
 def _check_common(
     connection: sqlite3.Connection,
     *,
@@ -2034,6 +2238,34 @@ def _create_v7(connection: sqlite3.Connection) -> None:
         raise ConversationStorageError(_STORAGE_MESSAGE) from exc
 
 
+def _create_v8(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V8_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """只追加 v8 用量表，不改旧数据。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _v8_migration_statements():
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
 def _migrate_v6_to_v7(
     connection: sqlite3.Connection, owner: SchemaOwner
 ) -> None:
@@ -2243,19 +2475,25 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def _recover_running(connection: sqlite3.Connection) -> None:
-    """启动恢复：遗留 running 轮次变成 interrupted，不重跑模型。"""
+    """启动恢复：遗留 running 轮次变成 interrupted，不重跑模型。
+
+    当前部署以单后端进程为前提，因此启动时可以清空全部执行占用；多进程部署
+    不能直接复用这个假设。
+    """
 
     from datetime import datetime, timezone
 
     try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM user_active_turns")
         running = connection.execute(
             "SELECT COUNT(*) FROM conversation_turns WHERE status = 'running'"
         ).fetchone()[0]
         if not running:
+            connection.commit()
             return
 
         now = datetime.now(timezone.utc).isoformat()
-        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             UPDATE conversations SET updated_at = ?

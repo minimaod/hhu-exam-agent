@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
+import httpx
 
 from app.api.attachments import router as attachments_router
 from app.api.auth import router as auth_router
@@ -21,9 +22,23 @@ from app.api.memory import router as memory_router
 from app.api.mistakes import router as mistakes_router
 from app.api.papers import router as papers_router
 from app.api.query import router as query_router
+from app.api.usage import router as usage_router
 from app.auth.dependencies import require_user
 from app.auth.service import AuthService, AuthSettings
-from app.config import load_auth_config_state, load_config_state
+from app.config import (
+    load_auth_config_state,
+    load_config_state,
+    load_usage_config_state,
+)
+from app.quota.errors import (
+    ImageQuotaExceeded,
+    ModelQuotaExceeded,
+    QuotaStorageError,
+    TurnInProgressError,
+)
+from app.quota.gate import UsageGate, UsageLimits
+from app.quota.lease import LeaseRegistry
+from app.quota.transport import QuotaTransport
 from app.conversations.errors import (
     ActiveProblemConflictError,
     AttachmentInvalidError,
@@ -62,11 +77,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.query_config = load_config_state()
     app.state.auth_config = load_auth_config_state()
+    app.state.usage_config = load_usage_config_state()
     app.state.conversation_store = build_store_state()
     app.state.question_runtime = build_question_runtime()
+    app.state.usage_gate = None
+    app.state.model_http_client = None
+    app.state.lease_registry = LeaseRegistry()
     store = app.state.conversation_store
     auth_config = app.state.auth_config
+    usage_config = app.state.usage_config
     app.state.auth_service = None
+
+    if (
+        store.db_path is not None
+        and store.error is None
+        and usage_config.error is None
+    ):
+        app.state.usage_gate = UsageGate(
+            store.db_path,
+            limits=UsageLimits(
+                model_requests=usage_config.model_requests,
+                site_requests=usage_config.site_requests,
+                images=usage_config.images,
+            ),
+        )
+        app.state.model_http_client = httpx.AsyncClient(
+            transport=QuotaTransport(app.state.usage_gate),
+            timeout=None,
+        )
     if (
         store.db_path is not None
         and store.error is None
@@ -88,6 +126,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        client = getattr(app.state, "model_http_client", None)
+        if client is not None:
+            await client.aclose()
         runtime = getattr(app.state, "question_runtime", None)
         if runtime is not None:
             runtime.close()
@@ -119,6 +160,9 @@ app.include_router(
 )
 app.include_router(
     memory_router, prefix="/api", dependencies=[Depends(require_user)]
+)
+app.include_router(
+    usage_router, prefix="/api", dependencies=[Depends(require_user)]
 )
 
 
@@ -319,6 +363,58 @@ async def handle_memory_correction_unsupported(
     """单次作答只能整体移除，或纠正内容为空：422。"""
 
     return _detail_response(422, str(exc))
+
+
+@app.exception_handler(ModelQuotaExceeded)
+async def handle_model_quota(
+    request: Request,
+    exc: ModelQuotaExceeded,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": exc.message,
+            "code": exc.code,
+            "quota": exc.quota(),
+        },
+    )
+
+
+@app.exception_handler(ImageQuotaExceeded)
+async def handle_image_quota(
+    request: Request,
+    exc: ImageQuotaExceeded,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": exc.message,
+            "code": exc.code,
+            "quota": exc.quota(),
+        },
+    )
+
+
+@app.exception_handler(TurnInProgressError)
+async def handle_turn_in_progress(
+    request: Request,
+    exc: TurnInProgressError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "code": "TURN_IN_PROGRESS"},
+    )
+
+
+@app.exception_handler(QuotaStorageError)
+async def handle_quota_storage(
+    request: Request,
+    exc: QuotaStorageError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": exc.message, "code": exc.code},
+    )
 
 
 @app.exception_handler(QuestionError)

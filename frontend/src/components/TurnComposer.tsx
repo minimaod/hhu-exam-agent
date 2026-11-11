@@ -15,6 +15,8 @@ type TurnComposerProps = {
   value: string;
   running: boolean;
   disabled: boolean;
+  quotaBlocked?: boolean;
+  imagesBlocked?: boolean;
   disabledReason?: "no-conversation" | "loading" | null;
   confirmedCourse?: string | null;
   activeProblem: ProblemView | null;
@@ -57,6 +59,8 @@ export default function TurnComposer({
   value,
   running,
   disabled,
+  quotaBlocked = false,
+  imagesBlocked = false,
   disabledReason = null,
   confirmedCourse = null,
   activeProblem,
@@ -104,7 +108,8 @@ export default function TurnComposer({
     element.style.height = `${Math.max(40, Math.min(160, element.scrollHeight))}px`;
   }, [value]);
   const examples = examplesFor(confirmedCourse);
-  const canSend = !running && !disabled && (value.trim().length > 0 || files.length > 0);
+  const blocked = disabled || quotaBlocked;
+  const canSend = !running && !blocked && (value.trim().length > 0 || files.length > 0);
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter" || !(event.ctrlKey || event.metaKey)) {
@@ -148,7 +153,7 @@ export default function TurnComposer({
         className="mt-1"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!running && !disabled) {
+          if (!running && !blocked) {
             onSubmit();
           }
         }}
@@ -184,6 +189,7 @@ export default function TurnComposer({
             }}
             rows={1}
             maxLength={2000}
+            disabled={quotaBlocked}
             placeholder={placeholder}
             aria-keyshortcuts="Control+Enter Meta+Enter"
             title="Enter 换行；Ctrl/⌘ + Enter 发送"
@@ -228,6 +234,7 @@ export default function TurnComposer({
                 type="file"
                 accept="image/jpeg,image/png,image/gif,image/webp"
                 multiple
+                disabled={quotaBlocked || imagesBlocked}
                 className="hidden"
                 onChange={(event) => handleFiles(event, "statement")}
               />
@@ -238,6 +245,7 @@ export default function TurnComposer({
                 type="file"
                 accept="image/jpeg,image/png,image/gif,image/webp"
                 multiple
+                disabled={quotaBlocked || imagesBlocked}
                 className="hidden"
                 onChange={(event) => handleFiles(event, "solution")}
               />
@@ -300,7 +308,9 @@ export default function TurnComposer({
           <span className="text-[10px] text-slate-400">
             {running
               ? "正在处理，请稍候…"
-              : disabledReason === "no-conversation"
+              : quotaBlocked
+                ? "今日模型请求额度已用完"
+                : disabledReason === "no-conversation"
                 ? "请先新建或选择会话"
                 : disabledReason === "loading"
                   ? "正在读取会话记录…"
@@ -318,7 +328,7 @@ export default function TurnComposer({
             )}
             <button
               type="submit"
-              disabled={running || disabled || (!value.trim() && files.length === 0)}
+              disabled={running || blocked || (!value.trim() && files.length === 0)}
               className="inline-flex items-center rounded-lg bg-river px-4 py-1.5 text-xs font-medium text-white transition hover:bg-river/90 disabled:cursor-not-allowed disabled:bg-slate-400"
             >
               {running ? "处理中…" : "发送"}

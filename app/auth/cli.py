@@ -1,4 +1,4 @@
-"""F012 管理员命令行。
+"""F012/F013 管理员命令行。
 
 用法：
     uv run python -m app.auth.cli migrate --admin-username admin
@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,21 +55,34 @@ def _read_password(args: argparse.Namespace) -> str:
     return first
 
 
+def _db_version(db_path: Path) -> int:
+    connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    try:
+        return int(connection.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        connection.close()
+
+
 def _cmd_migrate(args: argparse.Namespace) -> int:
     db_path = Path(args.database)
     if not db_path.is_file():
         raise SystemExit(f"数据库不存在：{db_path}")
     try:
-        username = validate_username(args.admin_username)
-        password = _read_password(args)
-        validate_password(password)
-        owner = schema.SchemaOwner(
-            id=str(uuid4()),
-            username=username,
-            username_normalized=normalize_username(username),
-            password_hash=hash_password(password),
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
+        version = _db_version(db_path)
+        owner = None
+        if version == 6:
+            if not args.admin_username:
+                raise SystemExit("从 v6 升级需要 --admin-username。")
+            username = validate_username(args.admin_username)
+            password = _read_password(args)
+            validate_password(password)
+            owner = schema.SchemaOwner(
+                id=str(uuid4()),
+                username=username,
+                username_normalized=normalize_username(username),
+                password_hash=hash_password(password),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
         report = migrate_database(
             db_path,
             owner=owner,
@@ -77,18 +91,18 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
             else db_path.parent / "backups",
         )
     except MigrationCommittedCheckError as exc:
-        print(f"迁移已提交为 v7，但提交后检查失败：{exc}", file=sys.stderr)
+        print(f"迁移已提交为 v8，但提交后检查失败：{exc}", file=sys.stderr)
         return 1
     except MigrationRolledBackError as exc:
-        print(f"迁移失败，事务已回滚，数据库仍为 v6：{exc}", file=sys.stderr)
+        print(f"迁移失败，事务已回滚：{exc}", file=sys.stderr)
         return 1
     except (AuthPasswordError, ConversationStorageError) as exc:
         print(f"迁移失败：{exc}", file=sys.stderr)
         return 1
     if report.already_migrated:
-        print(f"数据库已是 v7：会话 {report.conversations} 条，无需修改。")
+        print(f"数据库已是 v8：会话 {report.conversations} 条，无需修改。")
     else:
-        print(f"迁移完成：v7，会话 {report.conversations} 条。")
+        print(f"迁移完成：v8，会话 {report.conversations} 条。")
         print(f"备份：{report.backup_path}")
     return 0
 
@@ -147,8 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", default=str(_default_db()))
     sub = parser.add_subparsers(dest="command", required=True)
 
-    migrate = sub.add_parser("migrate", help="v6→v7 迁移（自动备份）")
-    migrate.add_argument("--admin-username", required=True)
+    migrate = sub.add_parser("migrate", help="v6/v7→v8 迁移（自动备份）")
+    migrate.add_argument("--admin-username")
     migrate.add_argument("--backup-dir")
     migrate.add_argument(
         "--admin-password-stdin",

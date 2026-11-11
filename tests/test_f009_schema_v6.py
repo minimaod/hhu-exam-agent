@@ -53,7 +53,7 @@ def test_fresh_database_creates_v6_memory_tables(tmp_path: Path) -> None:
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert {"memory_corrections", "memory_exclusions"} <= _tables(path)
         columns = [
             row[1]
@@ -81,7 +81,7 @@ def test_v5_migrates_to_v6_without_touching_old_rows(tmp_path: Path) -> None:
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert connection.execute("SELECT title FROM conversations").fetchone()[0] == "升级前的会话"
         # 只建表、不回填：旧练习不会凭空出现在记忆覆盖表里。
         assert connection.execute("SELECT COUNT(*) FROM memory_corrections").fetchone()[0] == 0

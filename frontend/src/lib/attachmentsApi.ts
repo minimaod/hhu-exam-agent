@@ -3,17 +3,20 @@
 import { readErrorDetail } from "./papersApi.ts";
 import type { AttachmentMeta } from "./conversationsApi.ts";
 import { apiFetch } from "./apiFetch.ts";
+import { parseQuotaFailure, type QuotaInfo } from "./usageApi.ts";
 
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 const ALLOWED = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
 export class AttachmentsApiError extends Error {
   readonly status: number | undefined;
+  readonly quota: QuotaInfo | null;
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, quota?: QuotaInfo | null) {
     super(message);
     this.name = "AttachmentsApiError";
     this.status = status;
+    this.quota = quota ?? null;
   }
 }
 
@@ -67,7 +70,12 @@ export async function uploadAttachment(
   }
 
   if (!response.ok) {
-    throw new AttachmentsApiError(await readErrorDetail(response), response.status);
+    const failure = await parseQuotaFailure(response.clone());
+    throw new AttachmentsApiError(
+      failure?.message ?? (await readErrorDetail(response)),
+      response.status,
+      failure?.quota,
+    );
   }
 
   let payload: unknown;

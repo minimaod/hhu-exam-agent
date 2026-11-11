@@ -1,6 +1,7 @@
 """错题记录创建、列表、修改、纠正幂等与来源校验。"""
 
 from dataclasses import dataclass
+import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
@@ -393,3 +394,186 @@ def test_record_correction_rejects_total_and_duplicate_attachments(
         },
     )
     assert duplicate.status_code == 422
+
+
+def test_correction_stream_binds_authenticated_actor(env: Env) -> None:
+    from app.quota.transport import current_actor
+    from tests.f012_support import TEST_USER_ID
+
+    conversation_id = env.client.post("/api/conversations", json={}).json()["id"]
+    _problem(env, conversation_id, "绑定账号")
+    record_id = _record(env, conversation_id)
+    seen: list[str | None] = []
+    original = env.tutor.understand_problem
+
+    async def wrapped(text, images):
+        seen.append(current_actor())
+        return await original(text, images)
+
+    env.tutor.understand_problem = wrapped  # type: ignore[method-assign]
+    env.tutor.push_understanding(clear_understanding("新题干"))
+    env.tutor.push_explanation(sample_explanation("2"))
+    response = env.client.post(
+        f"/api/mistake-records/{record_id}/corrections",
+        json={"request_id": str(uuid4()), "statement_text": "新题干"},
+    )
+    assert _last_event(response)["result"]["kind"] == "record_updated"
+    assert seen and all(value == TEST_USER_ID for value in seen)
+
+
+def test_correction_quota_precheck_blocks_before_sse(env: Env) -> None:
+    from tests.f012_support import TEST_USER_ID
+
+    conversation_id = env.client.post("/api/conversations", json={}).json()["id"]
+    _problem(env, conversation_id, "额度预检")
+    record_id = _record(env, conversation_id)
+    calls = len(env.tutor.understand_calls)
+    gate = app.state.usage_gate
+    assert gate is not None
+    gate.set_override(
+        TEST_USER_ID,
+        daily_requests=0,
+        daily_images=1,
+        expires_on="2099-01-01",
+    )
+    response = env.client.post(
+        f"/api/mistake-records/{record_id}/corrections",
+        json={"request_id": str(uuid4()), "statement_text": "新题干"},
+    )
+    assert response.status_code == 429, response.text
+    assert response.json()["code"] == "MODEL_QUOTA_EXCEEDED"
+    assert len(env.tutor.understand_calls) == calls
+
+
+def test_correction_real_model_path_counts_usage(env: Env) -> None:
+    import json
+    import httpx
+    from app.config import DeepSeekSettings
+    from app.quota.transport import QuotaTransport
+    from app.tutoring.llm import DeepSeekTutor
+    from tests.f012_support import TEST_USER_ID
+
+    conversation_id = env.client.post("/api/conversations", json={}).json()["id"]
+    _problem(env, conversation_id, "真实路径")
+    record_id = _record(env, conversation_id)
+    gate = app.state.usage_gate
+    assert gate is not None
+    calls: list[httpx.Request] = []
+    payloads = [
+        clear_understanding("新题干").model_dump(mode="json"),
+        sample_explanation("2").model_dump(mode="json"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        content = json.dumps(payloads[len(calls) - 1], ensure_ascii=False)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=QuotaTransport(gate, httpx.MockTransport(handler))
+    )
+    settings = DeepSeekSettings(
+        api_key="test", base_url="https://api.deepseek.com", model="deepseek-chat"
+    )
+    env.records._make_tutor = lambda: DeepSeekTutor(
+        settings, http_async_client=client
+    )
+    response = env.client.post(
+        f"/api/mistake-records/{record_id}/corrections",
+        json={"request_id": str(uuid4()), "statement_text": "新题干"},
+    )
+    assert _last_event(response)["result"]["kind"] == "record_updated"
+    assert len(calls) == 2
+    connection = sqlite3.connect(env.repo.db_path)
+    try:
+        used = connection.execute(
+            "SELECT COUNT(*) FROM model_usage_events "
+            "WHERE owner_id = ? AND kind = 'model_request'",
+            (TEST_USER_ID,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert used == 2
+
+
+def test_correction_second_model_call_quota_error_has_quota_info(
+    env: Env,
+) -> None:
+    import json
+    import httpx
+    from app.config import DeepSeekSettings
+    from app.quota.transport import QuotaTransport
+    from app.tutoring.llm import DeepSeekTutor
+    from tests.f012_support import TEST_USER_ID
+
+    conversation_id = env.client.post("/api/conversations", json={}).json()["id"]
+    _problem(env, conversation_id, "两次调用")
+    record_id = _record(env, conversation_id)
+    gate = app.state.usage_gate
+    assert gate is not None
+    gate.set_override(
+        TEST_USER_ID,
+        daily_requests=1,
+        daily_images=1,
+        expires_on="2099-01-01",
+    )
+    calls: list[httpx.Request] = []
+    understanding = clear_understanding("新题干").model_dump(mode="json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        content = json.dumps(understanding, ensure_ascii=False)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client = httpx.AsyncClient(
+        transport=QuotaTransport(gate, httpx.MockTransport(handler))
+    )
+    settings = DeepSeekSettings(
+        api_key="test", base_url="https://api.deepseek.com", model="deepseek-chat"
+    )
+    env.records._make_tutor = lambda: DeepSeekTutor(
+        settings, http_async_client=client
+    )
+    response = env.client.post(
+        f"/api/mistake-records/{record_id}/corrections",
+        json={"request_id": str(uuid4()), "statement_text": "新题干"},
+    )
+    event = _last_event(response)
+    assert event["type"] == "error"
+    assert event["code"] == "MODEL_QUOTA_EXCEEDED"
+    assert event["quota"]["scope"] == "user"
+    assert event["quota"]["used"] == 1
+    assert event["quota"]["reset_at"]
+    assert len(calls) == 1

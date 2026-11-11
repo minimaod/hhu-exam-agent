@@ -1,12 +1,14 @@
 """会话服务入口：组装依赖、公开方法、轮次执行入口与调度衔接。"""
 
+import asyncio
 import json
 import logging
+import uuid
 from collections.abc import (
     AsyncIterator,
     Callable,
 )
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -76,6 +78,14 @@ from app.images import ATTACHMENTS_ROOT
 from app.mistakes.service import MistakeRecordService
 from app.papers.service import PaperService
 from app.querying.service import QueryService
+from app.quota.errors import (
+    QuotaError,
+    QuotaStorageError,
+    TurnInProgressError,
+)
+from app.quota.gate import UsageGate
+from app.quota.lease import LeaseRegistry
+from app.quota.transport import bind_actor
 from app.questions.errors import QuestionBankUnavailableError
 from app.questions.runtime import (
     QuestionRuntime,
@@ -127,6 +137,9 @@ class ConversationService(
         memory: Any | None = None,
         attachments_root: Path = ATTACHMENTS_ROOT,
         question_runtime: QuestionRuntime | None = None,
+        quota: UsageGate | None = None,
+        usage_error: str | None = None,
+        lease_registry: LeaseRegistry | None = None,
         allow_unscoped: bool = False,
     ) -> None:
         if repository.owner_id is None and not allow_unscoped:
@@ -146,6 +159,11 @@ class ConversationService(
         self._records = records
         self._memory = memory
         self._attachments_root = attachments_root
+        self._quota = quota
+        self._usage_error = usage_error
+        self._lease_registry = lease_registry
+        self._lease_by_request: dict[str, str] = {}
+        self._current_lease_token: str | None = None
         self._owns_question_runtime = question_runtime is None
         self.questions = question_runtime or QuestionRuntime(
             None, error="题目库未启用", bank_root=bank_root_from_env()
@@ -253,6 +271,7 @@ class ConversationService(
         """
 
         self._require_owned_conversation(conversation_id)
+        self._sweep_orphans()
         turn = self._repository.find_turn(conversation_id, request_id)
         if turn is None:
             raise ConversationNotFoundError("该轮次不存在。")
@@ -267,6 +286,12 @@ class ConversationService(
             raise ConversationConflictError("这一轮没有可复用的回复材料，请重新提出需求。")
         if self._make_reply is None:
             raise ConversationConflictError("回复模型尚未配置。")
+
+        if self._usage_error:
+            raise ConversationQueryUnavailableError(self._usage_error)
+        owner = self._repository.owner_id
+        if self._quota is not None and owner is not None:
+            self._quota.ensure_available(owner)
 
         notes: list[str] = []
         legacy_public_only = False
@@ -283,7 +308,28 @@ class ConversationService(
                 material_from_payload(payload)
             )
             legacy_public_only = True
-        text, meta = await self._stream_reply(self._make_reply(), material)
+        lease_token = str(uuid.uuid4())
+        if owner is not None:
+            self._repository.acquire_reply_lease(
+                conversation_id, request_id, lease_token
+            )
+        if self._lease_registry is not None:
+            self._lease_registry.prepare(lease_token)
+            self._lease_registry.mark_started(lease_token, asyncio.current_task())
+        actor_context = (
+            bind_actor(
+                owner,
+                request_id=f"reply:{request_id}",
+                conversation_id=conversation_id,
+            )
+            if owner is not None
+            else nullcontext()
+        )
+        try:
+            with actor_context:
+                text, meta = await self._stream_reply(self._make_reply(), material)
+        finally:
+            self._release_lease(lease_token)
         if not text:
             raise ConversationConflictError("这次仍然没能生成回复，请稍后再试。")
         if legacy_public_only:
@@ -312,6 +358,66 @@ class ConversationService(
             "reply": meta,
         }
 
+    def _precheck_quota(self, data: TurnInput) -> None:
+        """SSE 前的只读额度预检；实际封顶仍在发送前的 SQLite 事务。"""
+
+        if not self._may_use_model(data):
+            return
+        if self._usage_error:
+            raise ConversationQueryUnavailableError(self._usage_error)
+        if self._quota is not None and self._repository.owner_id is not None:
+            self._quota.ensure_available(self._repository.owner_id)
+
+    @staticmethod
+    def _may_use_model(data: TurnInput) -> bool:
+        if data.retry_of is not None:
+            return True
+        if data.question_action == "record":
+            return False
+        if data.question_action == "exercise":
+            return True
+        return data.kind not in (
+            "record",
+            "feedback",
+            "reveal_solution",
+            "select_question",
+            "view_question_answer",
+        )
+
+    def _sweep_orphans(self) -> None:
+        if self._lease_registry is None:
+            return
+        tokens = self._lease_registry.orphans()
+        if tokens:
+            # 只能移除本仓库确实删掉的数据库占用；另一个账号的清理不能
+            # 把 A 的内存登记删掉，否则 A 自己再也回收不了数据库占用。
+            released = self._repository.release_turn_slots(tokens)
+            for token in released:
+                self._lease_registry.finish(token)
+
+    def _release_lease(self, token: str) -> bool:
+        """先让数据库确认释放，再移除内存登记。
+
+        数据库短暂失败时保留登记，下一次请求的孤儿回收会重试；不能先删内存
+        登记，否则数据库里的占用再也没有人负责回收。
+        """
+
+        try:
+            self._repository.release_turn_slot(token)
+        except Exception:
+            logger.warning(
+                "释放执行占用失败，保留登记等待下次回收", exc_info=True
+            )
+            if self._lease_registry is not None:
+                self._lease_registry.mark_release_pending(token)
+            return False
+        if self._lease_registry is not None:
+            self._lease_registry.finish(token)
+        return True
+
+    def _discard_lease(self, token: str) -> None:
+        self._release_lease(token)
+
     def prepare_turn(
         self,
         conversation_id: str,
@@ -322,9 +428,55 @@ class ConversationService(
         if self._repository.get_conversation(conversation_id) is None:
             raise ConversationNotFoundError("会话不存在。")
 
-        if data.retry_of is not None:
-            return self._prepare_retry(conversation_id, data)
+        self._sweep_orphans()
+        token = str(uuid.uuid4())
+        self._current_lease_token = token
+        if self._lease_registry is not None:
+            # 先登记，再尝试写数据库占用；这样“占用已写入、随后准备失败且
+            # 首次释放也失败”时，下一次请求能凭登记重试回收。
+            self._lease_registry.prepare(token)
+        try:
+            if data.retry_of is not None:
+                prepared = self._prepare_retry(conversation_id, data)
+            else:
+                prepared = self._prepare_new_turn(conversation_id, data)
+        except Exception:
+            # 只有本次请求真正持有的租约才允许中断/释放；重复 request_id
+            # 被拒绝时不能把原轮次打断。
+            try:
+                held = self._repository.release_turn_slot(token)
+            except Exception:
+                # 数据库短暂失败：保留内存登记，下一次孤儿回收重试。
+                logger.warning(
+                    "轮次准备失败后释放占用失败，保留登记", exc_info=True
+                )
+                if self._lease_registry is not None:
+                    self._lease_registry.mark_release_pending(token)
+                held = False
+            else:
+                if held:
+                    with suppress(Exception):
+                        self._repository.interrupt_turn(
+                            conversation_id, data.request_id
+                        )
+                if self._lease_registry is not None:
+                    self._lease_registry.finish(token)
+            raise
 
+        if isinstance(prepared, ExecuteTurn):
+            self._lease_by_request[prepared.request_id] = token
+            if self._lease_registry is not None:
+                self._lease_registry.prepare(token)
+        else:
+            # 回放已完成轮次：不占新 lease，也不扣额度。
+            self._discard_lease(token)
+        return prepared
+
+    def _prepare_new_turn(
+        self,
+        conversation_id: str,
+        data: TurnInput,
+    ) -> PreparedTurn:
         normalized = self._normalize(data)
         normalized = replace(normalized, source=self._resolve_source(normalized))
         canonical = self._canonical(normalized)
@@ -346,6 +498,13 @@ class ConversationService(
                     "该请求已中断，请使用新的 request_id 重新提交。"
                 )
             return ReplayTurn(conversation_id=conversation_id, turn=existing)
+
+        if self._repository.has_active_lease():
+            raise TurnInProgressError(
+                "你已有一轮正在处理，请等待完成或先停止。"
+            )
+
+        self._precheck_quota(normalized)
 
         if self._repository.has_running_turn(conversation_id):
             raise ConversationConflictError(
@@ -380,6 +539,10 @@ class ConversationService(
             if not self._same_input(existing, canonical) or existing.status in ("running", "interrupted"):
                 raise ConversationConflictError("重试请求仍在执行、已中断或内容发生冲突，请刷新记录。")
             return ReplayTurn(conversation_id, existing)
+        if self._repository.has_active_lease():
+            raise TurnInProgressError(
+                "你已有一轮正在处理，请等待完成或先停止。"
+            )
         origin = self._repository.find_turn(conversation_id, request.retry_of or "")
         if origin is None:
             raise ProblemNotFoundError("原轮次不属于当前会话。")
@@ -405,10 +568,12 @@ class ConversationService(
             question_source_turn=payload.get("question_source_turn"),
             question_action=payload.get("question_action"),
         )
+        self._precheck_quota(recovered)
         if _is_dynamic_recovery(origin.recovery):
             turn = self._repository.start_turn(conversation_id, request.request_id, origin.query,
                                              kind="dynamic", input_json=canonical,
-                                             attachments=recovered.attachments)
+                                             attachments=recovered.attachments,
+                                             lease_token=self._current_lease_token)
             recovery = json.loads(json.dumps(origin.recovery))
             self._repository.save_recovery(conversation_id, request.request_id, recovery)
             return ExecuteTurn(conversation_id, request.request_id, turn, recovered, "dispatch", recovery=recovery)
@@ -450,6 +615,7 @@ class ConversationService(
                 data.text or ("生成变式" if data.question_action == "exercise" else "保存错题"),
                 kind="dynamic",
                 input_json=canonical,
+                lease_token=self._current_lease_token,
             )
             return ExecuteTurn(
                 conversation_id=conversation_id,
@@ -475,6 +641,7 @@ class ConversationService(
                     kind="query",
                     input_json=canonical,
                     attachments=data.attachments,
+                    lease_token=self._current_lease_token,
                 )
                 return ExecuteTurn(
                     conversation_id=conversation_id,
@@ -493,6 +660,7 @@ class ConversationService(
                     kind="problem",
                     input_json=canonical,
                     attachments=data.attachments,
+                    lease_token=self._current_lease_token,
                 )
                 return ExecuteTurn(
                     conversation_id=conversation_id,
@@ -517,6 +685,7 @@ class ConversationService(
                 kind="problem",
                 input_json=canonical,
                 attachments=data.attachments,
+                lease_token=self._current_lease_token,
             )
             return ExecuteTurn(
                 conversation_id=conversation_id,
@@ -540,6 +709,7 @@ class ConversationService(
             data.text,
             kind="query",
             input_json=canonical,
+            lease_token=self._current_lease_token,
         )
         return ExecuteTurn(
             conversation_id=conversation_id,
@@ -562,72 +732,88 @@ class ConversationService(
             return
 
         state = _RunState()
+        token = self._lease_by_request.pop(prepared.request_id, None)
+        owner = self._repository.owner_id
+        if token is not None and self._lease_registry is not None:
+            self._lease_registry.mark_started(token, asyncio.current_task())
+        actor_context = (
+            bind_actor(
+                owner,
+                request_id=prepared.request_id,
+                conversation_id=prepared.conversation_id,
+            )
+            if owner is not None
+            else nullcontext()
+        )
         try:
-            if prepared.operation == "clarify":
-                async for event in self._clarify_events(
-                    prepared,
-                    state,
-                    options=prepared.clarify_options or ("query", "tutoring"),
-                    message=(
-                        prepared.clarify_message
-                        or "请明确要查试卷，还是要辅导一道题。"
-                    ),
-                ):
-                    yield event
-                return
+            with actor_context:
+                if prepared.operation == "clarify":
+                    async for event in self._clarify_events(
+                        prepared,
+                        state,
+                        options=prepared.clarify_options or ("query", "tutoring"),
+                        message=(
+                            prepared.clarify_message
+                            or "请明确要查试卷，还是要辅导一道题。"
+                        ),
+                    ):
+                        yield event
+                    return
 
-            if prepared.operation == "dispatch":
-                async for event in self._dispatch_events(prepared, request, state):
-                    yield event
-                return
+                if prepared.operation == "dispatch":
+                    async for event in self._dispatch_events(prepared, request, state):
+                        yield event
+                    return
 
-            if prepared.operation == "query":
-                async for event in self._query_events(prepared, request, state):
-                    yield event
-                return
+                if prepared.operation == "query":
+                    async for event in self._query_events(prepared, request, state):
+                        yield event
+                    return
 
-            if prepared.operation in ("problem", "supplement", "correction"):
-                async for event in self._tutoring_events(
-                    prepared, request, state
-                ):
-                    yield event
-                return
+                if prepared.operation in ("problem", "supplement", "correction"):
+                    async for event in self._tutoring_events(
+                        prepared, request, state
+                    ):
+                        yield event
+                    return
 
-            if prepared.operation in _QUESTION_KINDS:
-                async for event in self._question_events(prepared, state):
-                    yield event
-                return
+                if prepared.operation in _QUESTION_KINDS:
+                    async for event in self._question_events(prepared, state):
+                        yield event
+                    return
 
-            if prepared.operation in ("question_exercise", "question_record"):
-                async for event in self._question_action_events(prepared, state):
-                    yield event
-                return
+                if prepared.operation in ("question_exercise", "question_record"):
+                    async for event in self._question_action_events(prepared, state):
+                        yield event
+                    return
 
-            if prepared.operation == "followup":
-                async for event in self._followup_events(prepared, state):
-                    yield event
-                return
+                if prepared.operation == "followup":
+                    async for event in self._followup_events(prepared, state):
+                        yield event
+                    return
 
-            if prepared.operation == "record":
-                async for event in self._record_events(prepared, state):
-                    yield event
-                return
+                if prepared.operation == "record":
+                    async for event in self._record_events(prepared, state):
+                        yield event
+                    return
 
-            if prepared.operation == "reveal_solution":
-                async for event in self._reveal_solution_events(prepared, state):
-                    yield event
-                return
+                if prepared.operation == "reveal_solution":
+                    async for event in self._reveal_solution_events(prepared, state):
+                        yield event
+                    return
 
-            if prepared.operation == "exercise_answer":
-                async for event in self._exercise_answer_events(prepared, state):
-                    yield event
-                return
+                if prepared.operation == "exercise_answer":
+                    async for event in self._exercise_answer_events(prepared, state):
+                        yield event
+                    return
 
-            if prepared.operation == "feedback":
-                async for event in self._feedback_events(prepared, state):
-                    yield event
-                return
+                if prepared.operation == "feedback":
+                    async for event in self._feedback_events(prepared, state):
+                        yield event
+                    return
         finally:
+            if token is not None:
+                self._release_lease(token)
             if not state.saved:
                 self._interrupt_quietly(prepared)
 
@@ -782,6 +968,9 @@ class ConversationService(
         code: str,
         message: str,
         state: _RunState,
+        *,
+        quota: dict[str, object] | None = None,
+        saved: bool = False,
     ) -> TurnErrorEvent:
         try:
             self._repository.fail_turn(
@@ -798,6 +987,8 @@ class ConversationService(
             request_id=prepared.request_id,
             code=code,  # type: ignore[arg-type]
             message=message,
+            quota=quota,  # type: ignore[arg-type]
+            saved=saved,
         )
 
     def _interrupt_quietly(self, prepared: ExecuteTurn) -> None:

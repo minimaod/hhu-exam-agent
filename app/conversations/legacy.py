@@ -31,6 +31,7 @@ from app.conversations.repository import (
     ProblemRecord,
     UpdatedProblem,
 )
+from app.quota.errors import quota_of
 from app.conversations.turn_types import (
     ExecuteTurn,
     TurnInput,
@@ -451,7 +452,7 @@ class LegacyFlowMixin:
             )
             return
         except QueryError as exc:
-            yield self._failure_event(prepared, exc.code, exc.message, state)
+            yield self._failure_event(prepared, exc.code, exc.message, state, quota=quota_of(exc))
             return
         except Exception:
             logger.exception("会话意图判断失败")
@@ -635,6 +636,7 @@ class LegacyFlowMixin:
                 request_id=prepared.request_id,
                 code=event.code,
                 message=event.message,
+                quota=event.quota,
             )
             return
 
@@ -865,7 +867,7 @@ class LegacyFlowMixin:
             await finish(holder["payload"])
         except QueryError as exc:
             queue.put_nowait(
-                self._failure_event(prepared, exc.code, exc.message, state)
+                self._failure_event(prepared, exc.code, exc.message, state, quota=quota_of(exc))
             )
         except ConversationStorageError:
             queue.put_nowait(_storage_error_event(prepared))
@@ -935,7 +937,7 @@ class LegacyFlowMixin:
                 tutoring=payload,
             )
         except QueryError as exc:
-            yield self._failure_event(prepared, exc.code, exc.message, state)
+            yield self._failure_event(prepared, exc.code, exc.message, state, quota=quota_of(exc))
         except ConversationStorageError:
             yield _storage_error_event(prepared)
         except Exception:

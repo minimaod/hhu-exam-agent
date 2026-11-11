@@ -39,6 +39,7 @@ from app.conversations.errors import (
     ProblemNotFoundError,
 )
 from app.images import MAX_IMAGE_BYTES, MAX_IMAGES_PER_TURN, MAX_TOTAL_BYTES
+from app.quota.errors import TurnInProgressError
 from app.conversations.inputs import query_input
 from app.conversations.models import (
     ActionResultItem,
@@ -489,20 +490,93 @@ class ConversationRepository:
             finally:
                 self._action_connection.reset(token)
 
-    def save_recovery(self, conversation_id: str, request_id: str, recovery: dict) -> None:
+    def save_recovery_on(
+        self,
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        request_id: str,
+        recovery: dict,
+        *,
+        merge: bool = False,
+    ) -> None:
+        """在调用方已开启的写事务内保存恢复记录。"""
+
+        self._assert_conversation_owned(connection, conversation_id)
+        row = connection.execute(
+            "SELECT output_json FROM conversation_turns WHERE conversation_id=? AND request_id=? AND status='running'",
+            (conversation_id, request_id),
+        ).fetchone()
+        if row is None:
+            raise ConversationConflictError("轮次已结束，不能再写入动作恢复记录。")
+        payload = _json_load(row["output_json"], {}) if row["output_json"] else {}
+        if merge:
+            existing = payload.get("_recovery")
+            if isinstance(existing, dict):
+                merged = dict(existing)
+                merged.update(recovery)
+                recovery = merged
+        payload["_recovery"] = recovery
+        connection.execute(
+            "UPDATE conversation_turns SET output_json=?, kind=CASE WHEN ?>=1 THEN 'dynamic' ELSE kind END WHERE conversation_id=? AND request_id=?",
+            (json.dumps(payload, ensure_ascii=False), recovery.get("version", 0), conversation_id, request_id),
+        )
+
+    def save_recovery(
+        self,
+        conversation_id: str,
+        request_id: str,
+        recovery: dict,
+        *,
+        merge: bool = False,
+    ) -> None:
         with self._write() as connection:
-            self._assert_conversation_owned(connection, conversation_id)
-            row = connection.execute(
-                "SELECT output_json FROM conversation_turns WHERE conversation_id=? AND request_id=? AND status='running'",
-                (conversation_id, request_id),
-            ).fetchone()
-            if row is None:
-                raise ConversationConflictError("轮次已结束，不能再写入动作恢复记录。")
-            payload = _json_load(row["output_json"], {}) if row["output_json"] else {}
-            payload["_recovery"] = recovery
-            connection.execute(
-                "UPDATE conversation_turns SET output_json=?, kind=CASE WHEN ?>=1 THEN 'dynamic' ELSE kind END WHERE conversation_id=? AND request_id=?",
-                (json.dumps(payload, ensure_ascii=False), recovery.get("version", 0), conversation_id, request_id),
+            self.save_recovery_on(
+                connection,
+                conversation_id,
+                request_id,
+                recovery,
+                merge=merge,
+            )
+
+    def mark_business_saved_on(
+        self,
+        connection: sqlite3.Connection,
+        conversation_id: str,
+        request_id: str,
+    ) -> None:
+        """在调用方事务内标记业务结果已提交。"""
+
+        self._assert_conversation_owned(connection, conversation_id)
+        row = connection.execute(
+            "SELECT output_json FROM conversation_turns "
+            "WHERE conversation_id=? AND request_id=? AND status='running'",
+            (conversation_id, request_id),
+        ).fetchone()
+        if row is None:
+            raise ConversationConflictError("轮次已结束，不能写入业务恢复标记。")
+        payload = _json_load(row["output_json"], {}) if row["output_json"] else {}
+        recovery = payload.get("_recovery")
+        if not isinstance(recovery, dict):
+            recovery = {}
+        recovery["business_saved"] = True
+        payload["_recovery"] = recovery
+        connection.execute(
+            "UPDATE conversation_turns SET output_json=? "
+            "WHERE conversation_id=? AND request_id=?",
+            (json.dumps(payload, ensure_ascii=False), conversation_id, request_id),
+        )
+
+    def mark_business_saved(
+        self, conversation_id: str, request_id: str
+    ) -> None:
+        """业务写入后、下一次模型调用前持久化“已有业务结果”标记。
+
+        使用活动 ``action_write`` 连接时与业务写入处于同一事务。
+        """
+
+        with self._write() as connection:
+            self.mark_business_saved_on(
+                connection, conversation_id, request_id
             )
 
     # ------------------------------------------------------------------
@@ -608,6 +682,7 @@ class ConversationRepository:
         kind: str = "query",
         input_json: str | None = None,
         attachments: Sequence[tuple[str, str]] = (),
+        lease_token: str | None = None,
     ) -> Turn:
         """原子接受一轮输入：分配序号、绑定附件、更新标题/时间、写入 running。"""
 
@@ -671,6 +746,28 @@ class ConversationRepository:
                 attachments,
             )
 
+            if lease_token is not None and self._owner_id is not None:
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO user_active_turns (
+                            owner_id, conversation_id, request_id,
+                            lease_token, started_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            self._owner_id,
+                            conversation_id,
+                            request_id,
+                            lease_token,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise TurnInProgressError(
+                        "你已有一轮正在处理，请等待完成或先停止。"
+                    ) from exc
+
         return Turn(
             request_id=request_id,
             seq=next_seq,
@@ -679,6 +776,93 @@ class ConversationRepository:
             status="running",
             started_at=datetime.fromisoformat(now),
         )
+
+    def acquire_reply_lease(
+        self,
+        conversation_id: str,
+        request_id: str,
+        lease_token: str,
+    ) -> None:
+        if self._owner_id is None:
+            return
+        now = _now()
+        with self._write() as connection:
+            self._assert_conversation_owned(connection, conversation_id)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO user_active_turns (
+                        owner_id, conversation_id, request_id,
+                        lease_token, started_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._owner_id,
+                        conversation_id,
+                        f"reply:{request_id}",
+                        lease_token,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise TurnInProgressError(
+                    "你已有一轮正在处理，请等待完成或先停止。"
+                ) from exc
+
+    def has_active_lease(self) -> bool:
+        if self._owner_id is None:
+            return False
+        with self._read() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM user_active_turns WHERE owner_id = ? LIMIT 1",
+                (self._owner_id,),
+            ).fetchone()
+        return row is not None
+
+    def release_turn_slot(self, lease_token: str) -> bool:
+        if self._owner_id is None:
+            return False
+        with self._write() as connection:
+            cursor = connection.execute(
+                "DELETE FROM user_active_turns "
+                "WHERE owner_id = ? AND lease_token = ?",
+                (self._owner_id, lease_token),
+            )
+        return cursor.rowcount == 1
+
+    def release_turn_slots(self, lease_tokens: Sequence[str]) -> list[str]:
+        if not lease_tokens:
+            return []
+        marks = ",".join("?" for _ in lease_tokens)
+        with self._write() as connection:
+            params: list[object] = list(lease_tokens)
+            owner_sql = ""
+            if self._owner_id is not None:
+                owner_sql = " AND owner_id = ?"
+                params.append(self._owner_id)
+            rows = connection.execute(
+                f"SELECT lease_token, conversation_id, request_id FROM user_active_turns "
+                f"WHERE lease_token IN ({marks}){owner_sql}",
+                tuple(params),
+            ).fetchall()
+            now = _now()
+            released: list[str] = []
+            for row in rows:
+                released.append(str(row["lease_token"]))
+                connection.execute(
+                    """
+                    UPDATE conversation_turns
+                    SET status = 'interrupted', finished_at = ?
+                    WHERE conversation_id = ? AND request_id = ? AND status = 'running'
+                    """,
+                    (now, row["conversation_id"], row["request_id"]),
+                )
+            connection.execute(
+                f"DELETE FROM user_active_turns "
+                f"WHERE lease_token IN ({marks}){owner_sql}",
+                tuple(params),
+            )
+        return released
 
     def complete_turn(
         self,
@@ -904,6 +1088,7 @@ class ConversationRepository:
         height: int,
         size_bytes: int,
         sha256: str,
+        quota_check: Callable[[sqlite3.Connection], None] | None = None,
     ) -> AttachmentRecord:
         now = _now()
         with self._write() as connection:
@@ -916,6 +1101,9 @@ class ConversationRepository:
             ).fetchone()[0]
             if pending >= 20:
                 raise AttachmentInvalidError("待提交图片过多，请先发送或稍后再试。")
+
+            if quota_check is not None:
+                quota_check(connection)
 
             connection.execute(
                 """

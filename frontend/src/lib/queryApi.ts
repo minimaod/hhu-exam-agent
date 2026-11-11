@@ -13,6 +13,7 @@ import {
 } from "./papersApi.ts";
 import { createSseParser } from "./sseParser.ts";
 import { apiFetch } from "./apiFetch.ts";
+import { parseQuotaInfo, type QuotaInfo } from "./usageApi.ts";
 
 const QUERY_PATH = "/api/query";
 const MAX_QUERY_LENGTH = 1000;
@@ -26,7 +27,10 @@ export type QueryErrorCode =
   | "MODEL_TIMEOUT"
   | "MODEL_RESPONSE_INVALID"
   | "CATALOG_UNAVAILABLE"
-  | "QUERY_FAILED";
+  | "QUERY_FAILED"
+  | "MODEL_QUOTA_EXCEEDED"
+  | "IMAGE_QUOTA_EXCEEDED"
+  | "QUOTA_STORAGE_UNAVAILABLE";
 
 export type QueryFilters = {
   course: string | null;
@@ -52,6 +56,7 @@ export type ErrorEvent = {
   type: "error";
   code: QueryErrorCode;
   message: string;
+  quota?: QuotaInfo | null;
 };
 
 export type QueryEvent = ProgressEvent | ResultEvent | ErrorEvent;
@@ -105,7 +110,10 @@ function isQueryErrorCode(value: unknown): value is QueryErrorCode {
     value === "MODEL_TIMEOUT" ||
     value === "MODEL_RESPONSE_INVALID" ||
     value === "CATALOG_UNAVAILABLE" ||
-    value === "QUERY_FAILED"
+    value === "QUERY_FAILED" ||
+    value === "MODEL_QUOTA_EXCEEDED" ||
+    value === "IMAGE_QUOTA_EXCEEDED" ||
+    value === "QUOTA_STORAGE_UNAVAILABLE"
   );
 }
 
@@ -178,7 +186,12 @@ function parseQueryEvent(raw: string): QueryEvent {
     ) {
       throw new QueryApiError("后端返回的错误事件格式不符合约定。");
     }
-    return { type: "error", code: payload.code, message: payload.message };
+    return {
+      type: "error",
+      code: payload.code,
+      message: payload.message,
+      quota: parseQuotaInfo(payload.quota),
+    };
   }
 
   if (!isResultEvent(payload)) {

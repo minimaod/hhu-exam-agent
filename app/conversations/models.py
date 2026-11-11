@@ -11,7 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from app.questions.models import ExerciseSourceView, QuestionCard
-from app.querying.models import ErrorCode, ResultEvent
+from app.querying.models import ErrorCode, QuotaInfo, ResultEvent
 from app.tutoring.models import AttachmentView, ProblemView, TutoringResult
 
 TurnStatus = Literal["running", "completed", "failed", "interrupted"]
@@ -20,6 +20,7 @@ RECOVERABLE_CODES = {
     "MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_UNAVAILABLE",
     "MODEL_RESPONSE_INVALID", "CATALOG_UNAVAILABLE", "QUERY_FAILED", "TUTORING_FAILED",
     "QUESTION_SEARCH_FAILED", "QUESTION_BANK_UNAVAILABLE",
+    "MODEL_QUOTA_EXCEEDED", "QUOTA_STORAGE_UNAVAILABLE",
 }
 
 QuestionResultStatus = Literal[
@@ -288,8 +289,20 @@ class Turn(BaseModel):
             entries = self.recovery.get("actions", [])
             if entries and not self.recovery.get("pending") and all(entry.get("outcome", {}).get("status") == "success" for entry in entries):
                 self.business_status = "succeeded"
-                self.retryable = False
-                self.retry_hint = "业务操作已保存；本轮连接未完整结束，可刷新查看已保存结果。"
+                quota_stopped = (
+                    self.error is not None
+                    and self.error.code in {
+                        "MODEL_QUOTA_EXCEEDED",
+                        "QUOTA_STORAGE_UNAVAILABLE",
+                    }
+                )
+                # 已保存业务结果但配额中断：允许从恢复记录继续补齐后续回复。
+                self.retryable = quota_stopped
+                self.retry_hint = (
+                    "业务结果已保存；可重试补齐后续步骤。"
+                    if quota_stopped
+                    else "业务操作已保存；本轮连接未完整结束，可刷新查看已保存结果。"
+                )
         if self.status == "completed":
             has_payload = any(
                 [
@@ -421,6 +434,8 @@ class TurnErrorEvent(BaseModel):
     request_id: str
     code: TurnErrorCode
     message: str
+    quota: QuotaInfo | None = None
+    saved: bool = False
 
 
 TurnEvent = TurnProgressEvent | TurnMessageDeltaEvent | TurnResultEvent | TurnErrorEvent

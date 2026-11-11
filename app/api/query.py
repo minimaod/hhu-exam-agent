@@ -15,10 +15,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
+from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.config import QueryConfigState
 from app.papers.service import PaperService, get_paper_service
 from app.querying.llm import DeepSeekUnderstanding
 from app.querying.service import SSE_HEADERS, QueryService
+from app.quota.transport import bind_actor
 
 router = APIRouter(tags=["query"])
 
@@ -48,6 +51,7 @@ def get_query_config(request: Request) -> QueryConfigState:
 
 
 def get_query_service(
+    request: Request,
     config: Annotated[QueryConfigState, Depends(get_query_config)],
     papers: Annotated[PaperService, Depends(get_paper_service)],
 ) -> QueryService | None:
@@ -56,7 +60,10 @@ def get_query_service(
     if config.settings is None:
         return None
     return QueryService(
-        understand=DeepSeekUnderstanding(config.settings),
+        understand=DeepSeekUnderstanding(
+            config.settings,
+            http_async_client=getattr(request.app.state, "model_http_client", None),
+        ),
         papers=papers,
     )
 
@@ -67,6 +74,7 @@ async def query_papers(
     request: Request,
     config: Annotated[QueryConfigState, Depends(get_query_config)],
     service: Annotated[QueryService | None, Depends(get_query_service)],
+    user: Annotated[User, Depends(require_user)],
 ) -> StreamingResponse:
     """返回 text/event-stream：progress 若干，最后一条 result 或 error。"""
 
@@ -76,8 +84,21 @@ async def query_papers(
             detail=config.error or "自然语言查询尚未配置。",
         )
 
+    usage_config = getattr(request.app.state, "usage_config", None)
+    usage_error = getattr(usage_config, "error", None)
+    if usage_error:
+        raise HTTPException(status_code=503, detail=usage_error)
+    gate = getattr(request.app.state, "usage_gate", None)
+    if gate is not None:
+        gate.ensure_available(user.id)
+
+    async def encode_stream():
+        with bind_actor(user.id):
+            async for chunk in service.stream(payload.query, request):
+                yield chunk
+
     return StreamingResponse(
-        service.stream(payload.query, request),
+        encode_stream(),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

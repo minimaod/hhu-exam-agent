@@ -4,7 +4,7 @@
 
 项目地址：[minimaod/hhu-exam-agent](https://github.com/minimaod/hhu-exam-agent)。
 
-**当前为本地原型，尚未部署在线服务。** 截至 2026-11-07，F010 A–D 已完成技术收尾，统一用户体验验收待完成；F010 改动尚未提交和推送。
+**F011 已部署受保护测试站，F012/F013 待测试站验收。**
 
 ## 能做什么
 
@@ -81,14 +81,14 @@ pnpm dev
 
 **克隆源码不会获得 PDF 或本地题库，只补 PDF 也不会自动生成已审核题目。** 题库工具位于 [tools/question_bank](tools/question_bank)，准备流程为抽取、校订审核、构建校验和发布。
 
-学习库默认为 `data/local/study.sqlite3`，图片在 `data/local/attachments`，题库在 `data/local/question-bank`。可通过进程环境变量 `HHU_STUDY_DB`、`HHU_QB_ROOT` 指向独立数据。学习库当前为 v7；v6 旧库不会在启动时自动升级，需先停止后端并运行管理员迁移命令（会自动备份）。不要用删除整个 `data/local` 的方式重置学习记录。
+学习库默认为 `data/local/study.sqlite3`，图片在 `data/local/attachments`，题库在 `data/local/question-bank`。可通过进程环境变量 `HHU_STUDY_DB`、`HHU_QB_ROOT` 指向独立数据。F013 新建学习库使用 v8。v6/v7 旧库需先停止后端，再通过管理员命令备份并迁移。不要用删除整个 `data/local` 的方式重置学习记录。
 
 ### 账号、邀请码与迁移
 
-首次启动空库会创建 v7。未登录可以浏览试卷目录和下载 PDF；学习会话、错题本和学习记忆需要登录。管理员命令：
+首次启动空库会创建 v8。未登录可以浏览试卷目录和下载 PDF；学习会话、错题本和学习记忆需要登录。管理员命令：
 
 ```powershell
-# 已 v6 的库迁移到 v7（会先备份到 data/local/backups）
+# 已 v6/v7 的库迁移到 v8（v6 需要管理员账号；会先备份到 data/local/backups）
 uv run python -m app.auth.cli --database data/local/study.sqlite3 migrate --admin-username admin
 
 # 生成一次性邀请码（原文只显示一次）
@@ -101,14 +101,29 @@ uv run python -m app.auth.cli --database data/local/study.sqlite3 restore --back
 
 写请求需要 `X-HHU-CSRF: 1`（前端自动添加）；Session Cookie 为 HttpOnly、SameSite=Lax。HTTPS 环境把 `HHU_COOKIE_SECURE` 设为 true。正式学习库迁移需另行批准。Nginx 前端 location 需要 `try_files $uri $uri/ /index.html;`，否则直接打开或刷新 `/login`、`/register` 会 404。
 
+### 模型用量限制
+
+默认每人每日 30 次模型请求、全站每日 500 次、每人每日 20 张图片，写在 `.env` 的 `HHU_MODEL_DAILY_LIMIT`、`HHU_SITE_DAILY_LIMIT`、`HHU_IMAGE_DAILY_LIMIT`；修改后重启生效。额度按北京时间自然日重置，模型请求在真正发往供应商前记账，超限不会发出请求。
+
+管理员可查看用量并给个别用户临时调额（`--until` 必填）：
+
+```powershell
+uv run python -m app.quota.cli --database data/local/study.sqlite3 report
+uv run python -m app.quota.cli --database data/local/study.sqlite3 report --username <用户名> --json
+uv run python -m app.quota.cli --database data/local/study.sqlite3 set-limit --username <用户名> --requests 2 --until 2026-11-12
+uv run python -m app.quota.cli --database data/local/study.sqlite3 clear-limit --username <用户名>
+```
+
+每个账号同一时间只允许一个进行中的轮次或正文重生成；第二个请求返回 409。当前部署以单后端进程为前提，启动时会清理残留占用。Nginx 的 `/api/` 限流示例见 `deploy/nginx-f013.conf.example`；SSH 隧道下所有用户共享 127.0.0.1 的限流桶，公网部署后再按真实 IP 调整。
+
 ## 验证与当前限制
 
 2026-11-07 收尾记录：后端完整回归 **993 passed**、离线外连 0；前端类型检查与构建通过；48 例新接口契约对照 **93/96**。新契约成绩与旧冻结脚本诊断分别计分，不能互相替代。本次文档整理未重跑这些测试。
 
 - 相对学年筛选仍有已知失败；服务器取消链、前端刷新回执仍缺完整证据。
 - 实模 S2 部分通过，未取得目标题 ID；S4 缺陷经专项复验关闭，不代表所有自然表达均已验证。
-- 当前已有多用户登录与数据隔离；复习日历、每日计划与公开部署仍未开展。
-- 登录限流与模型用量限制属于 F013/D024，尚未实现。
+- 当前已有多用户登录、数据隔离与模型用量限制；复习日历、每日计划与公开部署仍未开展。
+- 登录限流/失败锁定尚未单独实现；模型请求按账号与全站次数限制，Nginx 限流是兜底。
 - 完整测试依赖本地 PDF、题库及冻结评测资料；涉及题库时使用独立副本，避免 Qdrant 目录锁冲突。
 - 已有实模评测预算用尽，不直接重跑实模脚本；新增调用需单独确定范围与费用。
 

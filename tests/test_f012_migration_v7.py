@@ -1,4 +1,4 @@
-"""F012：v6→v7 迁移、备份、重复执行与 WAL 恢复。"""
+"""F012/F013：v6→v8 迁移、备份、重复执行与 WAL 恢复。"""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def test_v6_copy_migrates_to_admin(tmp_path: Path) -> None:
     assert report.backup_path is not None and report.backup_path.is_file()
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         assert connection.execute(
             "SELECT owner_id FROM conversations"
         ).fetchone()[0] == "admin-1"
@@ -109,7 +109,7 @@ def test_migration_failure_rolls_back_and_backup_restores(
     finally:
         connection.close()
 
-    backups = list(backup_dir.glob("f012-v6-*/study.sqlite3"))
+    backups = list(backup_dir.glob("study-v6-*/study.sqlite3"))
     assert len(backups) == 1
     restored = tmp_path / "restored.sqlite3"
     restore_backup(backups[0], restored)
@@ -164,12 +164,12 @@ def test_old_database_startup_is_refused(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_fresh_empty_database_creates_v7(tmp_path: Path) -> None:
+def test_fresh_empty_database_creates_v8(tmp_path: Path) -> None:
     db = tmp_path / "study.sqlite3"
     schema.initialize_database(db)
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         assert connection.execute(
             "SELECT COUNT(*) FROM users"
         ).fetchone()[0] == 0
@@ -372,7 +372,7 @@ def test_restore_stops_when_checkpoint_returns_busy(
     assert db.is_file()
 
 
-def test_post_commit_startup_failure_reports_v7(
+def test_post_commit_startup_failure_reports_v8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = tmp_path / "study.sqlite3"
@@ -386,24 +386,24 @@ def test_post_commit_startup_failure_reports_v7(
         migrate_database(db, owner=owner(), backup_dir=tmp_path / "backups")
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
     finally:
         connection.close()
 
 
-def test_post_commit_check_reports_committed_v7(
+def test_post_commit_check_reports_committed_v8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = tmp_path / "study.sqlite3"
     build_v6(db)
     monkeypatch.setattr(
-        "app.auth.migrate._assert_v7",
+        "app.auth.migrate._assert_v8",
         lambda path: (_ for _ in ()).throw(ConversationStorageError("注入检查失败")),
     )
     with pytest.raises(MigrationCommittedCheckError):
         migrate_database(db, owner=owner(), backup_dir=tmp_path / "backups")
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
     finally:
         connection.close()

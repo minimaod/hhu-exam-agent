@@ -193,6 +193,14 @@ def get_conversation_service_state(
     repository = ConversationRepository(state.db_path).scoped(user.id)
 
     settings = config.settings
+    client = getattr(request.app.state, "model_http_client", None)
+    quota = getattr(request.app.state, "usage_gate", None)
+    usage_config = getattr(request.app.state, "usage_config", None)
+    usage_error = getattr(usage_config, "error", None)
+    if usage_error:
+        # 额度配置无效时不创建任何真实模型适配器，避免绕过记账。
+        settings = None
+    lease_registry = getattr(request.app.state, "lease_registry", None)
     make_query: Callable[[], QueryService] | None = None
     make_tutor: Callable[[], DeepSeekTutor] | None = None
     make_router: Callable[[], DeepSeekIntentRouter] | None = None
@@ -203,24 +211,26 @@ def get_conversation_service_state(
 
         def _make_query() -> QueryService:
             return QueryService(
-                understand=DeepSeekUnderstanding(settings),
+                understand=DeepSeekUnderstanding(
+                    settings, http_async_client=client
+                ),
                 papers=papers,
             )
 
         def _make_tutor() -> DeepSeekTutor:
-            return DeepSeekTutor(settings)
+            return DeepSeekTutor(settings, http_async_client=client)
 
         def _make_router() -> DeepSeekIntentRouter:
-            return DeepSeekIntentRouter(settings)
+            return DeepSeekIntentRouter(settings, http_async_client=client)
 
         def _make_exercise_agent() -> DeepSeekExerciseAgent:
-            return DeepSeekExerciseAgent(settings)
+            return DeepSeekExerciseAgent(settings, http_async_client=client)
 
         def _make_scheduler() -> SchedulerAgent:
-            return SchedulerAgent(settings)
+            return SchedulerAgent(settings, http_async_client=client)
 
         def _make_reply() -> StreamingReply:
-            return StreamingReply(settings)
+            return StreamingReply(settings, http_async_client=client)
 
         make_query = _make_query
         make_tutor = _make_tutor
@@ -258,6 +268,9 @@ def get_conversation_service_state(
             memory=memory,
             attachments_root=images.ATTACHMENTS_ROOT,
             question_runtime=runtime,
+            quota=quota,
+            usage_error=usage_error,
+            lease_registry=lease_registry,
         ),
         error=None,
     )

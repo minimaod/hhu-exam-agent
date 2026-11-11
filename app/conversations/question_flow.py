@@ -21,12 +21,14 @@ from app.conversations.models import (
     ActionResultItem,
     SuggestionItem,
     Turn,
+    TurnErrorEvent,
     TurnEvent,
     TurnMessageDeltaEvent,
     TurnProgressEvent,
     TurnResultEvent,
     reply_state as _reply_state,
 )
+from app.quota.errors import QuotaError, quota_of
 from app.conversations.reply import (
     build_material,
     material_to_payload,
@@ -284,7 +286,13 @@ class QuestionFlowMixin:
                     lambda stage, message: None,
                 )
             except QueryError as exc:
-                yield self._failure_event(prepared, exc.code, exc.message, state)
+                yield self._failure_event(
+                    prepared,
+                    exc.code,
+                    exc.message,
+                    state,
+                    quota=quota_of(exc),
+                )
                 return
             except Exception:
                 logger.exception("真题变式生成失败")
@@ -460,6 +468,15 @@ class QuestionFlowMixin:
         except QuestionError as exc:
             yield self._failure_event(prepared, exc.code, exc.message, state)
             return
+        except QuotaError as exc:
+            yield self._failure_event(
+                prepared,
+                exc.code,
+                exc.message,
+                state,
+                quota=quota_of(exc),
+            )
+            return
         except Exception:
             logger.exception("真题讲解失败")
             yield self._failure_event(
@@ -553,13 +570,26 @@ class QuestionFlowMixin:
                 message="正在组织讲解",
             )
             meta: dict[str, Any] = {}
-            async for piece in self._reply_pieces(self._make_reply(), material, meta):
-                yield TurnMessageDeltaEvent(
+            try:
+                async for piece in self._reply_pieces(self._make_reply(), material, meta):
+                    yield TurnMessageDeltaEvent(
+                        conversation_id=prepared.conversation_id,
+                        request_id=prepared.request_id,
+                        seq=int(meta["deltas"]),
+                        delta=piece[:400],
+                    )
+            except QuotaError as exc:
+                # 讲解、目标绑定和正文材料都已经落盘；保留 completed，
+                # 通知前端 results 已保存，额度恢复后可 /reply 重生成。
+                yield TurnErrorEvent(
                     conversation_id=prepared.conversation_id,
                     request_id=prepared.request_id,
-                    seq=int(meta["deltas"]),
-                    delta=piece[:400],
+                    code=exc.code,  # type: ignore[arg-type]
+                    message=exc.message,
+                    quota=quota_of(exc),  # type: ignore[arg-type]
+                    saved=True,
                 )
+                return
             text = str(meta.pop("text", "") or "")
             if text:
                 message = text

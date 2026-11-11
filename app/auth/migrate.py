@@ -57,7 +57,7 @@ def backup_database(db_path: Path, backup_dir: Path) -> Path:
             raise ConversationStorageError(
                 "当前数据库仍在使用，WAL 无法合并；请停止服务后再备份。"
             )
-        target_dir = backup_dir / f"f012-v6-{_now_tag()}-{uuid.uuid4().hex[:6]}"
+        target_dir = backup_dir / f"study-v{_read_version(db_path)}-{_now_tag()}-{uuid.uuid4().hex[:6]}"
         target_dir.mkdir(parents=True, exist_ok=False)
         target = target_dir / "study.sqlite3"
         destination = sqlite3.connect(target)
@@ -124,42 +124,74 @@ def _assert_v7(db_path: Path) -> tuple[int, int]:
         connection.close()
 
 
+def _assert_v8(db_path: Path) -> tuple[int, int]:
+    connection = schema._open(db_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != 8 or not schema._is_compatible_v8(connection):
+            raise ConversationStorageError("v8 结构校验失败。")
+        unowned = connection.execute(
+            "SELECT COUNT(*) FROM conversations WHERE owner_id IS NULL"
+        ).fetchone()[0]
+        if unowned:
+            raise ConversationStorageError("v8 仍存在无归属会话。")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise ConversationStorageError("v8 外键检查失败。")
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ConversationStorageError("v8 完整性检查失败。")
+        conversations = connection.execute(
+            "SELECT COUNT(*) FROM conversations"
+        ).fetchone()[0]
+        memory_rows = connection.execute(
+            "SELECT COUNT(*) FROM memory_corrections"
+        ).fetchone()[0] + connection.execute(
+            "SELECT COUNT(*) FROM memory_exclusions"
+        ).fetchone()[0]
+        return int(conversations), int(memory_rows)
+    finally:
+        connection.close()
+
+
 def migrate_database(
     db_path: Path,
     *,
-    owner: schema.SchemaOwner,
+    owner: schema.SchemaOwner | None = None,
     backup_dir: Path,
 ) -> MigrationReport:
+    """把 v6/v7 迁移到 v8；v7→v8 不需要管理员账号。"""
+
     version = _read_version(db_path)
-    if version == 7:
-        conversations, memory_rows = _assert_v7(db_path)
-        return MigrationReport(7, True, None, conversations, memory_rows)
-    if version != 6:
+    if version == 8:
+        conversations, memory_rows = _assert_v8(db_path)
+        return MigrationReport(8, True, None, conversations, memory_rows)
+    if version not in (6, 7):
         raise ConversationStorageError(
-            "F012 迁移只支持 v6 数据库；请先用原版本升级到 v6。"
+            "F013 迁移只支持 v6 或 v7 数据库；请先升级到 v6。"
         )
+    if version == 6 and owner is None:
+        raise ConversationStorageError("v6 升级需要管理员账号。")
 
     backup_path = backup_database(db_path, backup_dir)
     try:
         schema.initialize_database(db_path, migration_owner=owner)
     except ConversationStorageError as exc:
         actual_version = _read_version(db_path)
-        if actual_version == 7:
+        if actual_version == 8:
             raise MigrationCommittedCheckError(
-                "迁移事务已提交为 v7，但提交后的启动处理失败；"
+                "迁移事务已提交为 v8，但提交后的启动处理失败；"
                 f"请检查数据库后再决定是否从备份恢复：{backup_path}；原因：{exc}"
             ) from exc
         raise MigrationRolledBackError(
-            f"迁移事务已回滚，数据库仍为 v6；备份：{backup_path}；原因：{exc}"
+            f"迁移事务已回滚，数据库仍为 v{actual_version}；备份：{backup_path}；原因：{exc}"
         ) from exc
     try:
-        conversations, memory_rows = _assert_v7(db_path)
+        conversations, memory_rows = _assert_v8(db_path)
     except ConversationStorageError as exc:
         raise MigrationCommittedCheckError(
-            f"迁移已提交为 v7，但提交后校验失败：{exc}；请从备份恢复：{backup_path}"
+            f"迁移已提交为 v8，但提交后校验失败：{exc}；请从备份恢复：{backup_path}"
         ) from exc
     return MigrationReport(
-        7, False, backup_path, conversations, memory_rows
+        8, False, backup_path, conversations, memory_rows
     )
 
 
