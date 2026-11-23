@@ -108,6 +108,14 @@ function readAuthTarget(): PrivateView | null {
   return target === "conversations" || target === "materials" || target === "memory" || target === "mistakes" ? target : null;
 }
 
+function SiteFilingLink() {
+  return (
+    <a className="site-filing-link" href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer">
+      湘ICP备2026055716号-1
+    </a>
+  );
+}
+
 function AppShell() {
   const { phase, user, error: authError, retry } = useAuth();
   const [view, setView] = useState<View>(() => {
@@ -498,6 +506,7 @@ function AppShell() {
             window.history.replaceState(window.history.state, "", mode === "register" ? "/register" : "/login");
           }}
         />
+        <footer className="entry-filing"><SiteFilingLink /></footer>
       </main>
     );
   }
@@ -597,6 +606,7 @@ function AppShell() {
             </span>
           </button>
           <UserMenu onLogin={() => openAuth("login")} onRegister={() => openAuth("register")} />
+          <SiteFilingLink />
         </div>
       </aside>
 

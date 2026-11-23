@@ -46,12 +46,14 @@ afterEach(() => {
 
 const coverHeading = /河海大学\s*考试复习助手/;
 const archiveHeading = "河海大学历年试卷馆藏目录";
+const filingNumber = "湘ICP备2026055716号-1";
 
 test("首次访问停留在封面，点击登录才显示表单", async () => {
   vi.useFakeTimers();
   await act(async () => { render(<App />); });
 
   expect(screen.getByRole("heading", { name: coverHeading })).toBeTruthy();
+  expect(screen.getByRole("link", { name: filingNumber }).getAttribute("href")).toBe("https://beian.miit.gov.cn/");
   expect(screen.getByRole("img", { name: "河海大学校徽" }).getAttribute("src")).toContain("hhu-emblem.png");
   await act(async () => { vi.advanceTimersByTime(10_000); });
   expect(screen.getByRole("heading", { name: coverHeading })).toBeTruthy();
@@ -60,6 +62,7 @@ test("首次访问停留在封面，点击登录才显示表单", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "登录" }));
   expect(screen.getByRole("heading", { name: "登录学习工作区" })).toBeTruthy();
+  expect(screen.getByRole("link", { name: filingNumber })).toBeTruthy();
   expect(screen.queryByRole("heading", { name: coverHeading })).toBeNull();
   expect(screen.getByRole("button", { name: "访客进入试卷库" })).toBeTruthy();
 });
@@ -136,9 +139,11 @@ test("直接打开 /register 跳过封面，且可以进入试卷库", async () 
   render(<App />);
 
   expect(await screen.findByRole("heading", { name: "用邀请码注册" })).toBeTruthy();
+  expect(screen.getByRole("link", { name: filingNumber })).toBeTruthy();
   expect(screen.queryByRole("heading", { name: coverHeading })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "访客进入试卷库" }));
   expect(screen.queryByRole("heading", { name: "用邀请码注册" })).toBeNull();
+  expect(screen.getByRole("link", { name: filingNumber })).toBeTruthy();
   expect(screen.getByText("已登记的试卷")).toBeTruthy();
   expect(window.location.pathname).toBe("/");
 });

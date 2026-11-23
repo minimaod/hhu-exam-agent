@@ -3,7 +3,7 @@
  * 「资料与成果」找回旧资料与删除会话确认弹窗测试。
  */
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import ConversationWorkspace from "./ConversationWorkspace";
 import type { ConversationDetail } from "../lib/conversationsApi";
@@ -761,17 +761,39 @@ test("生成记录共用一张成果卡，工作台按知识点跳转、对照�
   expect(screen.getAllByRole("region", { name: "复习成果" })).toHaveLength(1);
   expect(screen.queryByText("闭合曲面积分。")).toBeNull();
   expect(screen.queryByText(/点成果卡即可打开/)).toBeNull();
-  fireEvent.click(await within(card).findByRole("button", { name: "笔记" }));
-  const dialog = await screen.findByRole("dialog", { name: "复习工作台" });
-  const workbench = within(dialog);
-  expect(workbench.getByText("闭合曲面积分。")).toBeTruthy();
-  expect(workbench.queryByRole("complementary", { name: "原页对照" })).toBeNull();
-  fireEvent.click(workbench.getByRole("button", { name: "原页" }));
-  const original = workbench.getByRole("complementary", { name: "原页对照" });
-  expect(within(original).getByRole("img", { name: "资料第 2 页原件" })).toBeTruthy();
-  fireEvent.click(within(original).getByRole("button", { name: "下一页" }));
-  fireEvent.click(workbench.getByRole("button", { name: "查看提取文本" }));
-  await workbench.findByText("原页里的高斯定理");
+  const queuedFrames = new Map<number, FrameRequestCallback>();
+  let frameId = 0;
+  const requestFrame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+    queuedFrames.set(++frameId, callback);
+    return frameId;
+  });
+  const cancelFrame = vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+    queuedFrames.delete(id);
+  });
+  try {
+    fireEvent.click(await within(card).findByRole("button", { name: "笔记" }));
+    const dialog = await screen.findByRole("dialog", { name: "复习工作台" });
+    const workbench = within(dialog);
+    expect(workbench.getByText("闭合曲面积分。")).toBeTruthy();
+    expect(workbench.queryByRole("complementary", { name: "原页对照" })).toBeNull();
+    fireEvent.click(workbench.getByRole("button", { name: "原页" }));
+    const original = workbench.getByRole("complementary", { name: "原页对照" });
+    expect(within(original).getByRole("img", { name: "资料第 2 页原件" })).toBeTruthy();
+    fireEvent.click(within(original).getByRole("button", { name: "下一页" }));
+    fireEvent.click(workbench.getByRole("button", { name: "查看提取文本" }));
+    expect(queuedFrames.size).toBeGreaterThan(0);
+    act(() => {
+      const callbacks = [...queuedFrames.values()];
+      queuedFrames.clear();
+      callbacks.forEach((callback) => callback(0));
+    });
+    expect(workbench.getByRole("img", { name: "资料第 3 页原件" })).toBeTruthy();
+    await workbench.findByText("原页里的高斯定理");
+  } finally {
+    requestFrame.mockRestore();
+    cancelFrame.mockRestore();
+  }
+  const workbench = within(screen.getByRole("dialog", { name: "复习工作台" }));
   fireEvent.click(workbench.getByRole("button", { name: "关闭" }));
   fireEvent.click(workbench.getByRole("button", { name: "速览" }));
   expect(workbench.queryByText("完整推导的内容。")).toBeNull();

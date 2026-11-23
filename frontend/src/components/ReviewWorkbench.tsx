@@ -174,7 +174,7 @@ export default function ReviewWorkbench({
     saveReviewProgress(progressKey, kcId);
     setProgress(readReviewProgress(progressKey));
   };
-  const onScroll = () => {
+  const syncNotePosition = (clearManualPage: boolean) => {
     const pane = scroller.current;
     if (skipSpy.current || position.view !== "notes" || !pane || askTarget) return;
     const line = pane.getBoundingClientRect().top + Math.min(140, pane.clientHeight / 3);
@@ -188,7 +188,7 @@ export default function ReviewWorkbench({
     const id = section?.dataset.reviewSection;
     if (id && id !== position.kcId) {
       setPosition({ view: "notes", kcId: id });
-      setManualPage(undefined);
+      if (clearManualPage) setManualPage(undefined);
       markRead(id);
     }
   };
@@ -217,7 +217,7 @@ export default function ReviewWorkbench({
     const frame = requestAnimationFrame(() => {
       skipSpy.current = false;
       setJump(null);
-      if (!target && jump.view === "notes") onScroll();
+      if (!target && jump.view === "notes") syncNotePosition(false);
     });
     return () => cancelAnimationFrame(frame);
     // A jump runs once after its destination is rendered.
@@ -350,7 +350,7 @@ export default function ReviewWorkbench({
         </div>
         <progress aria-label={`阅读进度 ${readCount}/${noteIds.length}`} max={noteIds.length || 1} value={readCount} />
       </header>
-      <div ref={scroller} className="review-workbench-scroll" onScroll={onScroll}>
+      <div ref={scroller} className="review-workbench-scroll" onScroll={() => syncNotePosition(true)}>
         <div className="review-workbench-grid" data-collapsed={collapsed} data-side={hasSidePane}>
           <aside ref={directoryRef} className="review-directory" aria-label="知识点目录" style={{ top: directoryTop }}>
             <button type="button" className="review-button review-desktop-directory" aria-expanded={!collapsed}

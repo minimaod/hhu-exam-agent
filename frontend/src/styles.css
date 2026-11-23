@@ -719,7 +719,15 @@ select.field-control::picker-icon { display: none; }
 .guest-prompt-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 
 .entry-screen, .entry-check { min-height: 100vh; min-height: 100dvh; }
-.entry-screen { background: var(--canvas); color: var(--ink); }
+.entry-screen {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  background: var(--canvas);
+  color: var(--ink);
+}
+.entry-screen > .auth-split { min-height: 0; }
+.entry-filing { padding: 10px 16px; text-align: center; }
+.site-filing-link { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; text-decoration: underline; }
 .entry-check {
   display: grid;
   place-items: center;
