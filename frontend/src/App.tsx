@@ -108,11 +108,14 @@ function readAuthTarget(): PrivateView | null {
   return target === "conversations" || target === "materials" || target === "memory" || target === "mistakes" ? target : null;
 }
 
-function SiteFilingLink() {
+function SiteFooterLinks() {
   return (
-    <a className="site-filing-link" href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer">
-      湘ICP备2026055716号-1
-    </a>
+    <div className="flex flex-wrap justify-center gap-x-3 gap-y-1">
+      <a className="site-filing-link" href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer">
+        湘ICP备2026055716号-1
+      </a>
+      <a className="site-filing-link" href="/service-info.html">隐私与资料说明</a>
+    </div>
   );
 }
 
@@ -506,7 +509,7 @@ function AppShell() {
             window.history.replaceState(window.history.state, "", mode === "register" ? "/register" : "/login");
           }}
         />
-        <footer className="entry-filing"><SiteFilingLink /></footer>
+        <footer className="entry-filing"><SiteFooterLinks /></footer>
       </main>
     );
   }
@@ -606,7 +609,7 @@ function AppShell() {
             </span>
           </button>
           <UserMenu onLogin={() => openAuth("login")} onRegister={() => openAuth("register")} />
-          <SiteFilingLink />
+          <SiteFooterLinks />
         </div>
       </aside>
 
