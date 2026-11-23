@@ -18,7 +18,7 @@ describe("试卷卡片：日期与下载反馈", () => {
     const { container } = render(
       <PaperCard paper={paper} download={null} onDownload={vi.fn()} />,
     );
-    expect(screen.getByText("日期未登记")).toBeTruthy();
+    expect(screen.getByText("时间待补充")).toBeTruthy();
     expect(container.textContent).not.toContain("paper-internal-id");
   });
 

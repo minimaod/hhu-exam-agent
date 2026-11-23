@@ -350,9 +350,11 @@ class LegacyFlowMixin:
         card = self._resolve_question_card(
             conversation_id, data.question_source_turn, data.question_id
         )
-        if data.student_answer_text and (
-            card.question_type != "choice"
-            or data.student_answer_text not in {option.label for option in card.options}
+        if (
+            data.student_answer_text
+            and card.question_type == "choice"
+            and card.options
+            and data.student_answer_text not in {option.label for option in card.options}
         ):
             raise TurnInvalidError("请选择这道选择题实际提供的选项。")
         turn = self._repository.start_turn(

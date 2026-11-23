@@ -114,7 +114,7 @@ type Harness = {
   requests: Record<string, unknown>[];
 };
 
-async function open(options: { assistant?: string | null } = {}): Promise<Harness> {
+async function open(options: { assistant?: string | null; detailGate?: Promise<void> } = {}): Promise<Harness> {
   const requests: Record<string, unknown>[] = [];
   let controller: ReturnType<typeof manualStream> | null = null;
   let turnRequestId = "";
@@ -132,6 +132,7 @@ async function open(options: { assistant?: string | null } = {}): Promise<Harnes
       }
       if (url.endsWith(cid)) {
         detailReads += 1;
+        if (detailReads > 1) await options.detailGate;
         // 第一轮读取是打开会话（还没有对话）；结果之后的读取才带回保存的正文。
         return Response.json(
           detail(detailReads > 1 ? options.assistant ?? null : null, turnRequestId),
@@ -166,11 +167,17 @@ afterEach(() => {
 });
 
 test("片段到达即显示，result 后换成保存的完整正文且不重复", async () => {
-  const harness = await open({ assistant: "已经确认科目是 Python。" });
+  let finishRefresh: () => void = () => {};
+  const detailGate = new Promise<void>((resolve) => { finishRefresh = resolve; });
+  const harness = await open({ assistant: "已经确认科目是 Python。", detailGate });
+  expect(screen.getByText("我要复习 Python", { selector: ".turn-user-note" })).toBeTruthy();
 
+  harness.push({ type: "progress", stage: "composing_reply", message: "正在整理回复" });
+  expect(await screen.findByText("正在整理回复")).toBeTruthy();
   harness.push({ type: "message_delta", seq: 1, delta: "已经确认科目" });
-  expect(await screen.findByText(/正在生成回复/)).toBeTruthy();
-  expect(await screen.findByText(/已经确认科目/)).toBeTruthy();
+  const prose = await screen.findByTestId("assistant-draft");
+  expect(prose.textContent).toContain("已经确认科目");
+  expect(screen.queryByText("正在整理回复")).toBeNull();
   // 输入区草稿不受影响：片段不会清空或覆盖用户正在输入的内容。
   expect((screen.getByPlaceholderText(COMPOSER) as HTMLTextAreaElement).value).toBe(
     "我要复习 Python",
@@ -187,8 +194,10 @@ test("片段到达即显示，result 后换成保存的完整正文且不重复"
   });
   harness.close();
 
-  // 最终只保留服务端保存的正文：临时正文区域消失，且不重复显示。
-  await waitFor(() => expect(screen.queryByText(/正在生成回复/)).toBeNull());
+  // 会话详情仍未返回时，终态已经落到同一 DOM 区域。
+  await waitFor(() => expect(screen.queryByTestId("assistant-draft")).toBeNull());
+  expect(screen.getByText("已经确认科目是 Python。").closest(".assistant-prose")).toBe(prose);
+  finishRefresh();
   await waitFor(() =>
     expect(screen.getAllByText(/已经确认科目是 Python。/, { exact: false })).toHaveLength(1),
   );
@@ -208,6 +217,6 @@ test("断流时保留片段但明确标注未保存", async () => {
   // 直接结束流：没有 result，属于未完成。
   harness.close();
 
-  expect(await screen.findByText(/回复已中断，未保存/)).toBeTruthy();
-  expect(screen.queryByText(/正在生成回复/)).toBeNull();
+  expect(await screen.findByText(/回复已中断，以上为尚未保存的片段/)).toBeTruthy();
+  expect(screen.queryByText(/正在整理回复/)).toBeNull();
 });

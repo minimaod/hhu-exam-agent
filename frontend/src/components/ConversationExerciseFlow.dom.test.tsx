@@ -128,17 +128,18 @@ describe("练习展示：一张题目主卡 + 每次作答回执", () => {
     await screen.findByLabelText("最终答案");
     const composer = document.querySelector("textarea[maxlength='2000']") as HTMLTextAreaElement;
     fireEvent.change(composer, { target: { value: "保留的主输入草稿" } });
-    fireEvent.change(screen.getByLabelText("解法图"), { target: { files: [new File(["image"], "solution.png", { type: "image/png" })] } });
-    fireEvent.change(screen.getByLabelText("题干图"), { target: { files: [new File(["image"], "statement.png", { type: "image/png" })] } });
-    expect(await screen.findByText(/本次提交将附上解法图：solution.png/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("选择过程图"), { target: { files: [new File(["image"], "solution.png", { type: "image/png" })] } });
+    fireEvent.change(screen.getByLabelText("选择附件"), { target: { files: [new File(["image"], "statement.png", { type: "image/png" })] } });
+    expect(await screen.findByAltText("solution.png")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("过程图")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "提交作答并评价" }));
     await waitFor(() => expect(streamTurn).toHaveBeenLastCalledWith(expect.objectContaining({
       exerciseId: "exercise-1", kind: "exercise", attachments: [{ id: "solution-image", role: "solution" }],
     })));
     await waitFor(() => expect((screen.getByRole("button", { name: "提交作答并评价" }) as HTMLButtonElement).disabled).toBe(fail ? false : true));
     expect((composer as HTMLTextAreaElement).value).toBe("保留的主输入草稿");
-    expect(screen.getByAltText("待上传题干图")).toBeTruthy();
-    expect(Boolean(screen.queryByAltText("待上传解法图"))).toBe(fail);
+    expect(screen.getByAltText("待上传图片")).toBeTruthy();
+    expect(Boolean(screen.queryByAltText("solution.png"))).toBe(fail);
   });
 
   test("生成轮保留主卡，作答轮只显示本次回执，订正回到主卡", async () => {

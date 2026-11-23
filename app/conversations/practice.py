@@ -21,7 +21,7 @@ from app.conversations.errors import (
     ProblemNotFoundError,
     TurnInvalidError,
 )
-from app.conversations.graph import ActionOutcome
+from app.conversations.graph import ActionOutcome, ActionPlan
 from app.conversations.models import (
     ActionResultItem,
     ExerciseAttemptView,
@@ -40,6 +40,7 @@ from app.conversations.repository import (
     AttachmentRecord,
     ExerciseAttemptRecord,
     ExerciseRecord,
+    NewProblem,
 )
 from app.conversations.turn_types import (
     ExecuteTurn,
@@ -49,6 +50,7 @@ from app.conversations.turn_types import (
     _RunState,
     _storage_error_event,
 )
+from app.papers.courses import normalize_course
 from app.querying.errors import QueryError
 from app.quota.errors import QuotaError, quota_of
 from app.questions.cards import compose_statement
@@ -63,8 +65,13 @@ from app.tutoring.exercise_llm import (
 )
 from app.tutoring.models import (
     AttachmentView,
+    Explanation,
+    KnowledgePoint,
     RecordCreatedResult,
     RecordExistsResult,
+    Source,
+    Step,
+    fit_knowledge_point_name,
 )
 from app.tutoring.service import load_images
 
@@ -92,51 +99,7 @@ class PracticeMixin:
     def _build_exercise_view(
         self, ex: ExerciseRecord, *, allow_solution: bool = False
     ) -> ExerciseView:
-        evaluation = self._parse_evaluation(ex.evaluation_json)
-
-        ref_sol = None
-        if allow_solution or ex.status in ("submitted", "revealed") or ex.revealed_solution_at is not None:
-            ref_sol = ex.reference_solution_text
-
-        attempts = [
-            ExerciseAttemptView(
-                id=attempt.id,
-                attempt_no=attempt.attempt_no,
-                kind=attempt.kind,  # type: ignore[arg-type]
-                student_answer_text=attempt.student_answer_text,
-                student_solution_text=attempt.student_solution_text,
-                answered_after_revealed=attempt.answered_after_revealed,
-                evaluation=self._parse_evaluation(attempt.evaluation_json),
-                request_id=attempt.request_id,
-                attachments=self._attachment_views(
-                    ex.conversation_id, attempt.attachments
-                ),
-                created_at=attempt.created_at,
-                updated_at=attempt.updated_at,
-            )
-            for attempt in ex.attempts
-        ]
-
-        return ExerciseView(
-            id=ex.id,
-            conversation_id=ex.conversation_id,
-            problem_id=ex.problem_id,
-            root_problem_id=ex.root_problem_id,
-            statement_text=ex.statement_text,
-            knowledge_point=ex.knowledge_point,
-            status=ex.status,  # type: ignore[arg-type]
-            student_answer_text=ex.student_answer_text,
-            student_solution_text=ex.student_solution_text,
-            revealed_solution_at=ex.revealed_solution_at,
-            answered_after_revealed=ex.answered_after_revealed,
-            evaluation=evaluation,
-            reference_solution_text=ref_sol,
-            source_question=self._repository.get_exercise_question_source(ex.id),
-            attachments=self._attachment_views(ex.conversation_id, ex.attachments),
-            attempts=attempts,
-            created_at=ex.created_at,
-            updated_at=ex.updated_at,
-        )
+        return self._repository.view_from_exercise(ex, allow_solution=allow_solution)
 
     @staticmethod
     def _parse_evaluation(raw: str | None) -> ExerciseEvaluation | None:
@@ -199,6 +162,51 @@ class PracticeMixin:
                 "independence_note": note[:800],
             }
         )
+
+    @staticmethod
+    def _normalize_optional_process_evaluation(
+        evaluation: AnswerEvaluation, attempt: ExerciseAttemptRecord
+    ) -> AnswerEvaluation:
+        """统一归一化评价结果：
+
+        1. 未能得出对错结论（is_correct=None）时，无论模型是否漏设，均视为需要补充；
+        2. 选填过程留空且已判定最终答案对错时，不再误标为待补充或保留占位套话。
+        """
+
+        if evaluation.is_correct is None:
+            if not evaluation.needs_supplement:
+                return evaluation.model_copy(update={"needs_supplement": True})
+            return evaluation
+
+        has_process = bool((attempt.student_solution_text or "").strip()) or bool(
+            attempt.attachments
+        )
+        if has_process:
+            return evaluation
+
+        updates: dict[str, Any] = {}
+        if evaluation.needs_supplement:
+            updates["needs_supplement"] = False
+
+        analysis = (evaluation.step_by_step_analysis or "").strip()
+        if analysis and len(analysis) <= 80 and (
+            ("未提供" in analysis or "未写" in analysis)
+            and ("过程" in analysis or "步骤" in analysis)
+            and ("无法定位" in analysis or "暂无法" in analysis)
+        ):
+            updates["step_by_step_analysis"] = ""
+
+        guidance = (evaluation.guidance or "").strip()
+        if guidance:
+            cleaned = re.sub(
+                r"(?:建议|请)?补[充写](?:完整)?(?:解题)?过程[，。；;！!]?\s*",
+                "",
+                guidance,
+            ).strip(" ，；;。")
+            if cleaned != guidance and cleaned:
+                updates["guidance"] = f"{cleaned}。" if guidance.endswith("。") else cleaned
+
+        return evaluation.model_copy(update=updates) if updates else evaluation
 
     def _plan_exercise_attempt(
         self, ex: ExerciseRecord, request: TurnInput
@@ -503,7 +511,7 @@ class PracticeMixin:
             evaluation = ExerciseEvaluation.model_validate(
                 json.loads(attempt.evaluation_json)
             )
-            return bool(evaluation.needs_supplement)
+            return answer_gate.evaluation_requires_supplement(evaluation)
         return False
 
     async def _dynamic_generate_exercise(
@@ -511,36 +519,68 @@ class PracticeMixin:
         prepared: ExecuteTurn,
         ctx: _DynamicContext,
         emit: Callable[[str, str], None],
+        action: ActionPlan | None = None,
     ) -> ActionOutcome:
         name = "generate_exercise"
+        params = dict(action.parameters) if action is not None else {}
+        from_question_param = bool(params.get("from_question"))
+        raw_topic = str(params.get("topic") or "").strip()
+        raw_course = str(params.get("course") or "").strip()
+        requested_course = normalize_course(raw_course) if raw_course else ctx.confirmed_course
+        if requested_course and not ctx.confirmed_course:
+            ctx.confirmed_course = requested_course
+
         active = self._question_operation_problem(ctx)
-        if active is None or active.status != "explained" or active.explanation is None:
+        has_explained_active = (
+            active is not None
+            and active.status == "explained"
+            and active.explanation is not None
+        )
+        # 仅在未要求基于原题出变式、且显式给出目标考点或要求自主出题时，允许脱离已讲解原题。
+        standalone = bool(not from_question_param and raw_topic and (not has_explained_active or not params.get("ref")))
+        if not standalone and not has_explained_active:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
                 "clarification",
-                "需要先有一道完成讲解的题目，才能生成类似练习。请先上传或粘贴题目。",
+                (
+                    "需要先完成当前选中真题的讲解，才能基于它生成类似练习。请先让我讲解这道题。"
+                    if from_question_param
+                    else "需要先有一道完成讲解的题目，才能生成类似练习；或者直接告诉我你想练的课程与考点（如“高数求极限”），我可以为你自主出题（非真题）。"
+                ),
                 needs_user=True,
             ))
         if self._make_exercise_agent is None:
             return self._action_result(prepared, ctx, ActionOutcome(name, "failed", "练习生成模型尚未配置。"))
 
-        emit("generating_exercise", "正在根据核心考点生成类似练习题")
-        from_question = (
-            ctx.question_selection is not None
-            and ctx.question_card is not None
-            and ctx.question_selection.problem_id == active.id
+        emit(
+            "generating_exercise",
+            "正在按考点自主生成练习题（非真题）"
+            if standalone
+            else "正在根据核心考点生成类似练习题",
         )
-        original_statement = (
-            compose_statement(ctx.question_card)
-            if from_question and ctx.question_card is not None
-            else active.statement_text
-        )
-        knowledge_points = ", ".join(
-            point.name for point in active.explanation.knowledge_points
-        )
-        steps_summary = "; ".join(
-            f"步骤{step.index}:{step.title}" for step in active.explanation.steps
-        )
+        if standalone:
+            from_question = False
+            original_statement = None
+            knowledge_points = raw_topic
+            steps_summary = None
+        else:
+            assert active is not None and active.explanation is not None
+            from_question = (
+                ctx.question_selection is not None
+                and ctx.question_card is not None
+                and ctx.question_selection.problem_id == active.id
+            )
+            original_statement = (
+                compose_statement(ctx.question_card)
+                if from_question and ctx.question_card is not None
+                else active.statement_text
+            )
+            knowledge_points = ", ".join(
+                point.name for point in active.explanation.knowledge_points
+            )
+            steps_summary = "; ".join(
+                f"步骤{step.index}:{step.title}" for step in active.explanation.steps
+            )
         agent = self._make_exercise_agent()
         recent = self._repository.list_recent_exercise_statements(
             prepared.conversation_id, limit=MAX_RECENT_EXERCISES
@@ -554,7 +594,8 @@ class PracticeMixin:
                 original_statement=original_statement,
                 knowledge_points=knowledge_points,
                 steps_summary=steps_summary,
-                course=ctx.confirmed_course,
+                course=requested_course,
+                topic=raw_topic if standalone else None,
                 recent_statements=recent,
                 avoid_statements=avoid or None,
             )
@@ -578,18 +619,63 @@ class PracticeMixin:
                 retryable=True,
             ))
         with self._repository.action_write():
+            if standalone:
+                anchor_statement = (
+                    f"【自主练习主题】"
+                    f"{f'{requested_course} · ' if requested_course else ''}"
+                    f"{generated.knowledge_point}"
+                )
+                # 占位锚点绝不填入完整参考解答，防止后续通过 problem 追问或讲解通道提前泄题。
+                anchor_explanation = Explanation(
+                    knowledge_points=[
+                        KnowledgePoint(
+                            name=fit_knowledge_point_name(generated.knowledge_point),
+                            explanation=f"学生要求围绕“{raw_topic}”自主练习。",
+                        )
+                    ],
+                    steps=[
+                        Step(
+                            index=1,
+                            title="独立作答提示",
+                            content="请先在练习卡片作答区完成解题，再提交评价或查看参考解答。",
+                        )
+                    ],
+                    final_answer="（请先独立作答，完成后再查看参考解答）",
+                    error_analysis="",
+                    uncertainties=[],
+                )
+                anchor = self._repository.create_problem_version(
+                    conversation_id=prepared.conversation_id,
+                    problem=NewProblem(
+                        statement_text=anchor_statement,
+                        status="explained",
+                        clarity="clear",
+                        unclear_points=[],
+                        uncertainties=[],
+                        source=Source(type="none"),
+                        student_answer_text=None,
+                        solution_text=None,
+                        explanation=anchor_explanation,
+                    ),
+                )
+                target_problem_id = anchor.id
+                target_root_problem_id = anchor.root_problem_id
+            else:
+                assert active is not None
+                target_problem_id = active.id
+                target_root_problem_id = active.root_problem_id
             exercise = self._repository.create_exercise(
                 id=str(uuid.uuid4()),
                 conversation_id=prepared.conversation_id,
-                problem_id=active.id,
-                root_problem_id=active.root_problem_id,
+                problem_id=target_problem_id,
+                root_problem_id=target_root_problem_id,
                 statement_text=generated.statement,
                 reference_solution_text=generated.reference_solution,
                 knowledge_point=generated.knowledge_point,
             )
             ctx.active_exercise = exercise
             ctx.exercise_id = exercise.id
-            if from_question and ctx.question_card is not None:
+            if not standalone and from_question and ctx.question_card is not None:
                 self._repository.save_exercise_question_source(
                     exercise_id=exercise.id,
                     card=ctx.question_card,
@@ -601,13 +687,20 @@ class PracticeMixin:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
                 "success",
-                "已根据真题生成针对性练习题（待作答）"
-                if from_question
-                else "已生成针对性练习题（待作答）",
+                (
+                    "已根据真题生成针对性练习题（待作答）"
+                    if from_question
+                    else (
+                        "已由模型按考点自主生成练习题（非历年真题，待作答）"
+                        if standalone
+                        else "已生成针对性练习题（待作答）"
+                    )
+                ),
                 {
                     "exercise_id": exercise.id,
                     "knowledge_point": generated.knowledge_point,
                     "from_question": from_question,
+                    "generated_mode": "standalone" if standalone else "variant",
                 },
                 needs_user=True,
             ))
@@ -698,7 +791,10 @@ class PracticeMixin:
                 retryable=not isinstance(exc, QueryError) or exc.code in RECOVERABLE_CODES,
             ))
 
-        effective = self._enforce_independence(evaluation, attempt)
+        effective = self._normalize_optional_process_evaluation(
+            self._enforce_independence(evaluation, attempt),
+            attempt,
+        )
         evaluation_json = json.dumps(
             effective.model_dump(mode="json"), ensure_ascii=False
         )
@@ -810,7 +906,14 @@ class PracticeMixin:
         user_feedback: str | None = None,
     ) -> ActionOutcome:
         name = "record_mistake"
-        active = self._question_operation_problem(ctx)
+        authorized_id = getattr(ctx, "authorized_mistake_problem_id", None)
+        ctx.authorized_mistake_problem_id = None
+        if authorized_id:
+            active = self._repository.get_problem(authorized_id)
+            if active is not None and active.conversation_id != prepared.conversation_id:
+                active = None
+        else:
+            active = self._question_operation_problem(ctx)
         if active is None or active.status != "explained" or active.explanation is None:
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
@@ -1111,7 +1214,10 @@ class PracticeMixin:
             )
             return
 
-        effective = self._enforce_independence(eval_res, attempt)
+        effective = self._normalize_optional_process_evaluation(
+            self._enforce_independence(eval_res, attempt),
+            attempt,
+        )
         try:
             ex_view, eval_view = self._complete_exercise_evaluation(
                 prepared, saved, ex, attempt, effective

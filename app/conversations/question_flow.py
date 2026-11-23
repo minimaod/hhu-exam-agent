@@ -54,6 +54,7 @@ from app.questions.models import (
     QuestionCard,
     QuestionSelection,
 )
+from app.questions.runtime import QuestionRuntime
 
 logger = logging.getLogger("app.conversations.service")
 
@@ -182,14 +183,16 @@ class QuestionFlowMixin:
         """详情页只从快照重建卡片；仅为已开放对象补答案正文。"""
 
         updates: dict[str, Any] = {}
+        source_availability: dict[tuple[str, str], tuple[bool, bool]] = {}
         if turn.question_results:
             results = []
             for card in turn.question_results:
                 selection = self._repository.find_question_selection_for_card(
                     conversation_id, card.question_id, card.build_id, card.content_sha256
                 )
+                if isinstance(self.questions, QuestionRuntime):
+                    card = self.questions.with_source_links(card, conversation_id, source_availability)
                 results.append(QuestionCard.model_validate({**card.model_dump(),
-                    "source_url": answer_url_for(conversation_id, card.question_id, card.build_id).replace("/answer?", "/source?"),
                     "source_views": (selection.snapshot.get("source_views", []) if selection else []),
                     "answer_url": answer_url_for(conversation_id, card.question_id, card.build_id) if card.answer.available else None,
                 }))
@@ -220,9 +223,10 @@ class QuestionFlowMixin:
                     or card.build_id != turn.question.build_id
                 ):
                     card = turn.question
+            if isinstance(self.questions, QuestionRuntime):
+                card = self.questions.with_source_links(card, conversation_id, source_availability)
             card = card.model_copy(
                 update={
-                    "source_url": answer_url_for(conversation_id, card.question_id, card.build_id).replace("/answer?", "/source?"),
                     "answer_url": (
                         answer_url_for(
                             conversation_id, card.question_id, card.build_id

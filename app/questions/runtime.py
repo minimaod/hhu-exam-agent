@@ -14,6 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
+from app.papers.errors import CatalogUnavailableError, PaperUnavailableError
+from app.papers.repository import PaperRepository
+from app.papers.service import DEFAULT_PAPERS_ROOT, PaperService
 from app.question_bank.config import DEFAULT_BANK_ROOT
 from app.question_bank.errors import QuestionBankRequestError
 from app.question_bank.models import SearchRequest, SearchResponse
@@ -25,6 +28,7 @@ from app.questions.cards import (
     card_from_snapshot,
     card_from_summary,
     compose_material,
+    download_url,
 )
 from app.questions.errors import QuestionError, QuestionNotRevealedError
 from app.questions.models import (
@@ -73,6 +77,7 @@ class QuestionRuntime:
         self._error = error
         self._root = Path(bank_root) if bank_root is not None else DEFAULT_BANK_ROOT
         self._archive = BuildArchive(self._root, papers_root)
+        self._papers = PaperService(PaperRepository(papers_root or DEFAULT_PAPERS_ROOT))
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
@@ -139,7 +144,7 @@ class QuestionRuntime:
         approved = int(capability.approved_count)
         searchable = int(capability.searchable_count)
         if capability.status == "ready":
-            message = f"Python 题库可用：{approved} 道已审核题可检索。"
+            message = f"{capability.course} 题库可用：{approved} 道已审核题可检索。"
         elif capability.status == "unreviewed":
             message = (
                 f"题库已建（{searchable} 道可检索），题目正在逐题审核，"
@@ -219,12 +224,17 @@ class QuestionRuntime:
                 "question_type": request.question_type,
             }
             if response.status == "ok" and response.items:
+                source_availability: dict[tuple[str, str], tuple[bool, bool]] = {}
                 cards = [
-                    card_from_summary(
-                        item,
-                        conversation_id=conversation_id,
-                        build_id=build_id,
-                        source_request_id=request_id or None,
+                    self.with_source_links(
+                        card_from_summary(
+                            item,
+                            conversation_id=conversation_id,
+                            build_id=build_id,
+                            source_request_id=request_id or None,
+                        ),
+                        conversation_id,
+                        source_availability,
                     )
                     for item in response.items
                 ]
@@ -265,7 +275,7 @@ class QuestionRuntime:
             if request.exam_type == "other":
                 return QuestionSearchResult(
                     status="no_match",
-                    message="Python 题库目前只有期中、期末真题；其他类型请查看试卷目录。",
+                    message=f"{capability.course} 题库目前只有期中、期末真题；其他类型请查看试卷目录。",
                     mode=response.mode,
                 )
             return QuestionSearchResult(
@@ -282,6 +292,39 @@ class QuestionRuntime:
     # 卡片与答案
     # ------------------------------------------------------------------
 
+    def with_source_links(
+        self,
+        card: QuestionCard,
+        conversation_id: str,
+        cache: dict[tuple[str, str], tuple[bool, bool]] | None = None,
+    ) -> QuestionCard:
+        """从归档和试卷目录重建当前可提供的来源入口。"""
+        paper_id = card.source.paper_id
+        key = (card.build_id, paper_id)
+        availability = cache.get(key) if cache is not None else None
+        if availability is None:
+            with self._lock:
+                has_page = self._archive.has_paper_source(card.build_id, paper_id)
+                try:
+                    self._papers.get_download(paper_id)
+                except (CatalogUnavailableError, PaperUnavailableError, OSError, ValueError, RuntimeError):
+                    can_download = False
+                else:
+                    can_download = True
+            availability = (has_page, can_download)
+            if cache is not None:
+                cache[key] = availability
+        has_page, can_download = availability
+        page_url = None
+        if has_page and (card.pages.statement or card.pages.answer):
+            page_url = answer_url(conversation_id, card.question_id, card.build_id).replace(
+                "/answer?", "/source?"
+            )
+        source = card.source.model_copy(
+            update={"download_url": download_url(paper_id) if can_download else None}
+        )
+        return card.model_copy(update={"source_url": page_url, "source": source})
+
     def card_for_selection(
         self,
         selection: QuestionSelection,
@@ -295,11 +338,11 @@ class QuestionRuntime:
             answer_revealed=bool(selection.answer_revealed_at),
             answer_revealed_at=selection.answer_revealed_at,
         )
-        # 快照里的资产 URL 已经绑定会话与 build；answer_url 由当前会话重建。
+        # 快照里的资产 URL 已经绑定会话与 build；来源和答案入口从当前状态重建。
+        card = self.with_source_links(card, selection.conversation_id)
         return card.model_copy(
             update={
                 "source_request_id": selection.source_request_id,
-                "source_url": answer_url(selection.conversation_id, selection.question_id, selection.build_id).replace("/answer?", "/source?"),
                 "answer_url": (
                     answer_url(
                         selection.conversation_id,

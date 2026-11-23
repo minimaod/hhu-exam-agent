@@ -264,9 +264,9 @@ def content_issue(record: dict[str, Any]) -> str | None:
         return None
     options = record.get("options") or []
     labels = [str(item.get("label")) for item in options]
-    if labels == ["A", "B", "C", "D"]:
+    if labels in (["A", "B", "C", "D"], ["A", "B", "C", "D", "E"]):
         return None
-    if len(options) == 4:
+    if len(options) in (4, 5):
         return f"选择题选项标签异常（原文保留：{','.join(labels)}）"
     return f"选择题选项未完整还原（识别到 {len(options)} 项：{','.join(labels) or '无'}）"
 
@@ -275,7 +275,7 @@ def content_status(record: dict[str, Any]) -> str:
     issue = content_issue(record)
     if issue is None:
         return "ok"
-    return "options_label_anomaly" if len(record.get("options") or []) == 4 else "options_incomplete"
+    return "options_label_anomaly" if len(record.get("options") or []) in (4, 5) else "options_incomplete"
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
@@ -288,16 +288,24 @@ def copy_assets(
     *,
     review_root: Path,
     target_dir: Path,
+    extra_review_roots: Iterable[Path] = (),
 ) -> list[dict[str, Any]]:
     """把题目引用图复制进 build，按内容命名；保留来源说明。"""
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    roots = [review_root, *extra_review_roots]
     assets: list[dict[str, Any]] = []
     for record in records:
         for ordinal, item in enumerate(record.get("assets") or [], start=1):
-            source = review_root / str(item.get("crop") or "")
-            if not source.is_file():
-                raise FileNotFoundError(f"题图不存在：{source}")
+            crop_rel = str(item.get("crop") or "")
+            source: Path | None = None
+            for root in roots:
+                candidate = root / crop_rel
+                if candidate.is_file():
+                    source = candidate
+                    break
+            if source is None:
+                raise FileNotFoundError(f"题图不存在：{review_root / crop_rel}")
             data = source.read_bytes()
             digest = hashlib.sha256(data).hexdigest()
             asset_id = f"asset-{digest[:16]}"

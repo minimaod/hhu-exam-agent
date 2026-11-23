@@ -13,10 +13,10 @@ const base: UsageSnapshot = {
 };
 
 describe("UsageNotice", () => {
-  test("显示剩余次数并说明一轮可能消耗多次", () => {
+  test("显示剩余次数且不暴露内部消耗细节", () => {
     render(<UsageNotice usage={base} />);
     expect(screen.getByText(/今日剩余模型请求/)).toBeTruthy();
-    expect(screen.getByText(/一轮复杂对话可能消耗/)).toBeTruthy();
+    expect(screen.queryByText(/一轮复杂对话可能消耗/)).toBeNull();
   });
 
   test("个人额度用完显示原因和重置时间", () => {

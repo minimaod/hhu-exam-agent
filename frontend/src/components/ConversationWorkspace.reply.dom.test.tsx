@@ -63,8 +63,11 @@ afterEach(() => {
 
 test("回复未生成完整时给出公开提示，并可只重做正文", async () => {
   let regenerated = false;
+  let finishRegeneration: () => void = () => {};
+  const pending = new Promise<void>((resolve) => { finishRegeneration = resolve; });
   const fetchMock = vi.fn(async (url: string) => {
     if (url.endsWith("/reply")) {
+      await pending;
       regenerated = true;
       return Response.json({
         request_id: "22222222-2222-4222-8222-222222222222",
@@ -98,8 +101,17 @@ test("回复未生成完整时给出公开提示，并可只重做正文", async
   // 业务状态仍然是成功：正文不完整不等于操作失败。
   expect(screen.getByText("成功")).toBeTruthy();
 
-  fireEvent.click(screen.getByRole("button", { name: "重新生成回复" }));
+  const regenerate = screen.getByRole("button", { name: "重新生成回复" });
+  fireEvent.change(screen.getByPlaceholderText(COMPOSER), { target: { value: "并发提交的草稿" } });
+  fireEvent.click(regenerate);
+  fireEvent.click(regenerate);
+  fireEvent.keyDown(screen.getByPlaceholderText(COMPOSER), { key: "Enter", ctrlKey: true });
+  expect((screen.getByRole("button", { name: "处理中…" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
+  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith("/reply"))).toHaveLength(1);
+  expect(fetchMock.mock.calls.filter(([url]) => url.endsWith("/turns"))).toHaveLength(0);
 
+  finishRegeneration();
   await waitFor(() =>
     expect(screen.getByText(/已经确认科目是 Python，接下来先做两套真题。/)).toBeTruthy(),
   );

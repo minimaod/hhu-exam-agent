@@ -22,11 +22,12 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import sleep
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from app.conversations import schema
+from app.conversations import answer_gate, schema
 from app.conversations.errors import (
     AttachmentInvalidError,
     AttachmentNotFoundError,
@@ -51,6 +52,7 @@ from app.conversations.models import (
     SuggestionItem,
     Turn,
     TurnError,
+    WorkbenchSource,
 )
 from app.querying.models import ResultEvent
 from app.questions.cards import HIDDEN_FIELDS as QUESTION_ANSWER_FIELDS
@@ -105,14 +107,13 @@ def _json_dump(value: object) -> str:
 
 
 def _needs_supplement(evaluation_json: str | None) -> bool:
-    """评价要求补充过程时，允许学生继续提交并重新评价。"""
+    """评价要求补充过程，或未能判定对错时，均视为尚未完成，允许继续补充/重试。"""
 
     if not evaluation_json:
         return False
     try:
-        return bool(
-            ExerciseEvaluation.model_validate_json(evaluation_json).needs_supplement
-        )
+        parsed = ExerciseEvaluation.model_validate_json(evaluation_json)
+        return answer_gate.evaluation_requires_supplement(parsed)
     except (ValidationError, ValueError):
         return False
 
@@ -430,12 +431,14 @@ class ConversationRepository:
             connection.close()
 
     @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
+    def _write(self, *, temp_in_memory: bool = False) -> Iterator[sqlite3.Connection]:
         if self._action_connection.get() is not None:
             yield self._action_connection.get()
             return
         connection = self._open()
         try:
+            if temp_in_memory:
+                connection.execute("PRAGMA temp_store = MEMORY")
             connection.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
             connection.close()
@@ -683,6 +686,7 @@ class ConversationRepository:
         input_json: str | None = None,
         attachments: Sequence[tuple[str, str]] = (),
         lease_token: str | None = None,
+        workbench_source: WorkbenchSource | None = None,
     ) -> Turn:
         """原子接受一轮输入：分配序号、绑定附件、更新标题/时间、写入 running。"""
 
@@ -721,8 +725,8 @@ class ConversationRepository:
                     """
                     INSERT INTO conversation_turns (
                         conversation_id, request_id, seq, query, status,
-                        kind, input_json, started_at
-                    ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
+                        kind, input_json, started_at, output_json
+                    ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)
                     """,
                     (
                         conversation_id,
@@ -732,6 +736,8 @@ class ConversationRepository:
                         kind,
                         canonical,
                         now,
+                        json.dumps({"_recovery": {"workbench_source": workbench_source.model_dump()}}, ensure_ascii=False)
+                        if workbench_source else None,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -774,6 +780,7 @@ class ConversationRepository:
             kind=kind,  # type: ignore[arg-type]
             query=query,
             status="running",
+            workbench_source=workbench_source,
             started_at=datetime.fromisoformat(now),
         )
 
@@ -802,6 +809,39 @@ class ConversationRepository:
                         f"reply:{request_id}",
                         lease_token,
                         now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise TurnInProgressError(
+                    "你已有一轮正在处理，请等待完成或先停止。"
+                ) from exc
+
+    def acquire_correction_lease(
+        self, record_id: str, request_id: str, lease_token: str
+    ) -> None:
+        """纠正与会话轮次共用账号占用；归属校验和占用写入在同一事务内。"""
+        if self._owner_id is None:
+            raise ConversationStorageError("缺少用户身份，不能纠正错题记录。")
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT r.conversation_id FROM mistake_records r "
+                "JOIN conversations c ON c.id = r.conversation_id "
+                "WHERE r.id = ? AND c.owner_id = ?",
+                (record_id, self._owner_id),
+            ).fetchone()
+            if row is None:
+                raise MistakeRecordNotFoundError("错题记录不存在。")
+            try:
+                connection.execute(
+                    "INSERT INTO user_active_turns "
+                    "(owner_id, conversation_id, request_id, lease_token, started_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        self._owner_id,
+                        row["conversation_id"],
+                        f"correction:{request_id}",
+                        lease_token,
+                        _now(),
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -2120,6 +2160,20 @@ class ConversationRepository:
                 connection, conversation_id, root_problem_id
             )
 
+    def list_records_by_conversation(
+        self, conversation_id: str
+    ) -> dict[str, RecordRow]:
+        owner_sql, owner_params = self._owner_filter("mistake_records")
+        with self._read() as connection:
+            rows = connection.execute(
+                f"{self._RECORD_SELECT} WHERE conversation_id = ?" + owner_sql,
+                (conversation_id, *owner_params),
+            ).fetchall()
+            return {
+                str(row["root_problem_id"]): self._row_to_record(connection, row)
+                for row in rows
+            }
+
     def list_records(self, *, limit: int, offset: int) -> tuple[list[RecordRow], int]:
         owner_sql, owner_params = self._owner_filter("mistake_records")
         with self._read() as connection:
@@ -2205,6 +2259,7 @@ class ConversationRepository:
         reason: str,
         new_snapshot: RecordSnapshot,
         request_input: str,
+        expected_updated_at: datetime | None = None,
     ) -> tuple[RecordRow, bool]:
         """用新快照替换当前记录，并把旧快照写入修订；request_id 幂等。
 
@@ -2241,6 +2296,13 @@ class ConversationRepository:
                 return self._load_record(connection, record_id), False
 
             current = self._row_to_record(connection, row)
+            if (
+                expected_updated_at is not None
+                and current.updated_at != expected_updated_at
+            ):
+                raise MistakeRecordConflictError(
+                    "这条错题在讲解期间已被修改，请刷新后重新纠正。"
+                )
             db_conversation_id = current.conversation_id
             if new_snapshot.conversation_id != db_conversation_id:
                 raise MistakeRecordNotFoundError("错题记录不存在。")
@@ -2351,6 +2413,136 @@ class ConversationRepository:
             )
             if cursor.rowcount != 1:
                 raise MistakeRecordNotFoundError("错题记录不存在。")
+
+    def delete_conversation_with_attachments(
+        self, conversation_id: str
+    ) -> list[str]:
+        """在同一事务中删除归属当前账号的会话，并返回待清理磁盘附件路径。"""
+
+        owner_sql, owner_params = self._owner_filter("conversations", column="id")
+        for attempt in (1, 2):
+            stage = "begin"
+            try:
+                # 级联删除和成果解绑可能写 SQLite 临时文件，须在事务开始前选内存。
+                with self._write(temp_in_memory=True) as connection:
+                    stage = "delete"
+                    exists = connection.execute(
+                        "SELECT 1 FROM conversations WHERE id = ?" + owner_sql,
+                        (conversation_id, *owner_params),
+                    ).fetchone()
+                    if exists is None:
+                        raise ConversationNotFoundError("会话不存在。")
+                    running_turn = connection.execute(
+                        "SELECT 1 FROM conversation_turns WHERE conversation_id = ? AND status = 'running' LIMIT 1",
+                        (conversation_id,),
+                    ).fetchone()
+                    active_lease = (
+                        connection.execute(
+                            "SELECT 1 FROM user_active_turns WHERE owner_id = ? AND conversation_id = ? LIMIT 1",
+                            (self._owner_id, conversation_id),
+                        ).fetchone()
+                        if self._owner_id is not None
+                        else None
+                    )
+                    if running_turn is not None or active_lease is not None:
+                        raise ConversationConflictError("当前会话正在处理中，请稍候完成后再删除。")
+                    rows = connection.execute(
+                        "SELECT stored_name FROM attachments WHERE conversation_id = ?",
+                        (conversation_id,),
+                    ).fetchall()
+                    stored_names = [str(row["stored_name"]) for row in rows]
+                    connection.execute(
+                        "DELETE FROM conversations WHERE id = ?" + owner_sql,
+                        (conversation_id, *owner_params),
+                    )
+                    stage = "commit"
+                return stored_names
+            except (ConversationStorageError, sqlite3.Error) as exc:
+                sqlite_error = exc if isinstance(exc, sqlite3.Error) else exc.__cause__
+                code = getattr(sqlite_error, "sqlite_errorcode", 0) & 0xFF
+                busy = code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                retry = busy and attempt == 1
+                logger.warning(
+                    "Conversation delete SQLite failure: stage=%s error=%s retry=%s",
+                    stage,
+                    getattr(sqlite_error, "sqlite_errorname", type(sqlite_error).__name__),
+                    retry,
+                )
+                if retry:
+                    sleep(0.05)
+                    continue
+                if busy:
+                    raise ConversationStorageError(
+                        "本地学习数据正在写入，请稍后重试删除会话。"
+                    ) from exc
+                if isinstance(exc, sqlite3.Error):
+                    raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+                raise
+        raise AssertionError("unreachable delete retry")
+
+    def append_completed_material_turn(
+        self,
+        conversation_id: str,
+        *,
+        request_id: str,
+        query: str,
+        assistant_message: str,
+        composite_results: list[ActionResultItem],
+        title_hint: str | None = None,
+    ) -> str:
+        """在会话内追加一条已完成的个人资料操作展示轮次（不调用模型、不计入运行中占用）。"""
+
+        now = _now()
+        canonical = query_input(query)
+        output_payload: dict[str, Any] = {
+            "assistant_message": assistant_message,
+            "composite_results": [
+                it.model_dump(mode="json") for it in composite_results
+            ],
+        }
+        output_json = json.dumps(output_payload, ensure_ascii=False)
+
+        with self._write() as connection:
+            owner_sql, owner_params = self._owner_filter("conversations", column="id")
+            conversation = connection.execute(
+                "SELECT title FROM conversations WHERE id = ?" + owner_sql,
+                (conversation_id, *owner_params),
+            ).fetchone()
+            if conversation is None:
+                raise ConversationNotFoundError("会话不存在。")
+
+            next_seq = connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM conversation_turns WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0]
+
+            title = conversation["title"]
+            if title == DEFAULT_TITLE and title_hint:
+                title = _title_from_text(title_hint)
+
+            connection.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                (title, now, conversation_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO conversation_turns (
+                    conversation_id, request_id, seq, query, status,
+                    kind, input_json, output_json, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, 'completed', 'dynamic', ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    request_id,
+                    next_seq,
+                    query,
+                    canonical,
+                    output_json,
+                    now,
+                    now,
+                ),
+            )
+        return request_id
 
     def _find_record_by_root(
         self,
@@ -2540,8 +2732,13 @@ class ConversationRepository:
             # 当前契约的 exercise，旧数据仍可刷新和回放。
             if raw_kind == "exercise_answer":
                 raw_kind = "exercise"
+            workbench_source = None
+            if recovery.get("workbench_source"):
+                with suppress(ValidationError):
+                    workbench_source = WorkbenchSource.model_validate(recovery["workbench_source"])
             turn = Turn(
                 request_id=row["request_id"],
+                workbench_source=workbench_source,
                 seq=row["seq"],
                 kind=raw_kind,
                 query=row["query"],
@@ -3763,13 +3960,24 @@ class ConversationRepository:
             return None
 
         current = attempt or exercise.current_attempt
+        already_revealed = answer_gate.exercise_solution_already_revealed(exercise)
         if attempt is None:
-            status = exercise.status
             answer = exercise.student_answer_text
             solution = exercise.student_solution_text
             flag = exercise.answered_after_revealed
             revealed_at = exercise.revealed_solution_at
             parsed_eval = evaluation(exercise.evaluation_json)
+            complete = (
+                parsed_eval is not None
+                and not answer_gate.evaluation_requires_supplement(parsed_eval)
+            )
+            if complete:
+                status = "submitted"
+            elif exercise.status == "revealed":
+                status = "revealed"
+            else:
+                # 即使旧记录误标为 submitted，只要评价缺失或无法判分，统一展示为待作答。
+                status = "pending_answer"
             attachments_source = (
                 exercise.attachments if current is None else current.attachments
             )
@@ -3778,7 +3986,10 @@ class ConversationRepository:
             updated_at = exercise.updated_at
         else:
             parsed_eval = evaluation(attempt.evaluation_json)
-            complete = parsed_eval is not None and not parsed_eval.needs_supplement
+            complete = (
+                parsed_eval is not None
+                and not answer_gate.evaluation_requires_supplement(parsed_eval)
+            )
             status = "pending_answer" if not complete else "submitted"
             answer = attempt.student_answer_text
             solution = attempt.student_solution_text
@@ -3796,16 +4007,23 @@ class ConversationRepository:
             updated_at = attempt.updated_at
 
         ref_sol = None
-        if allow_solution or (
-            parsed_eval is not None and not parsed_eval.needs_supplement
-        ):
-            ref_sol = exercise.reference_solution_text
-        elif attempt is None and (
-            exercise.status in ("submitted", "revealed")
-            or exercise.revealed_solution_at is not None
-        ):
-            # 兼容未回填尝试的旧数据/查看解答动作：沿用原可见性。
-            ref_sol = exercise.reference_solution_text
+        if attempt is None:
+            if allow_solution or complete or already_revealed:
+                ref_sol = exercise.reference_solution_text
+        else:
+            legacy_revealed_submission = bool(
+                already_revealed
+                and exercise.status == "submitted"
+                and exercise.current_attempt is not None
+                and attempt.id == exercise.current_attempt.id
+            )
+            if (
+                allow_solution
+                or complete
+                or bool(attempt.answered_after_revealed)
+                or legacy_revealed_submission
+            ):
+                ref_sol = exercise.reference_solution_text
 
         attempts: list[ExerciseAttemptView] = []
         for item in attempts_source:
@@ -4192,7 +4410,12 @@ class ConversationRepository:
         return None
 
     def get_question_selection(
-        self, conversation_id: str, question_id: str, *, build_id: str | None = None
+        self,
+        conversation_id: str,
+        question_id: str,
+        *,
+        build_id: str | None = None,
+        content_sha256: str | None = None,
     ) -> QuestionSelection | None:
         owner_sql, owner_params = self._owner_filter("question_selections")
         with self._read() as connection:
@@ -4201,12 +4424,21 @@ class ConversationRepository:
                 SELECT * FROM question_selections
                 WHERE conversation_id = ? AND question_id = ?
                   AND (? IS NULL OR build_id = ?)
+                  AND (? IS NULL OR content_sha256 = ?)
                 """
                 + owner_sql
                 + """
                 ORDER BY created_at DESC, rowid DESC LIMIT 1
                 """,
-                (conversation_id, question_id, build_id, build_id, *owner_params),
+                (
+                    conversation_id,
+                    question_id,
+                    build_id,
+                    build_id,
+                    content_sha256,
+                    content_sha256,
+                    *owner_params,
+                ),
             ).fetchone()
         return None if row is None else self._row_to_question_selection(row)
 

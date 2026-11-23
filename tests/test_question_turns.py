@@ -160,6 +160,58 @@ def build_service(
     return service, repository, fake_runtime
 
 
+def test_original_paper_links_follow_available_files_in_search_and_history(tmp_path: Path) -> None:
+    import hashlib
+
+    import pymupdf
+
+    from app.question_bank.models import SearchRequest
+    from app.question_bank.paths import BankPaths, read_current
+    from app.question_bank.service import QuestionBankService
+    from app.questions.runtime import QuestionRuntime
+    from tests.support import sample_record, write_catalog
+    from tests.test_f007_multicourse_extension import _FakeEmbedder, _build_multicourse_bank
+
+    root, catalog = _build_multicourse_bank(tmp_path / "bank")
+    paper_id = "py-2024-final"
+    papers_root = tmp_path / "public-papers"
+    public_record = sample_record(paper_id, "final", None, "py.pdf")
+    public_record.update(course="Python语言程序设计", file_path="py.pdf")
+    write_catalog(papers_root, [public_record])
+    pdf_path = papers_root / "py.pdf"
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((20, 30), "Source fixture")
+        pdf.save(pdf_path)
+    paths = BankPaths(root)
+    current = read_current(paths)
+    assert current is not None
+    with sqlite3.connect(paths.build_dir(current["build_id"]) / "questions.sqlite3") as connection:
+        connection.execute(
+            "UPDATE papers SET pdf_sha256 = ? WHERE paper_id = ?",
+            (hashlib.sha256(pdf_path.read_bytes()).hexdigest(), paper_id),
+        )
+
+    with QuestionBankService(root, embedder=_FakeEmbedder(), catalog_path=catalog) as bank:
+        runtime = QuestionRuntime(bank, bank_root=root, papers_root=papers_root)
+        service, repository, _ = build_service(tmp_path, runtime=runtime)
+        conversation_id = service.create_conversation().id
+        request = SearchRequest(course="Python", paper_id=paper_id)
+        card = runtime.search(request, conversation_id=conversation_id).cards[0]
+        assert card.source_url and "/source?" in card.source_url
+        assert card.source.download_url == f"/api/papers/{paper_id}/download"
+        assert runtime.source_for_card(card, "statement", 1).path == pdf_path
+        add_search_turn(repository, conversation_id, [card])
+        assert service.get_detail(conversation_id).turns[0].question_results[0].source_url
+
+        pdf_path.unlink()
+        found = runtime.search(request, conversation_id=conversation_id).cards[0]
+        history = service.get_detail(conversation_id).turns[0].question_results[0]
+        for unavailable in (found, history):
+            assert unavailable.statement == card.statement
+            assert unavailable.source_url is None
+            assert unavailable.source.download_url is None
+
+
 def add_search_turn(
     repository: ConversationRepository, conversation_id: str, cards
 ) -> str:
@@ -461,7 +513,8 @@ async def test_model_cannot_disclose_answer_without_student_request(tmp_path, te
     assert result.tutoring is None
     assert tutor.explain_calls == []
     if extra_action == "view_question_answer":
-        assert repository.get_active_question(conversation.id) is None
+        active = repository.get_active_question(conversation.id)
+        assert active is None or not active.answer_revealed_at
     # 模型排队的讲解/看答案没有变成成功动作；至多留下一条等待学生的说明。
     queued = [item for item in result.composite_results if item.action == extra_action]
     assert all(item.status != "success" for item in queued)
@@ -529,12 +582,23 @@ async def test_new_lookup_does_not_echo_previous_revealed_selection(tmp_path):
     await run(service, conversation.id, turn_input(kind="view_question_answer", question_id=card.question_id, source_turn=source))
     before = repository.get_active_question(conversation.id)
     assert before.answer_revealed_at
-    # 换一道题但没说要讲：不能借旧题目的已公开答案回显。
+    # 换一道题但没说要讲：单题直接选中新题落库进入作答，不能借旧题目的已公开答案回显。
     events = await run(service, conversation.id, turn_input(kind=None, text="换一道Python真题", dispatch=True))
     result = next(event for event in events if event.type == "result")
-    assert result.question is None and result.tutoring is None
-    assert result.question_results and not result.question_results[0].answer_revealed
-    assert repository.get_active_question(conversation.id).answer_revealed_at == before.answer_revealed_at
+    assert result.tutoring is None
+    assert result.question is not None
+    assert result.question.question_id == "py-2024-2025-s1-final-choice-2"
+    assert result.question.selected is True
+    assert not result.question.answer_revealed
+    assert [item.question_id for item in result.question_results] == [
+        "py-2024-2025-s1-final-choice-2"
+    ]
+    assert not result.question_results[0].answer_revealed
+    active = repository.get_active_question(conversation.id)
+    assert active is not None
+    assert active.question_id == "py-2024-2025-s1-final-choice-2"
+    assert active.id != before.id
+    assert not active.answer_revealed_at
 
 
 @pytest.mark.anyio

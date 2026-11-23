@@ -59,7 +59,7 @@ def test_v6_copy_migrates_to_admin(tmp_path: Path) -> None:
     assert report.backup_path is not None and report.backup_path.is_file()
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert connection.execute(
             "SELECT owner_id FROM conversations"
         ).fetchone()[0] == "admin-1"
@@ -169,7 +169,7 @@ def test_fresh_empty_database_creates_v8(tmp_path: Path) -> None:
     schema.initialize_database(db)
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert connection.execute(
             "SELECT COUNT(*) FROM users"
         ).fetchone()[0] == 0
@@ -386,7 +386,7 @@ def test_post_commit_startup_failure_reports_v8(
         migrate_database(db, owner=owner(), backup_dir=tmp_path / "backups")
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
     finally:
         connection.close()
 
@@ -397,13 +397,13 @@ def test_post_commit_check_reports_committed_v8(
     db = tmp_path / "study.sqlite3"
     build_v6(db)
     monkeypatch.setattr(
-        "app.auth.migrate._assert_v8",
+        "app.auth.migrate._assert_v12",
         lambda path: (_ for _ in ()).throw(ConversationStorageError("注入检查失败")),
     )
     with pytest.raises(MigrationCommittedCheckError):
         migrate_database(db, owner=owner(), backup_dir=tmp_path / "backups")
     connection = sqlite3.connect(db)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
     finally:
         connection.close()

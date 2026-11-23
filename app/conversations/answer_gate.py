@@ -362,10 +362,21 @@ def _json_object(raw: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _finished_evaluation(raw: Any) -> ExerciseEvaluation | None:
-    """只有完整、可解析且明确“不需要补充”的评价才算完成。
+def evaluation_requires_supplement(evaluation: Any) -> bool:
+    """要求补充，或未能得出对错结论（is_correct=None），均视为作答尚未完成。"""
 
-    评价缺失、畸形或字段不全时默认封闭（F006：评价失败不等于练习已完成）。
+    if evaluation is None:
+        return False
+    return bool(getattr(evaluation, "needs_supplement", False)) or (
+        getattr(evaluation, "is_correct", None) is None
+    )
+
+
+def _finished_evaluation(raw: Any) -> ExerciseEvaluation | None:
+    """只有完整、可解析的评价才算存在；是否要求补充由 evaluation_requires_supplement 判断。
+
+    评价缺失、畸形或核心评价/点拨缺失时默认封闭（F006：评价失败不等于练习已完成）。
+    选填解题过程留空时 step_by_step_analysis 允许为空字符串。
     """
 
     value = _json_object(raw)
@@ -377,7 +388,6 @@ def _finished_evaluation(raw: Any) -> ExerciseEvaluation | None:
         return None
     if not (
         evaluation.final_answer_assessment.strip()
-        and evaluation.step_by_step_analysis.strip()
         and evaluation.guidance.strip()
     ):
         return None
@@ -385,7 +395,7 @@ def _finished_evaluation(raw: Any) -> ExerciseEvaluation | None:
 
 
 def _completed_attempt(attempt: Any) -> bool:
-    """一次真正完成的作答：有内容，且评价完整并明确没有要求补充。"""
+    """一次真正完成的作答：有内容，且评价已判出对错且明确不需要补充。"""
 
     def field(name: str) -> Any:
         if isinstance(attempt, dict):
@@ -400,7 +410,7 @@ def _completed_attempt(attempt: Any) -> bool:
     if not has_content:
         return False
     evaluation = _finished_evaluation(field("evaluation_json"))
-    return evaluation is not None and not evaluation.needs_supplement
+    return evaluation is not None and not evaluation_requires_supplement(evaluation)
 
 
 def _has_completed_attempt(exercise: Any) -> bool:
@@ -420,21 +430,33 @@ def _has_completed_attempt(exercise: Any) -> bool:
     )
 
 
+def exercise_solution_already_revealed(exercise: Any) -> bool:
+    """参考解答是否已通过主动查看或旧版揭示记录对学生公开过。"""
+
+    if exercise is None:
+        return False
+    return (
+        str(getattr(exercise, "status", "") or "") == "revealed"
+        or getattr(exercise, "revealed_solution_at", None) is not None
+    )
+
+
 def exercise_solution_gate(
     *,
     request_id: str,
     student_text: str,
     exercise: Any,
 ) -> GateDecision:
-    """F006 练习参考解答门禁：已完成作答或学生主动要求；否定请求不放行。"""
+    """F006 练习参考解答门禁：已公开、已完成作答或学生主动要求；否定请求不放行。"""
 
     if exercise is None:
         return _deny("EXERCISE_NOT_FOUND")
     if wants_to_try_first(student_text) or solution_negated(student_text):
         return _deny("EXERCISE_SOLUTION_NOT_AUTHORIZED")
-    status = str(getattr(exercise, "status", "") or "")
-    if status == "revealed" or _has_completed_attempt(exercise) or solution_requested(
-        student_text
+    if (
+        exercise_solution_already_revealed(exercise)
+        or _has_completed_attempt(exercise)
+        or solution_requested(student_text)
     ):
         return _allow(
             kind="exercise_solution",

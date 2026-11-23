@@ -51,6 +51,33 @@ class BankPaths:
         return self.taxonomy_dir / "knowledge-points.json"
 
     @property
+    def taxonomy_files(self) -> list[Path]:
+        """返回词表目录中全部知识点文件，默认主词表排首位。"""
+
+        if not self.taxonomy_dir.is_dir():
+            return [self.taxonomy_file]
+        files: list[Path] = []
+        if self.taxonomy_file.is_file():
+            files.append(self.taxonomy_file)
+        for path in sorted(self.taxonomy_dir.glob("knowledge-points-*.json")):
+            if path.is_file() and path != self.taxonomy_file:
+                files.append(path)
+        return files or [self.taxonomy_file]
+
+    @property
+    def extra_source_dirs(self) -> list[Path]:
+        """返回扩展学科源目录（source/ext-*），保持与 source/full 并列隔离。"""
+
+        source_root = self.root / "source"
+        if not source_root.is_dir():
+            return []
+        return sorted(
+            path
+            for path in source_root.iterdir()
+            if path.is_dir() and path.name.startswith("ext-") and (path / "manifest.json").is_file()
+        )
+
+    @property
     def stopwords_file(self) -> Path:
         return self.taxonomy_dir / "stopwords-zh.txt"
 

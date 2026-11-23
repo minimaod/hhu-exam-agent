@@ -16,18 +16,18 @@ export default function UserMenu({
 
   if (!user) {
     return (
-      <div className="flex items-center gap-2 text-[11px]">
+      <div className="flex items-center gap-2 text-xs">
         <button
           type="button"
           onClick={onLogin}
-          className="rounded-lg border border-slate-300 bg-white px-2 py-1 font-medium text-slate-700 hover:bg-slate-100"
+          className="quiet-button"
         >
           登录
         </button>
         <button
           type="button"
           onClick={onRegister}
-          className="rounded-lg bg-river px-2 py-1 font-medium text-white"
+          className="primary-button"
         >
           注册
         </button>
@@ -36,9 +36,10 @@ export default function UserMenu({
   }
 
   return (
-    <div className="flex items-center gap-2 text-[11px] text-slate-600">
-      <span className="max-w-[8rem] truncate" title={user.username}>
-        {user.username}
+    <div className="user-row">
+      <span className="user-identity">
+        <span className="user-avatar" aria-hidden="true">{Array.from(user.username)[0]?.toUpperCase()}</span>
+        <span className="user-name" title={user.username}>{user.username}</span>
       </span>
       <button
         type="button"
@@ -54,7 +55,7 @@ export default function UserMenu({
             setBusy(false);
           }
         }}
-        className="rounded-lg border border-slate-300 bg-white px-2 py-1 font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+        className="quiet-button"
       >
         {busy ? "退出中…" : "退出登录"}
       </button>

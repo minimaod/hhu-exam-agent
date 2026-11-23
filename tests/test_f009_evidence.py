@@ -194,24 +194,57 @@ def test_course_precedence_correction_then_question_then_problem(tmp_path: Path)
     assert corrected_entry.course_source == "user"
 
 
-def test_confirmed_course_is_never_reverse_inferred(tmp_path: Path) -> None:
+def test_confirmed_course_fallback_and_precedence(tmp_path: Path) -> None:
+    from app.memory.models import MemoryCorrectionRequest
+
     service, seed = build(tmp_path)
     conversation = seed.conversation()
+    selfreport_conv = seed.conversation()
+    paper_conv = seed.conversation()
+
     problem = seed.problem(conversation)
-    seed.exercise(conversation, problem, knowledge_point="杂项")
+    exercise_id = seed.exercise(conversation, problem, knowledge_point="极限")
+    selfreport_problem = seed.problem(selfreport_conv, self_reported=True)
+    paper_problem = seed.problem(
+        paper_conv,
+        paper_id="py-2023-2024-s2-final",
+        source_type="registered_paper",
+    )
+    paper_exercise = seed.exercise(paper_conv, paper_problem, knowledge_point="循环")
+
     with sqlite3.connect(service.db_path) as connection:
-        connection.execute(
-            "INSERT INTO conversation_contexts (conversation_id, confirmed_course, updated_at) "
-            "VALUES (?, ?, ?)",
-            (conversation, "高等数学", "2026-11-01T00:00:00+00:00"),
-        )
+        for conv_id in (conversation, selfreport_conv, paper_conv):
+            connection.execute(
+                "INSERT INTO conversation_contexts (conversation_id, confirmed_course, updated_at) "
+                "VALUES (?, ?, ?)",
+                (conv_id, "高等数学", "2026-11-01T00:00:00+00:00"),
+            )
         connection.commit()
 
-    python_view = service.summary("Python语言程序设计", days=30, limit=50)
+    # 1. 无 paper_id 的练习与自述理解记录，自动继承会话已确认科目。
     math_view = service.summary("高等数学", days=30, limit=50)
-    assert python_view.counts.evidence == 0
-    assert math_view.counts.evidence == 0
-    assert python_view.counts.pending_course == 1
+    assert math_view.counts.evidence == 2
+    assert math_view.counts.pending_course == 0
+    by_id = {entry.entry_id: entry for entry in math_view.entries}
+    assert by_id[f"exercise:{exercise_id}"].course_source == "conversation"
+    assert by_id[f"selfreport:{selfreport_problem}"].course_source == "conversation"
+
+    # 2. 有 paper_id 时仍以试卷归属为准，不被会话科目覆盖。
+    python_view = service.summary("Python语言程序设计", days=30, limit=50)
+    assert [entry.entry_id for entry in python_view.entries] == [
+        f"exercise:{paper_exercise}"
+    ]
+    assert python_view.entries[0].course_source == "paper" or (
+        python_view.entries[0].course_source == "problem"
+    )
+
+    # 3. 用户手动留空更正依然优先，可把继承的记录改回待确认。
+    service.correct("exercise", exercise_id, MemoryCorrectionRequest(course=""))
+    after_clear = service.summary("高等数学", days=30, limit=50)
+    assert after_clear.counts.evidence == 1
+    assert after_clear.counts.pending_course == 1
+    assert after_clear.pending_course_entries[0].entry_id == f"exercise:{exercise_id}"
+    assert after_clear.pending_course_entries[0].course_source == "user"
 
 
 def test_knowledge_points_normalize_only_on_exact_alias(tmp_path: Path) -> None:

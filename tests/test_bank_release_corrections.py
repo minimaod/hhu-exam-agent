@@ -86,7 +86,7 @@ def release_records():
         for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
         for record in [json.loads(line)]
     }
-    records, _, _ = load_bank_inputs(paths)
+    records, _, _ = load_bank_inputs(paths, corrections=[correction_path])
     return raw, {record["question_id"]: record for record in records}
 
 

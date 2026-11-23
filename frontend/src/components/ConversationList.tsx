@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import type { ConversationSummary } from "../lib/conversationsApi";
 import { formatDateTime } from "../lib/display";
 
@@ -7,8 +8,10 @@ type ConversationListProps = {
   loading: boolean;
   error: string | null;
   creating: boolean;
+  createTarget?: HTMLElement | null;
   onCreate: () => void;
   onSelect: (id: string) => void;
+  onRequestDelete?: (id: string) => void;
   onRetry: () => void;
 };
 
@@ -19,27 +22,23 @@ export default function ConversationList({
   loading,
   error,
   creating,
+  createTarget,
   onCreate,
   onSelect,
+  onRequestDelete,
   onRetry,
 }: ConversationListProps) {
-  return (
-    <aside className="rounded-2xl border border-slate-200/90 bg-white/80 p-4 shadow-card backdrop-blur">
-      <div className="flex items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold text-ink">学习会话</h2>
-        <button
-          type="button"
-          onClick={onCreate}
-          disabled={creating}
-          className="rounded-lg bg-river px-2.5 py-1 text-[11px] font-medium text-white transition hover:bg-river/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-river focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:bg-slate-400"
-        >
-          {creating ? "创建中…" : "新建会话"}
-        </button>
-      </div>
+  const createButton = (
+    <button type="button" onClick={onCreate} disabled={creating} className={createTarget ? "rail-create" : "primary-button"}>
+      {createTarget && <span aria-hidden="true">＋ </span>}
+      {creating ? "创建中…" : createTarget ? "新建学习会话" : "新建会话"}
+    </button>
+  );
 
-      <p className="mt-1 text-[11px] leading-5 text-slate-500">
-        查询历史保存在本地，刷新或重启后端后仍可打开。
-      </p>
+  return (
+    <section className="history-list">
+      {createTarget ? createPortal(createButton, createTarget) : createButton}
+      <h2 className="rail-section-title">最近学习会话</h2>
 
       {loading && (
         <p className="mt-3 text-xs text-slate-500">正在读取会话…</p>
@@ -51,7 +50,7 @@ export default function ConversationList({
           <button
             type="button"
             onClick={onRetry}
-            className="mt-2 rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-[11px] font-medium text-rose-800 transition hover:bg-rose-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-400"
+            className="mt-2 rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-800 transition hover:bg-rose-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-400"
           >
             重新读取
           </button>
@@ -69,29 +68,37 @@ export default function ConversationList({
           {conversations.map((conversation) => {
             const active = conversation.id === currentId;
             return (
-              <li key={conversation.id}>
+              <li key={conversation.id} className="group flex items-center gap-1">
                 <button
                   type="button"
                   onClick={() => onSelect(conversation.id)}
                   aria-current={active ? "true" : undefined}
-                  className={`w-full rounded-xl border px-3 py-2 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-river ${
-                    active
-                      ? "border-river/40 bg-river/10"
-                      : "border-transparent hover:border-slate-200 hover:bg-slate-50"
-                  }`}
+                  className="history-item min-w-0 flex-1"
                 >
-                  <span className="block truncate text-xs font-medium text-ink">
+                  <span className="history-title">
                     {conversation.title}
                   </span>
-                  <span className="mt-0.5 block text-[10px] text-slate-400">
+                  <span className="history-meta">
                     {formatDateTime(conversation.updated_at)}
                   </span>
                 </button>
+                {onRequestDelete && (
+                  <button
+                    type="button"
+                    aria-label="删除此会话"
+                    title={`删除会话：${conversation.title}`}
+                    data-testid={`delete-conversation-${conversation.id}`}
+                    onClick={() => onRequestDelete(conversation.id)}
+                    className="rounded-lg px-2 py-1 text-xs text-slate-400 hover:bg-rose-50 hover:text-rose-700 focus:text-rose-700"
+                  >
+                    ×
+                  </button>
+                )}
               </li>
             );
           })}
         </ul>
       )}
-    </aside>
+    </section>
   );
 }

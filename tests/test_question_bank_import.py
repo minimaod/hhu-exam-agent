@@ -60,14 +60,19 @@ def build_dir(current):
 
 def test_source_counts_and_searchable(inputs) -> None:
     records, manifest, papers = inputs
-    assert len(papers) == 20
-    assert len(records) == 1154
-    assert sum(1 for r in records if r["question_type"] == "choice") == 790
-    assert sum(1 for r in records if r["question_type"] == "fill") == 324
-    assert sum(1 for r in records if r["question_type"] == "code") == 40
+    py_records = [r for r in records if r["course"] == "Python语言程序设计"]
+    py_papers = [p for p in papers if p["course"] == "Python语言程序设计"]
+    assert len(py_papers) == 20
+    assert len(py_records) == 1154
+    assert sum(1 for r in py_records if r["question_type"] == "choice") == 790
+    assert sum(1 for r in py_records if r["question_type"] == "fill") == 324
+    assert sum(1 for r in py_records if r["question_type"] == "code") == 40
     issues = {r["question_id"] for r in records if QDB.content_issue(r)}
     assert issues == BAD_IDS
-    assert len(records) - len(issues) == 1152
+    assert len(py_records) - len(issues) == 1152
+    assert len(papers) == 40
+    assert len(records) == 1575
+    assert len(records) - len(issues) == 1573
     assert len(manifest.get("issues") or []) == 20
 
 
@@ -78,7 +83,7 @@ def test_content_hash_is_stable_and_matches_db(inputs, build_dir: Path) -> None:
         rows = dict(conn.execute("SELECT question_id, content_sha256 FROM questions"))
     finally:
         conn.close()
-    assert len(rows) == 1154
+    assert len(rows) == len(records) == 1575
     for record in records:
         assert rows[record["question_id"]] == QDB.content_sha256(record)
 
@@ -90,16 +95,17 @@ def test_two_label_anomalies_are_not_searchable(build_dir: Path) -> None:
             "SELECT question_id, content_status, content_issue, searchable "
             "FROM questions WHERE content_status!='ok'"
         ).fetchall()
-        option_shape = conn.execute(
+        py_option_shape = conn.execute(
             "SELECT COUNT(*) FROM ("
             " SELECT o.question_id FROM options o JOIN questions q ON q.question_id=o.question_id "
-            "WHERE q.question_type='choice' GROUP BY o.question_id HAVING COUNT(*)=4)"
+            "WHERE q.course='Python语言程序设计' AND q.question_type='choice' "
+            "GROUP BY o.question_id HAVING COUNT(*)=4)"
         ).fetchone()[0]
     finally:
         conn.close()
     assert {row[0] for row in rows} == BAD_IDS
     assert all(row[1] == "options_label_anomaly" and row[2] and row[3] == 0 for row in rows)
-    assert option_shape == 790
+    assert py_option_shape == 790
 
 
 def test_schema_contains_required_fact_tables(build_dir: Path) -> None:
@@ -131,7 +137,7 @@ def test_schema_contains_required_fact_tables(build_dir: Path) -> None:
 
 def test_assets_are_copied_and_hashed(build_dir: Path) -> None:
     manifest = json.loads((build_dir / "build.json").read_text(encoding="utf-8"))
-    assert len(manifest["assets"]) == 9
+    assert len(manifest["assets"]) == 92
     for asset in manifest["assets"]:
         path = build_dir / asset["path"]
         assert path.is_file()
@@ -142,9 +148,9 @@ def test_build_manifest_versions_are_consistent(current, build_dir: Path) -> Non
     manifest = json.loads((build_dir / "build.json").read_text(encoding="utf-8"))
     assert manifest["build_id"] == current["build_id"] == manifest["index_version"]
     assert manifest["source_version"] == current["source_version"]
-    assert manifest["counts"]["questions"] == 1154
-    assert manifest["counts"]["searchable"] == 1152
-    assert manifest["counts"]["fragments"] == 1152
+    assert manifest["counts"]["questions"] == 1575
+    assert manifest["counts"]["searchable"] == 1573
+    assert manifest["counts"]["fragments"] == 1573
     assert manifest["model"]["id"] == "BAAI/bge-small-zh-v1.5"
     assert (build_dir / "verify.json").is_file()
 

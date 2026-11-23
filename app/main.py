@@ -16,8 +16,10 @@ import httpx
 
 from app.api.attachments import router as attachments_router
 from app.api.auth import router as auth_router
+from app.api.contributions import router as contributions_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.api.materials import router as materials_router
 from app.api.memory import router as memory_router
 from app.api.mistakes import router as mistakes_router
 from app.api.papers import router as papers_router
@@ -26,9 +28,28 @@ from app.api.usage import router as usage_router
 from app.auth.dependencies import require_user
 from app.auth.service import AuthService, AuthSettings
 from app.config import (
+    MaterialConfigState,
     load_auth_config_state,
     load_config_state,
+    load_contribution_config_state,
     load_usage_config_state,
+)
+from app.contributions.errors import (
+    ContributionInvalidError,
+    ContributionParseTimeoutError,
+    ContributionStorageError,
+    ContributionTooLargeError,
+)
+from app.materials.errors import (
+    GuideInsufficientError,
+    GuideNotFoundError,
+    MaterialConflictError,
+    MaterialInvalidError,
+    MaterialNotFoundError,
+    MaterialPageLimitError,
+    MaterialParseTimeoutError,
+    MaterialStorageError,
+    MaterialTooLargeError,
 )
 from app.quota.errors import (
     ImageQuotaExceeded,
@@ -78,6 +99,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.query_config = load_config_state()
     app.state.auth_config = load_auth_config_state()
     app.state.usage_config = load_usage_config_state()
+    app.state.material_config = MaterialConfigState()
+    app.state.contribution_config = load_contribution_config_state()
     app.state.conversation_store = build_store_state()
     app.state.question_runtime = build_question_runtime()
     app.state.usage_gate = None
@@ -88,6 +111,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     usage_config = app.state.usage_config
     app.state.auth_service = None
 
+    if store.db_path is not None and store.error is None:
+        try:
+            from app.materials.service import MaterialService
+
+            MaterialService.cleanup_pending_files_on_startup(store.db_path)
+        except Exception:
+            pass
     if (
         store.db_path is not None
         and store.error is None
@@ -164,10 +194,67 @@ app.include_router(
 app.include_router(
     usage_router, prefix="/api", dependencies=[Depends(require_user)]
 )
+app.include_router(
+    materials_router, prefix="/api", dependencies=[Depends(require_user)]
+)
+app.include_router(
+    contributions_router, prefix="/api", dependencies=[Depends(require_user)]
+)
 
 
 def _detail_response(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": message})
+
+
+@app.exception_handler(MaterialNotFoundError)
+@app.exception_handler(GuideNotFoundError)
+async def handle_material_not_found(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return _detail_response(404, str(exc))
+
+
+@app.exception_handler(MaterialTooLargeError)
+async def handle_material_too_large(
+    request: Request,
+    exc: MaterialTooLargeError,
+) -> JSONResponse:
+    return _detail_response(413, str(exc))
+
+
+@app.exception_handler(MaterialInvalidError)
+@app.exception_handler(MaterialPageLimitError)
+@app.exception_handler(GuideInsufficientError)
+async def handle_material_unprocessable(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    return _detail_response(422, str(exc))
+
+
+@app.exception_handler(MaterialConflictError)
+async def handle_material_conflict(
+    request: Request,
+    exc: MaterialConflictError,
+) -> JSONResponse:
+    return _detail_response(409, str(exc))
+
+
+@app.exception_handler(MaterialParseTimeoutError)
+async def handle_material_timeout(
+    request: Request,
+    exc: MaterialParseTimeoutError,
+) -> JSONResponse:
+    return _detail_response(504, str(exc))
+
+
+@app.exception_handler(MaterialStorageError)
+async def handle_material_storage(
+    request: Request,
+    exc: MaterialStorageError,
+) -> JSONResponse:
+    return _detail_response(503, str(exc))
 
 
 @app.exception_handler(CatalogUnavailableError)
@@ -425,3 +512,35 @@ async def handle_question_error(
     """题库集成错误：404/409/410/503 由异常自身给出，正文不含内部路径。"""
 
     return _detail_response(exc.status_code, exc.message)
+
+
+@app.exception_handler(ContributionTooLargeError)
+async def handle_contribution_too_large(
+    request: Request,
+    exc: ContributionTooLargeError,
+) -> JSONResponse:
+    return _detail_response(413, str(exc))
+
+
+@app.exception_handler(ContributionInvalidError)
+async def handle_contribution_invalid(
+    request: Request,
+    exc: ContributionInvalidError,
+) -> JSONResponse:
+    return _detail_response(422, str(exc))
+
+
+@app.exception_handler(ContributionParseTimeoutError)
+async def handle_contribution_timeout(
+    request: Request,
+    exc: ContributionParseTimeoutError,
+) -> JSONResponse:
+    return _detail_response(504, str(exc))
+
+
+@app.exception_handler(ContributionStorageError)
+async def handle_contribution_storage(
+    request: Request,
+    exc: ContributionStorageError,
+) -> JSONResponse:
+    return _detail_response(503, str(exc))

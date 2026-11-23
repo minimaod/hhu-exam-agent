@@ -13,6 +13,7 @@ import {
   type ResultEvent,
 } from "./queryApi.ts";
 import { createSseParser } from "./sseParser.ts";
+import type { ConversationMaterialItem } from "./materialsApi.ts";
 import { apiFetch } from "./apiFetch.ts";
 import {
   parseQuotaFailure,
@@ -77,6 +78,7 @@ export type TurnStage =
   | "searching_questions"
   | "viewing_question"
   | "composing_reply"
+  | "generating_material"
   | "saving";
 
 export type SourceType = "none" | "student_text" | "registered_paper";
@@ -93,6 +95,11 @@ export type AttachmentRole =
   | "supplement"
   | "student_answer"
   | "student_solution";
+
+export type AttachmentInput = {
+  id: string;
+  role: AttachmentRole;
+};
 
 export type SuggestionItem = {
   label: string;
@@ -142,6 +149,7 @@ export type RecordSummary = {
   title: string;
   statement_excerpt: string;
   source: Source;
+  is_model_generated?: boolean;
   problem_version: number;
   self_reported_understood: boolean;
   created_at: string;
@@ -301,12 +309,14 @@ export type QuestionIndependentSolution = {
   text: string;
   note?: string | null;
 };
+export type QuestionType = "choice" | "fill" | "code" | "solve" | "proof" | "judge";
+
 export type QuestionCard = {
   question_id: string;
   build_id: string;
   selection_id?: string | null;
   source_request_id?: string | null;
-  question_type: "choice" | "fill" | "code";
+  question_type: QuestionType;
   number_label: string;
   statement: string;
   content_sha256: string;
@@ -381,6 +391,15 @@ export type RecordRef = {
   problem_version: number;
 };
 
+export type WorkbenchSource = {
+  artifact_id: string;
+  view: "notes" | "graph" | "quiz";
+  kc_id?: string | null;
+  question_id?: string | null;
+  label: string;
+  pages: number[];
+};
+
 export type ConversationTurn = BusinessOutcome &
   ReplyOutcome & {
   request_id: string;
@@ -394,6 +413,7 @@ export type ConversationTurn = BusinessOutcome &
   evaluation?: ExerciseEvaluation | null;
   composite_results?: ActionResultItem[] | null;
   assistant_message?: string | null;
+  workbench_source?: WorkbenchSource | null;
   suggestions?: SuggestionItem[] | null;
   exercise_id?: string | null;
   question_results?: QuestionCard[] | null;
@@ -413,6 +433,8 @@ export type ConversationDetail = {
   active_question?: QuestionCard | null;
   context?: ConversationContextView | null;
   record: RecordRef | null;
+  records_by_root?: Record<string, RecordRef>;
+  materials?: ConversationMaterialItem[];
 };
 
 export type TurnProgressEvent = {
@@ -497,6 +519,14 @@ export type StreamTurnOptions = {
   questionId?: string;
   questionSourceTurn?: string;
   questionAction?: "exercise" | "record";
+  materialGuideId?: string;
+  materialItemId?: string;
+  materialStudyMode?: "explain" | "exercise" | "evaluate";
+  materialArtifactId?: string;
+  materialQuestionId?: string;
+  materialKcId?: string;
+  workbenchView?: WorkbenchSource["view"];
+  materialSourcePages?: number[];
   signal?: AbortSignal;
   onProgress?: (event: TurnProgressEvent) => void;
   onMessageDelta?: (event: TurnMessageDeltaEvent) => void;
@@ -864,7 +894,12 @@ function isQuestionCard(value: unknown): value is QuestionCard {
     isRecord(value) &&
     typeof value.question_id === "string" &&
     typeof value.build_id === "string" &&
-    (value.question_type === "choice" || value.question_type === "fill" || value.question_type === "code") &&
+    (value.question_type === "choice" ||
+      value.question_type === "fill" ||
+      value.question_type === "code" ||
+      value.question_type === "solve" ||
+      value.question_type === "proof" ||
+      value.question_type === "judge") &&
     typeof value.number_label === "string" &&
     typeof value.statement === "string" &&
     Array.isArray(value.options) &&
@@ -1088,7 +1123,10 @@ function isConversationDetail(value: unknown): value is ConversationDetail {
     (value.context === undefined ||
       value.context === null ||
       isConversationContext(value.context)) &&
-    (value.record === null || isRecordRef(value.record))
+    (value.record === null || isRecordRef(value.record)) &&
+    (value.records_by_root === undefined ||
+      (isRecord(value.records_by_root) &&
+        Object.values(value.records_by_root).every(isRecordRef)))
   );
 }
 
@@ -1121,6 +1159,7 @@ function isTurnStage(value: unknown): value is TurnStage {
     value === "searching_questions" ||
     value === "viewing_question" ||
     value === "composing_reply" ||
+    value === "generating_material" ||
     value === "saving"
   );
 }
@@ -1272,6 +1311,17 @@ export async function getConversation(
     throw new ConversationsApiError("后端返回的会话记录格式不符合约定。");
   }
   return payload;
+}
+
+export async function stopConversationMaterialTurn(
+  conversationId: string,
+  requestId: string,
+): Promise<void> {
+  const response = await apiFetch(
+    `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(requestId)}/stop-material`,
+    { method: "POST" },
+  );
+  await ensureOk(response);
 }
 
 export function isReplyStatus(value: unknown): value is ReplyStatus {
@@ -1605,6 +1655,32 @@ export async function streamTurn(
   }
   if (options.questionAction) {
     body.question_action = options.questionAction;
+  }
+  if (options.materialGuideId && options.materialItemId) {
+    body.material_guide_id = options.materialGuideId;
+    body.material_item_id = options.materialItemId;
+    if (options.materialStudyMode) {
+      body.material_study_mode = options.materialStudyMode;
+    }
+  }
+  if (options.materialArtifactId && options.materialQuestionId) {
+    body.material_artifact_id = options.materialArtifactId;
+    body.material_question_id = options.materialQuestionId;
+    if (options.materialStudyMode) {
+      body.material_study_mode = options.materialStudyMode;
+    }
+  } else if (options.materialArtifactId && options.materialKcId) {
+    body.material_artifact_id = options.materialArtifactId;
+    body.material_kc_id = options.materialKcId;
+    if (options.materialStudyMode) {
+      body.material_study_mode = options.materialStudyMode;
+    }
+  }
+  if (options.workbenchView && options.materialArtifactId) {
+    body.material_workbench_view = options.workbenchView;
+    body.material_artifact_id = options.materialArtifactId;
+    if (options.materialKcId) body.material_kc_id = options.materialKcId;
+    if (options.materialSourcePages?.length) body.material_source_pages = options.materialSourcePages;
   }
   if (options.retryOf) {
     Object.keys(body).forEach((key) => { if (key !== "request_id") delete body[key]; });

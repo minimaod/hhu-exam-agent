@@ -26,6 +26,7 @@ class KnowledgePoint:
     aliases: tuple[str, ...]
     patterns: tuple[str, ...]
     priority: int
+    course: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,7 @@ class Taxonomy:
         return matches
 
 
-def load_taxonomy(path: Path) -> Taxonomy:
+def _load_taxonomy_file(path: Path) -> tuple[str | None, list[KnowledgePoint]]:
     if not path.exists():
         raise TaxonomyError(f"知识点词表不存在：{path}")
     try:
@@ -109,6 +110,7 @@ def load_taxonomy(path: Path) -> Taxonomy:
     rows = payload.get("knowledge_points") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or not rows:
         raise TaxonomyError("知识点词表缺少 knowledge_points 数组")
+    course = str(payload.get("course") or "").strip() or None
     points: list[KnowledgePoint] = []
     slugs: set[str] = set()
     for row in rows:
@@ -133,6 +135,78 @@ def load_taxonomy(path: Path) -> Taxonomy:
                 aliases=aliases,
                 patterns=patterns,
                 priority=int(row.get("priority") or 0),
+                course=str(row.get("course") or course or "").strip() or None,
             )
         )
+    return course, points
+
+
+def load_taxonomy(path: Path) -> Taxonomy:
+    _, points = _load_taxonomy_file(path)
     return Taxonomy(points)
+
+
+class MultiCourseTaxonomy:
+    """多学科受控知识点词表集合：按课程隔离别名与规则匹配，同时保证全局 slug 唯一。"""
+
+    def __init__(self, taxonomies: dict[str, Taxonomy], fallback: Taxonomy) -> None:
+        self.by_course = dict(taxonomies)
+        self.fallback = fallback
+        seen_slugs: set[str] = set()
+        merged: list[KnowledgePoint] = []
+        for tax in taxonomies.values():
+            for point in tax.points:
+                if point.slug in seen_slugs:
+                    raise TaxonomyError(f"多学科词表存在重复 slug：{point.slug}")
+                seen_slugs.add(point.slug)
+                merged.append(point)
+        self.points = tuple(merged)
+        self.by_slug = {point.slug: point for point in self.points}
+        self.course_by_slug = {
+            point.slug: point.course for point in self.points if point.course
+        }
+
+    def for_course(self, course: str | None) -> Taxonomy:
+        if course and course in self.by_course:
+            return self.by_course[course]
+        return self.fallback
+
+    def name(self, slug: str) -> str:
+        return self.by_slug[slug].name
+
+    def normalize(self, value: str, course: str | None = None) -> str | None:
+        if course and course in self.by_course:
+            hit = self.by_course[course].normalize(value)
+            if hit is not None:
+                return hit
+        for tax in self.by_course.values():
+            hit = tax.normalize(value)
+            if hit is not None:
+                return hit
+        return None
+
+    def label(self, record: dict[str, Any], limit: int = 3) -> list[LabelMatch]:
+        course = str(record.get("course") or "").strip() or None
+        tax = self.by_course.get(course) if course else None
+        if tax is None:
+            return []
+        return tax.label(record, limit=limit)
+
+
+def load_taxonomies(paths: Iterable[Path]) -> MultiCourseTaxonomy:
+    file_list = list(paths)
+    if not file_list:
+        raise TaxonomyError("未提供任何知识点词表文件")
+    by_course: dict[str, Taxonomy] = {}
+    fallback: Taxonomy | None = None
+    for path in file_list:
+        course, points = _load_taxonomy_file(path)
+        tax = Taxonomy(points)
+        if fallback is None:
+            fallback = tax
+        key = course or "__default__"
+        if key in by_course:
+            raise TaxonomyError(f"同一课程存在重复知识点词表：{key}")
+        by_course[key] = tax
+    assert fallback is not None
+    return MultiCourseTaxonomy(by_course, fallback)

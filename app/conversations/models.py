@@ -139,6 +139,7 @@ TurnStage = Literal[
     "searching_questions",
     "viewing_question",
     "composing_reply",
+    "generating_material",
 ]
 
 ExerciseStatus = Literal["pending_answer", "submitted", "revealed"]
@@ -241,6 +242,19 @@ class RecordRef(BaseModel):
     problem_version: int
 
 
+class WorkbenchSource(BaseModel):
+    artifact_id: str
+    view: Literal["notes", "graph", "quiz"]
+    kc_id: str | None = None
+    question_id: str | None = None
+    label: str
+    pages: list[int] = Field(default_factory=list)
+
+    def describe(self) -> str:
+        pages = "、".join(str(page) for page in self.pages) or "待核对"
+        return f"复习工作台当前内容：{self.label}（原页：{pages}）"
+
+
 class Turn(BaseModel):
     """一轮已保存的会话输入；status、kind 与结果必须自洽。"""
 
@@ -259,6 +273,7 @@ class Turn(BaseModel):
     question: QuestionCard | None = None
     composite_results: list[ActionResultItem] = Field(default_factory=list)
     assistant_message: str | None = None
+    workbench_source: WorkbenchSource | None = None
     suggestions: list[SuggestionItem] = Field(default_factory=list)
     exercise_id: str | None = None
     error: TurnError | None = None
@@ -353,6 +368,8 @@ class ConversationDetail(BaseModel):
     active_question: QuestionCard | None = None
     context: ConversationContextView | None = None
     record: RecordRef | None = None
+    records_by_root: dict[str, RecordRef] = Field(default_factory=dict)
+    materials: list[Any] = Field(default_factory=list)
 
 
 class TurnProgressEvent(BaseModel):

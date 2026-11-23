@@ -9,11 +9,15 @@ import {
   dedupeTexts,
   formatDateTime,
   formatExamDate,
+  formatFileSize,
+  explanationBody,
   isCoveredText,
   isDuplicateText,
+  mathSafeExcerpt,
   memoryValidityLabel,
   memoryVerdictLabel,
   normalizeText,
+  stripDuplicatePaperList,
 } from "./display.ts";
 
 test("内部动作名只显示中文，未知动作不原样泄露", () => {
@@ -91,7 +95,7 @@ test("缺失或无法解析的时间如实说明", () => {
   assert.equal(formatDateTime(null), "时间未知");
   assert.equal(formatDateTime("not-a-date"), "时间未知");
   assert.match(formatDateTime("2026-10-25T08:00:00+00:00"), /10\/25|\d{2}:\d{2}/);
-  assert.deepEqual(formatExamDate(null), { text: "日期未登记", known: false });
+  assert.deepEqual(formatExamDate(null), { text: "时间待补充", known: false });
   assert.deepEqual(formatExamDate("2024-06-20"), { text: "2024-06-20", known: true });
 });
 
@@ -103,4 +107,97 @@ test("建议按钮分类覆盖查看解答、作答、保存和练习", () => {
   assert.equal(classifySuggestion("先存到错题本"), "save");
   assert.equal(classifySuggestion("再来一道类似题"), "practice");
   assert.equal(classifySuggestion("查看 Python 试卷"), "chat");
+});
+
+test("文件大小小于 1 MB 按 KB 显示，达到 1 MB 换算为 MB", () => {
+  assert.equal(formatFileSize(2048), "2 KB");
+  assert.equal(formatFileSize(3143 * 1024), "3.1 MB");
+  assert.equal(formatFileSize(null), "大小未知");
+});
+
+test("公式安全截断不会把 LaTeX 公式从中间切开", () => {
+  const sample = "设函数 $z = f(x,y)$ 具有一阶偏导数，已知 $f_x(2,1) = 3$，$f_y(2,1) = -1$，求偏导。";
+  const clipped = mathSafeExcerpt(sample, 42);
+  assert.ok(clipped.endsWith("…"));
+  assert.equal((clipped.match(/\$/g) ?? []).length % 2, 0);
+  assert.ok(!clipped.includes("$f_y(2"));
+
+  const blockStart = "$$\\lim_{x\\to 0}\\frac{\\sqrt{1+\\tan x}-\\sqrt{1+\\sin x}}{x^3}$$ 后续文字";
+  const kept = mathSafeExcerpt(blockStart, 20);
+  assert.ok(kept.includes("$$\\lim_{x\\to 0}"));
+  assert.ok(kept.includes("$$…"));
+});
+
+test("公式安全截断处理开头未闭合的公式，保留转义美元符号后的文字", () => {
+  for (const opener of ["$", "$$", "\\[", "\\("]) {
+    assert.equal(mathSafeExcerpt(opener + "f_y(2 后续文字很长", 10), "…");
+    assert.equal(mathSafeExcerpt(opener + "f_y(2 后续文字很长", 2), "…");
+  }
+  assert.equal(mathSafeExcerpt("价格 \\$5，后面还有很长一段说明", 12), "价格 \\$5，后面还有…");
+});
+
+
+test("结构化讲解正文带完整推导、答案和原公式", () => {
+  const body = explanationBody({
+    knowledge_points: [],
+    steps: [{ index: 1, title: "取对数", content: "保留 $x^2$。" }],
+    final_answer: "B",
+    error_analysis: "分母不可以先约掉。",
+  });
+  assert.match(body, /## 解题步骤/);
+  assert.match(body, /保留 \$x\^2\$/);
+  assert.match(body, /## 最终答案\n\nB/);
+  assert.equal(body.split("分母不可以先约掉。").length, 2);
+});
+
+test("stripDuplicatePaperList 精准剥离省略学年的试卷清单，保留解题表格与推荐理由", () => {
+  const items = [
+    {
+      id: "math-bi-2024",
+      title: "2024-2025学年第一学期《高等数学BⅠ》期末试题及答案",
+    },
+    {
+      id: "math-aii-2024",
+      title: "2024-2025高数AII期末考试试题",
+    },
+  ];
+  const body = [
+    "已找到 2 份高等数学期末试卷：",
+    "- 2024-2025 高等数学BⅠ 期末试题及答案",
+    "2024–2025 第一学期《高等数学BⅠ》期末试题及答案",
+    "- 2024-2025高数AII期末考试试题：题型全面且难度适中，推荐优先练习。",
+    "",
+    "| 方法 | 适用条件 |",
+    "| --- | --- |",
+    "| 洛必达法则 | 0/0 或 ∞/∞ 型未定式 |",
+    "",
+    "| 试卷 | 推荐理由 |",
+    "| --- | --- |",
+    "| 2024–2025 第一学期《高等数学BⅠ》期末试题及答案 | 附原卷答案，方便订正错题 |",
+  ].join("\n");
+
+  const cleaned = stripDuplicatePaperList(body, items);
+  assert.equal(cleaned.includes("2024-2025 高等数学BⅠ 期末试题及答案"), false);
+  assert.equal(cleaned.includes("推荐优先练习"), true);
+  assert.equal(cleaned.includes("洛必达法则"), true);
+  assert.equal(cleaned.includes("方便订正错题"), true);
+  assert.equal(cleaned.split("\n").some((line) =>
+    line === "2024–2025 第一学期《高等数学BⅠ》期末试题及答案",
+  ), false);
+});
+
+test("旧查卷正文的学年和卷名分列时仍由查询卡承载", () => {
+  const items = [
+    { id: "recent", title: "2024-2025学年第二学期《高等数学AⅡ》期末考试试题" },
+    { id: "older", title: "2018级高等数学（上）期末试卷" },
+  ];
+  const body = [
+    "已找到 2 份高数期末试卷。",
+    "",
+    "| 学年/学期 | 试卷 |",
+    "| --- | --- |",
+    "| 2024-2025 第二学期 | 《高等数学AⅡ》期末考试试题 |",
+    "| 2018-2019 | 2018级高等数学（上）期末试卷 |",
+  ].join("\n");
+  assert.equal(stripDuplicatePaperList(body, items), "已找到 2 份高数期末试卷。");
 });

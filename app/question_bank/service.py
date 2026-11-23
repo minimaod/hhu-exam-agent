@@ -86,10 +86,13 @@ class QuestionBankService:
         self._vector: VectorStore | None = None
         self._reviews: dict[str, dict[str, Any]] = {}
         self._content_hashes: dict[str, str] = {}
+        self._question_courses: dict[str, str] = {}
         self._rejected: set[str] = set()
         self._approved: set[str] = set()
         self._hashes: dict[str, str] = {}
         self._course = COURSE
+        self._courses: set[str] = set()
+        self._kp_courses: dict[str, str] = {}
         self._not_built_reason: str | None = None
         self._unavailable_reason: str | None = None
         self._catalog_courses: set[str] = set()
@@ -121,6 +124,16 @@ class QuestionBankService:
             return
         build = self._repository.build
         self._course = str(build.get("course") or COURSE)
+        repo_courses = self._repository.courses()
+        manifest_courses = {
+            str(item) for item in (build.get("courses") or []) if str(item).strip()
+        }
+        self._courses = repo_courses or manifest_courses or {self._course}
+        self._kp_courses = {
+            str(k): str(v)
+            for k, v in (build.get("kp_courses") or {}).items()
+            if str(k).strip() and str(v).strip()
+        }
         if (
             build.get("build_id") != build_id
             or build.get("index_version") != current["index_version"]
@@ -132,6 +145,7 @@ class QuestionBankService:
         try:
             self._reviews = self._read_reviews()
             self._content_hashes = self._repository.question_hashes()
+            self._question_courses = self._repository.question_courses()
             for question_id, decision in self._reviews.items():
                 if self._content_hashes.get(question_id) != decision.get("content_sha256"):
                     continue
@@ -258,10 +272,11 @@ class QuestionBankService:
                 diagnostics=SearchDiagnostics(elapsed_ms=self._ms(started), cold_start=cold),
             )
 
-        if canonical != self._course:
+        if canonical not in self._courses:
             self._cold = False
+            available_label = "、".join(sorted(self._courses)) if self._courses else "无"
             reason = (
-                f"“{canonical}”尚未建立题目库；当前仅 Python 真题可查题。"
+                f"“{canonical}”尚未建立题目库；当前可查题课程：{available_label}。"
                 if known
                 else f"未登记课程“{canonical}”。"
             )
@@ -301,7 +316,7 @@ class QuestionBankService:
             self._cold = False
             if request.preview_candidates:
                 message = "候选预览中没有符合条件的题目"
-            elif self._approved:
+            elif self._approved_count(canonical):
                 message = "没有符合筛选条件的已审核题目"
             else:
                 message = (
@@ -613,7 +628,26 @@ class QuestionBankService:
         if canonical is None:
             raise QuestionBankRequestError("course", "课程不能为空")
         known = canonical in self._catalog_courses
-        if canonical != self._course:
+        if self._repository is None:
+            if canonical != self._course:
+                if not known:
+                    return CourseCapability(
+                        course=canonical, known=False, status="unknown", reason="未登记课程"
+                    )
+                return CourseCapability(
+                    course=canonical,
+                    known=True,
+                    status="catalog_only",
+                    paper_count=self._catalog_counts.get(canonical, 0),
+                    reason="该课程只有试卷目录，题目库尚未建立",
+                )
+            return CourseCapability(
+                course=canonical,
+                known=True,
+                status="error",
+                reason=self._not_built_reason or self._unavailable_reason or "题目库不可用",
+            )
+        if canonical not in self._courses:
             if not known:
                 return CourseCapability(
                     course=canonical, known=False, status="unknown", reason="未登记课程"
@@ -625,15 +659,8 @@ class QuestionBankService:
                 paper_count=self._catalog_counts.get(canonical, 0),
                 reason="该课程只有试卷目录，题目库尚未建立",
             )
-        if self._repository is None:
-            return CourseCapability(
-                course=canonical,
-                known=True,
-                status="error",
-                reason=self._not_built_reason or self._unavailable_reason or "题目库不可用",
-            )
         stats = self._repository.course_stats(canonical)
-        approved = self._approved_count()
+        approved = self._approved_count(canonical)
         if not stats["searchable_count"]:
             status = "error"
             reason = "没有可检索题目"
@@ -658,12 +685,12 @@ class QuestionBankService:
                 "original": stats["answered_count"],
                 "missing": stats["question_count"] - stats["answered_count"],
             },
-            verified_label_count=self._verified_label_count(),
+            verified_label_count=self._verified_label_count(canonical),
             build_id=self._repository.build.get("build_id"),
             source_version=self._repository.build.get("source_version"),
             verified=True,
             reason=reason,
-            paper_count=len(self._repository.papers()),
+            paper_count=len(self._repository.papers_by_course(canonical)),
         )
 
     def status(self) -> BankStatus:
@@ -673,14 +700,19 @@ class QuestionBankService:
                 message=self._not_built_reason or self._unavailable_reason or "题目库不可用",
                 degraded=True,
             )
-        stats = self._repository.course_stats(self._course)
+        question_count = 0
+        searchable_count = 0
+        for course_name in self._courses:
+            stats = self._repository.course_stats(course_name)
+            question_count += stats["question_count"]
+            searchable_count += stats["searchable_count"]
         degraded = self._vector is None or self._embedder_error is not None
         return BankStatus(
             available=True,
             build=self._build_info(),
-            question_count=stats["question_count"],
+            question_count=question_count,
             fragment_count=self._repository.fragment_count(),
-            searchable_count=stats["searchable_count"],
+            searchable_count=searchable_count,
             degraded=degraded,
             degradation=Degradation(
                 code="vector_unavailable",
@@ -768,7 +800,7 @@ class QuestionBankService:
         slugs: list[str] = []
         unknown: list[str] = []
         for name in request.knowledge_points:
-            slug = self._normalise_kp(name)
+            slug = self._normalise_kp(name, canonical)
             if slug is None:
                 unknown.append(name)
             elif slug not in slugs:
@@ -778,6 +810,7 @@ class QuestionBankService:
                 "knowledge_points", "未知知识点：" + "、".join(unknown)
             )
         return {
+            "course": canonical,
             "question_type": request.question_type,
             "exam_type": request.exam_type,
             "paper_id": paper_id,
@@ -793,11 +826,22 @@ class QuestionBankService:
             },
         }
 
-    def _normalise_kp(self, name: str) -> str | None:
+    def _normalise_kp(self, name: str, course: str | None = None) -> str | None:
         if self._repository is None:
             return None
         key = name.strip().casefold()
-        for row in self._repository.all_knowledge_points():
+        rows = self._repository.all_knowledge_points()
+        if course and self._kp_courses:
+            # 先在当前课程的知识点里匹配，避免跨科同名概念（如“向量”）串台。
+            for row in rows:
+                slug = str(row["slug"])
+                if self._kp_courses.get(slug) != course:
+                    continue
+                candidates = [slug, row["name"], *row["aliases"]]
+                if any(str(item).strip().casefold() == key for item in candidates):
+                    return slug
+            return None
+        for row in rows:
             candidates = [row["slug"], row["name"], *row["aliases"]]
             if any(str(item).strip().casefold() == key for item in candidates):
                 return str(row["slug"])
@@ -806,7 +850,8 @@ class QuestionBankService:
     def _passes_filters(
         self, record: dict[str, Any], filters: dict[str, Any], *, preview: bool = False
     ) -> bool:
-        if record["course"] != self._course or not record["searchable"]:
+        expected_course = filters.get("course") or self._course
+        if record["course"] != expected_course or not record["searchable"]:
             return False
         if not preview and record["question_id"] not in self._approved:
             return False
@@ -983,24 +1028,37 @@ class QuestionBankService:
         decision = self._reviews.get(record["question_id"])
         return bool(decision and decision.get("content_sha256") == record["content_sha256"])
 
-    def _approved_count(self) -> int:
+    def _approved_count(self, course: str | None = None) -> int:
         count = 0
         for question_id, decision in self._reviews.items():
-            if decision.get("action") == "approve" and self._content_hashes.get(question_id) == decision.get("content_sha256"):
-                count += 1
+            if decision.get("action") != "approve":
+                continue
+            if self._content_hashes.get(question_id) != decision.get("content_sha256"):
+                continue
+            if course is not None and self._question_courses.get(question_id) != course:
+                continue
+            count += 1
         return count
 
-    def _verified_label_count(self) -> int:
+    def _verified_label_count(self, course: str | None = None) -> int:
         if self._repository is None:
             return 0
-        verified = {
-            (str(row[0]), str(row[1]))
-            for row in self._repository.conn.execute(
+        if course is None:
+            rows = self._repository.conn.execute(
                 "SELECT question_id,kp_slug FROM question_knowledge_points WHERE status='verified'"
             )
-        }
+        else:
+            rows = self._repository.conn.execute(
+                "SELECT k.question_id, k.kp_slug FROM question_knowledge_points k "
+                "JOIN questions q ON q.question_id = k.question_id "
+                "WHERE k.status='verified' AND q.course = ?",
+                (course,),
+            )
+        verified = {(str(row[0]), str(row[1])) for row in rows}
         known = {row["slug"] for row in self._repository.all_knowledge_points()}
         for question_id, decision in self._reviews.items():
+            if course is not None and self._question_courses.get(question_id) != course:
+                continue
             if self._content_hashes.get(question_id) == decision.get("content_sha256"):
                 verified.update(
                     (question_id, slug) for slug in decision.get("labels_verified") or []

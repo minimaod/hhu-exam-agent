@@ -37,6 +37,7 @@ PRIVATE_ROUTES = {
     ("GET", "/api/conversations/{conversation_id}"),
     ("POST", "/api/conversations/{conversation_id}/turns"),
     ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/reply"),
+    ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/stop-material"),
     ("POST", "/api/conversations/{conversation_id}/exercises/{exercise_id}/reveal"),
     ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/source"),
     (
@@ -58,6 +59,39 @@ PRIVATE_ROUTES = {
     ("PATCH", "/api/learning-memory/{kind}/{source_id}"),
     ("DELETE", "/api/learning-memory/{kind}/{source_id}"),
     ("GET", "/api/usage/today"),
+    ("GET", "/api/materials/pdfs"),
+    ("POST", "/api/materials/pdfs"),
+    ("GET", "/api/materials/pdfs/{material_id}"),
+    ("DELETE", "/api/materials/pdfs/{material_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/file"),
+    ("POST", "/api/materials/pdfs/{material_id}/readability"),
+    ("POST", "/api/materials/pdfs/{material_id}/ocr"),
+    ("POST", "/api/materials/pdfs/{material_id}/guides"),
+    ("GET", "/api/materials/guides/{guide_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}"),
+    ("POST", "/api/materials/guides/{guide_id}/items/{item_id}/study"),
+    ("GET", "/api/materials/pdfs/{material_id}/delete-impact"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}/image"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts/import-sample"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts"),
+    ("GET", "/api/materials/artifacts/{artifact_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/attempt"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/reveal"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/graph-notes/{node_id}"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/kc-notes/{kc_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/study"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/evaluate"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/kcs/{kc_id}/study"),
+    ("GET", "/api/materials/library"),
+    ("GET", "/api/conversations/{conversation_id}/materials"),
+    ("POST", "/api/conversations/{conversation_id}/materials/upload"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/attach"),
+    ("DELETE", "/api/conversations/{conversation_id}/materials/{material_id}"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/generate"),
+    ("GET", "/api/conversations/{conversation_id}/materials/progress"),
+    ("GET", "/api/conversations/{conversation_id}/delete-impact"),
+    ("DELETE", "/api/conversations/{conversation_id}"),
+    ("POST", "/api/contributions"),
 }
 
 ALL_ROUTES = PUBLIC_ROUTES | PRIVATE_ROUTES
@@ -67,6 +101,7 @@ OWNED_ROUTES = {
     ("GET", "/api/conversations/{conversation_id}"),
     ("POST", "/api/conversations/{conversation_id}/turns"),
     ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/reply"),
+    ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/stop-material"),
     ("POST", "/api/conversations/{conversation_id}/exercises/{exercise_id}/reveal"),
     ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/source"),
     ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/assets/{asset_id}"),
@@ -80,6 +115,35 @@ OWNED_ROUTES = {
     ("POST", "/api/mistake-records/{record_id}/adopt-problem"),
     ("PATCH", "/api/learning-memory/{kind}/{source_id}"),
     ("DELETE", "/api/learning-memory/{kind}/{source_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}"),
+    ("DELETE", "/api/materials/pdfs/{material_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/file"),
+    ("POST", "/api/materials/pdfs/{material_id}/readability"),
+    ("POST", "/api/materials/pdfs/{material_id}/ocr"),
+    ("POST", "/api/materials/pdfs/{material_id}/guides"),
+    ("GET", "/api/materials/guides/{guide_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}"),
+    ("POST", "/api/materials/guides/{guide_id}/items/{item_id}/study"),
+    ("GET", "/api/materials/pdfs/{material_id}/delete-impact"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}/image"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts/import-sample"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts"),
+    ("GET", "/api/materials/artifacts/{artifact_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/attempt"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/reveal"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/graph-notes/{node_id}"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/kc-notes/{kc_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/study"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/evaluate"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/kcs/{kc_id}/study"),
+    ("GET", "/api/conversations/{conversation_id}/materials"),
+    ("POST", "/api/conversations/{conversation_id}/materials/upload"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/attach"),
+    ("DELETE", "/api/conversations/{conversation_id}/materials/{material_id}"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/generate"),
+    ("GET", "/api/conversations/{conversation_id}/materials/progress"),
+    ("GET", "/api/conversations/{conversation_id}/delete-impact"),
+    ("DELETE", "/api/conversations/{conversation_id}"),
 }
 
 COLLECTION_ROUTES = {
@@ -89,6 +153,9 @@ COLLECTION_ROUTES = {
     ("POST", "/api/mistake-records"),
     ("GET", "/api/learning-memory"),
     ("GET", "/api/learning-memory/courses"),
+    ("GET", "/api/materials/pdfs"),
+    ("POST", "/api/materials/pdfs"),
+    ("GET", "/api/materials/library"),
 }
 
 SESSION_ROUTES = {
@@ -96,6 +163,7 @@ SESSION_ROUTES = {
     ("POST", "/api/auth/logout"),
     ("GET", "/api/me"),
     ("GET", "/api/usage/today"),
+    ("POST", "/api/contributions"),
 }
 
 
@@ -130,7 +198,7 @@ def collect_api_operations(application: FastAPI) -> set[tuple[str, str]]:
 
 def test_actual_route_matrix_matches_plan() -> None:
     actual = collect_api_operations(app)
-    assert len(actual) == 31
+    assert len(actual) == 65
     assert actual == ALL_ROUTES
 
 
@@ -157,6 +225,10 @@ def test_private_routes_require_login(anon_client: TestClient) -> None:
         path = path.replace("{attachment_id}", "11111111-1111-4111-8111-111111111111")
         path = path.replace("{record_id}", "11111111-1111-4111-8111-111111111111")
         path = path.replace("{source_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{material_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{guide_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{item_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{page_no}", "1")
         path = path.replace("{question_id}", "q-1")
         path = path.replace("{asset_id}", "a-1")
         path = path.replace("{kind}", "exercise")
@@ -279,7 +351,19 @@ def _seed_a_world(db: Path, owner_id: str) -> dict[str, str]:
     return ids
 
 
-def test_a_b_isolation_on_owned_routes(anon_client: TestClient, sample_root: Path) -> None:
+def test_a_b_isolation_on_owned_routes(
+    anon_client: TestClient, sample_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.api import materials
+    from app.materials.errors import MaterialInvalidError
+
+    sample_lookups: list[str] = []
+
+    def missing_sample(name: str) -> Path:
+        sample_lookups.append(name)
+        raise MaterialInvalidError("未找到本地 ExamPass 样例目录。")
+
+    monkeypatch.setattr(materials, "_resolve_sample_dir", missing_sample)
     db = anon_client.app.state.conversation_store.db_path
     assert db is not None
     with TestClient(app) as a, TestClient(app) as b:
@@ -335,6 +419,7 @@ def test_a_b_isolation_on_owned_routes(anon_client: TestClient, sample_root: Pat
             (("GET", "/api/conversations/{conversation_id}"), "GET", f"/api/conversations/{a_conversation}", None),
             (("POST", "/api/conversations/{conversation_id}/turns"), "POST", f"/api/conversations/{a_conversation}/turns", {"request_id": a_req, "query": "hi"}),
             (("POST", "/api/conversations/{conversation_id}/turns/{request_id}/reply"), "POST", f"/api/conversations/{a_conversation}/turns/{a_req}/reply", None),
+            (("POST", "/api/conversations/{conversation_id}/turns/{request_id}/stop-material"), "POST", f"/api/conversations/{a_conversation}/turns/{a_req}/stop-material", None),
             (("POST", "/api/conversations/{conversation_id}/exercises/{exercise_id}/reveal"), "POST", f"/api/conversations/{a_conversation}/exercises/{world['exercise']}/reveal", None),
             (("GET", "/api/conversations/{conversation_id}/questions/{question_id}/source"), "GET", f"/api/conversations/{a_conversation}/questions/q-1/source?build=b&kind=statement&page=1", None),
             (("GET", "/api/conversations/{conversation_id}/questions/{question_id}/assets/{asset_id}"), "GET", f"/api/conversations/{a_conversation}/questions/q-1/assets/a-1?build=b", None),
@@ -394,6 +479,153 @@ def test_a_b_isolation_on_owned_routes(anon_client: TestClient, sample_root: Pat
         assert b.get("/api/learning-memory").status_code == 200
         collection_executed.add(("GET", "/api/learning-memory/courses"))
         assert b.get("/api/learning-memory/courses").status_code == 200
+
+        # F019 第二阶段：个人资料 11 项路由 A/B 隔离与集合登记
+        from tests.test_materials_pdf_parser import _make_simple_pdf
+        from app.materials import storage as mat_storage
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as mat_tmp:
+            old_mat_root = mat_storage.MATERIALS_ROOT
+            mat_storage.MATERIALS_ROOT = Path(mat_tmp)
+            try:
+                import app.materials.service as mat_svc_mod
+
+                old_svc_root = mat_svc_mod.MATERIALS_ROOT
+                mat_svc_mod.MATERIALS_ROOT = Path(mat_tmp)
+                try:
+                    collection_executed.add(("POST", "/api/materials/pdfs"))
+                    a_mat_res = a.post(
+                        "/api/materials/pdfs",
+                        files={
+                            "file": (
+                                "a.pdf",
+                                _make_simple_pdf(["Chapter 1 Limit squeeze theorem holds cleanly."]),
+                                "application/pdf",
+                            )
+                        },
+                        headers=TEST_CSRF_HEADERS,
+                    )
+                    assert a_mat_res.status_code == 201
+                    a_mid = a_mat_res.json()["id"]
+
+                    collection_executed.add(("GET", "/api/materials/pdfs"))
+                    assert b.get("/api/materials/pdfs").json()["items"] == []
+                    collection_executed.add(("GET", "/api/materials/library"))
+                    assert b.get("/api/materials/library").json()["items"] == []
+
+                    fake_gid = "11111111-1111-4111-8111-111111111111"
+                    fake_iid = "22222222-2222-4222-8222-222222222222"
+                    for method, path, body in (
+                        ("GET", f"/api/materials/pdfs/{a_mid}", None),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/file", None),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/readability", {"start_page": 1, "end_page": 1}),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/ocr", {"pages": [1]}),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/guides", {"start_page": 1, "end_page": 1}),
+                        ("GET", f"/api/materials/guides/{fake_gid}", None),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/pages/1", None),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/pages/1/image", None),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/artifacts/import-sample", {"sample_name": "exampass-physics"}),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/artifacts", {"start_page": 1, "end_page": 1}),
+                        ("GET", f"/api/materials/artifacts/{fake_gid}", None),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/attempt", {"user_answer": 0}),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/reveal", None),
+                        ("PUT", f"/api/materials/artifacts/{fake_gid}/graph-notes/n1", {"note_text": "test"}),
+                        ("PUT", f"/api/materials/artifacts/{fake_gid}/kc-notes/kc1.1", {"note_text": "test"}),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/study", {"mode": "explain"}),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/evaluate", None),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/kcs/kc1.1/study", {"mode": "explain"}),
+                        ("POST", f"/api/materials/guides/{fake_gid}/items/{fake_iid}/study", {"mode": "explain"}),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/delete-impact", None),
+                        ("DELETE", f"/api/materials/pdfs/{a_mid}", None),
+                    ):
+                        assert (
+                            b.request(
+                                method,
+                                path,
+                                json=body,
+                                headers=TEST_CSRF_HEADERS if method in {"POST", "PUT", "DELETE"} else None,
+                            ).status_code
+                            == 404
+                        )
+                    executed.update(
+                        {
+                            ("GET", "/api/materials/pdfs/{material_id}"),
+                            ("DELETE", "/api/materials/pdfs/{material_id}"),
+                            ("GET", "/api/materials/pdfs/{material_id}/file"),
+                            ("POST", "/api/materials/pdfs/{material_id}/readability"),
+                            ("POST", "/api/materials/pdfs/{material_id}/ocr"),
+                            ("POST", "/api/materials/pdfs/{material_id}/guides"),
+                            ("GET", "/api/materials/guides/{guide_id}"),
+                            ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}"),
+                            ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}/image"),
+                            ("POST", "/api/materials/pdfs/{material_id}/artifacts/import-sample"),
+                            ("POST", "/api/materials/pdfs/{material_id}/artifacts"),
+                            ("GET", "/api/materials/artifacts/{artifact_id}"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/attempt"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/reveal"),
+                            ("PUT", "/api/materials/artifacts/{artifact_id}/graph-notes/{node_id}"),
+                            ("PUT", "/api/materials/artifacts/{artifact_id}/kc-notes/{kc_id}"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/study"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/evaluate"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/kcs/{kc_id}/study"),
+                            ("POST", "/api/materials/guides/{guide_id}/items/{item_id}/study"),
+                            ("GET", "/api/materials/pdfs/{material_id}/delete-impact"),
+                        }
+                    )
+                    # F019 第三阶段：会话内资料与会话删除路由 A/B 隔离
+                    for method, path, body in (
+                        ("GET", f"/api/conversations/{a_conversation}/materials", None),
+                        ("POST", f"/api/conversations/{a_conversation}/materials/{a_mid}/attach", None),
+                        ("DELETE", f"/api/conversations/{a_conversation}/materials/{a_mid}", None),
+                        ("POST", f"/api/conversations/{a_conversation}/materials/{a_mid}/generate", {"outputs": ["graph"]}),
+                        ("GET", f"/api/conversations/{a_conversation}/materials/progress", None),
+                        ("GET", f"/api/conversations/{a_conversation}/delete-impact", None),
+                        ("DELETE", f"/api/conversations/{a_conversation}", None),
+                    ):
+                        assert (
+                            b.request(
+                                method,
+                                path,
+                                json=body,
+                                headers=TEST_CSRF_HEADERS if method in {"POST", "PUT", "DELETE"} else None,
+                            ).status_code
+                            == 404
+                        )
+                    assert (
+                        b.post(
+                            f"/api/conversations/{a_conversation}/materials/upload",
+                            files={
+                                "file": (
+                                    "b.pdf",
+                                    _make_simple_pdf(["Other text"]),
+                                    "application/pdf",
+                                )
+                            },
+                            headers=TEST_CSRF_HEADERS,
+                        ).status_code
+                        == 404
+                    )
+                    executed.update(
+                        {
+                            ("GET", "/api/conversations/{conversation_id}/materials"),
+                            ("POST", "/api/conversations/{conversation_id}/materials/upload"),
+                            ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/attach"),
+                            ("DELETE", "/api/conversations/{conversation_id}/materials/{material_id}"),
+                            ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/generate"),
+                            ("GET", "/api/conversations/{conversation_id}/materials/progress"),
+                            ("GET", "/api/conversations/{conversation_id}/delete-impact"),
+                            ("DELETE", "/api/conversations/{conversation_id}"),
+                        }
+                    )
+                    assert a.delete(
+                        f"/api/materials/pdfs/{a_mid}", headers=TEST_CSRF_HEADERS
+                    ).status_code == 200
+                finally:
+                    mat_svc_mod.MATERIALS_ROOT = old_svc_root
+            finally:
+                mat_storage.MATERIALS_ROOT = old_mat_root
+
         assert collection_executed == COLLECTION_ROUTES
 
         session_executed: set[tuple[str, str]] = set()
@@ -409,11 +641,19 @@ def test_a_b_isolation_on_owned_routes(anon_client: TestClient, sample_root: Pat
         assert a.post(
             "/api/query", json={"query": "高数"}, headers=TEST_CSRF_HEADERS
         ).status_code == 503
+        session_executed.add(("POST", "/api/contributions"))
+        assert a.post(
+            "/api/contributions",
+            headers=TEST_CSRF_HEADERS,
+            data={"course": "   ", "year": "2024"},
+            files={"file": ("exam.pdf", b"%PDF-1.4\n", "application/pdf")},
+        ).status_code == 422
         session_executed.add(("POST", "/api/auth/logout"))
         assert a.post("/api/auth/logout", headers=TEST_CSRF_HEADERS).status_code == 204
         assert a.get("/api/me").status_code == 401
         assert session_executed == SESSION_ROUTES
         assert executed == OWNED_ROUTES
+        assert sample_lookups == []
         assert owner_snapshot(db, a_user["id"])["digest"] == snapshot["digest"]
         # A 仍然可读自己的数据
         assert b.get(f"/api/conversations/{a_conversation}").status_code == 404

@@ -424,6 +424,10 @@ async def test_dynamic_followup_uses_keywords_and_saves_history(tmp_path: Path) 
         "explanation",
         "recent_followups",
         "question",
+        "intent",
+        "has_student_process",
+        "student_solution_text",
+        "student_solution_images",
     }
     assert call["statement"] == problem.statement_text
     assert call["question"] == "第二步为什么能替换？"

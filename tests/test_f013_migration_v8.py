@@ -33,21 +33,12 @@ def _usage_tables(db: Path) -> set[str]:
 
 
 def _make_v7(db: Path) -> None:
-    schema.initialize_database(db)
     connection = sqlite3.connect(db)
     try:
-        for name in (
-            "model_usage_user_day",
-            "model_usage_site_day",
-            "user_active_turns_request",
-        ):
-            connection.execute(f"DROP INDEX {name}")
-        for name in (
-            "model_usage_events",
-            "model_quota_overrides",
-            "user_active_turns",
-        ):
-            connection.execute(f"DROP TABLE {name}")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN IMMEDIATE")
+        for stmt in schema._CREATE_V7_STATEMENTS:
+            connection.execute(stmt)
         connection.execute("PRAGMA user_version = 7")
         connection.commit()
     finally:
@@ -59,8 +50,8 @@ def test_v7_to_v8_without_admin(tmp_path: Path) -> None:
     _make_v7(db)
     report = migrate_database(db, backup_dir=tmp_path / "backups")
     assert report.already_migrated is False
-    assert report.version == 8
-    assert _version(db) == 8
+    assert report.version == schema.SCHEMA_VERSION
+    assert _version(db) == schema.SCHEMA_VERSION
     assert _usage_tables(db) == {
         "model_usage_events",
         "model_quota_overrides",
@@ -76,8 +67,8 @@ def test_v6_to_v8_chain_keeps_old_data(tmp_path: Path) -> None:
     report = migrate_database(
         db, owner=owner(), backup_dir=tmp_path / "backups"
     )
-    assert report.version == 8
-    assert _version(db) == 8
+    assert report.version == schema.SCHEMA_VERSION
+    assert _version(db) == schema.SCHEMA_VERSION
     connection = sqlite3.connect(db)
     try:
         assert connection.execute(

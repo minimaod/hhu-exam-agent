@@ -91,7 +91,7 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
             else db_path.parent / "backups",
         )
     except MigrationCommittedCheckError as exc:
-        print(f"迁移已提交为 v8，但提交后检查失败：{exc}", file=sys.stderr)
+        print(f"迁移已提交为 v{schema.SCHEMA_VERSION}，但提交后检查失败：{exc}", file=sys.stderr)
         return 1
     except MigrationRolledBackError as exc:
         print(f"迁移失败，事务已回滚：{exc}", file=sys.stderr)
@@ -100,9 +100,9 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
         print(f"迁移失败：{exc}", file=sys.stderr)
         return 1
     if report.already_migrated:
-        print(f"数据库已是 v8：会话 {report.conversations} 条，无需修改。")
+        print(f"数据库已是 v{report.version}：会话 {report.conversations} 条，无需修改。")
     else:
-        print(f"迁移完成：v8，会话 {report.conversations} 条。")
+        print(f"迁移完成：v{report.version}，会话 {report.conversations} 条。")
         print(f"备份：{report.backup_path}")
     return 0
 
@@ -161,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database", default=str(_default_db()))
     sub = parser.add_subparsers(dest="command", required=True)
 
-    migrate = sub.add_parser("migrate", help="v6/v7→v8 迁移（自动备份）")
+    migrate = sub.add_parser("migrate", help="v6/v7/v8→v9 迁移（自动备份）")
     migrate.add_argument("--admin-username")
     migrate.add_argument("--backup-dir")
     migrate.add_argument(

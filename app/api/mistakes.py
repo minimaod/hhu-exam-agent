@@ -1,5 +1,6 @@
 """错题记录接口：创建、列表、详情、修改、纠正、采用新版与删除。"""
 
+from contextlib import aclosing
 from typing import Annotated
 from uuid import UUID
 
@@ -30,8 +31,8 @@ from app.mistakes.models import (
 )
 from app.mistakes.service import CorrectionInput, MistakeRecordService
 from app.querying.service import SSE_HEADERS
-from app.quota.transport import bind_actor
 from app.sse import encode_sse_event
+from app.streaming import ClosingStreamingResponse
 from app.tutoring.models import Source
 
 router = APIRouter(tags=["mistakes"])
@@ -253,6 +254,7 @@ async def correct_record(
     payload: CorrectionRequest,
     request: Request,
     records: RecordsDep,
+    service: ServiceDep,
     user: Annotated[User, Depends(require_user)],
 ) -> StreamingResponse:
     correction = CorrectionInput(
@@ -293,39 +295,28 @@ async def correct_record(
             headers=SSE_HEADERS,
         )
 
-    acquired = await records.begin_correction(str(record_id))
-    if not acquired:
-        raise MistakeRecordConflictError("该记录正在纠正，请稍后再试。")
-
     usage_config = getattr(request.app.state, "usage_config", None)
     usage_error = getattr(usage_config, "error", None)
     if usage_error:
-        await records.release_correction(str(record_id))
         raise ConversationQueryUnavailableError(usage_error)
     gate = getattr(request.app.state, "usage_gate", None)
     if gate is None:
-        await records.release_correction(str(record_id))
         raise ConversationQueryUnavailableError("用量限制尚未配置。")
-    try:
-        gate.ensure_available(user.id)
-    except Exception:
-        await records.release_correction(str(record_id))
-        raise
+    gate.ensure_available(user.id)
+    lease_token = service.prepare_record_correction(
+        str(record_id), str(payload.request_id)
+    )
 
     async def encode_corrections():
-        # 认证依赖可能在同步线程执行，ContextVar 不会自动回到响应任务；
-        # 这里用已验证的用户显式绑定，保证真实供应商请求能按账号记账。
-        with bind_actor(user.id, request_id=str(payload.request_id)):
-            async for event in records.corrections(
-                str(record_id),
-                str(payload.request_id),
-                correction,
-                request,
-            ):
+        async with aclosing(service.stream_record_correction(
+            str(record_id), str(payload.request_id), correction, request, lease_token
+        )) as events:
+            async for event in events:
                 yield encode_sse_event(event)
 
-    return StreamingResponse(
+    return ClosingStreamingResponse(
         encode_corrections(),
+        on_close=lambda: service.release_record_correction(lease_token),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

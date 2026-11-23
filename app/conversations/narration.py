@@ -1,6 +1,7 @@
 """回复材料与正文：公开材料投影、答案范围、正文生成、流式输出与只重做正文。"""
 
 import logging
+import re
 from collections.abc import (
     AsyncIterator,
     Callable,
@@ -24,7 +25,9 @@ from app.conversations.turn_types import (
     TurnInputRulesMixin,
     _DynamicContext,
 )
+from app.question_bank.models import QUESTION_TYPE_LABELS
 from app.questions.models import QuestionCard
+from app.querying.models import ResultEvent
 from app.quota.errors import QuotaError
 
 logger = logging.getLogger("app.conversations.service")
@@ -57,6 +60,7 @@ class NarrationMixin:
         # 只有本轮真的查过题，才把题目标题和整卷浏览进度交给正文；否则模型会
         # 拿着上一轮的题目编“这次先列出第 1 到第 5 题，回复继续看下一批”。
         own_questions = ctx.question_source_turn == prepared.request_id
+        workbench_source = getattr(prepared.input, "workbench_source", None)
         return self._restrict_reply_material(build_material(
             user_text=prepared.input.text,
             course=ctx.confirmed_course,
@@ -83,8 +87,10 @@ class NarrationMixin:
             answer_scope=ctx.answer_scope,
             suggestions=[item.label for item in suggestions],
             context_summary=recent_summary,
+            workbench_context=workbench_source.describe() if workbench_source else None,
             teaching=teaching,
             learning_memory=self._memory_material(ctx),
+            has_paper_cards=bool(ctx.result is not None and ctx.result.kind == "found"),
         ))
 
     @classmethod
@@ -97,6 +103,60 @@ class NarrationMixin:
         if material.teaching or material.answer_scope is not None:
             return material
         return replace(material, question_materials=(), context_summary=None)
+
+    @staticmethod
+    def _paper_lookup_reply(
+        result: ResultEvent | None, user_text: str, actions: list[ActionResultItem]
+    ) -> str | None:
+        """目录已给出结果，并且学生本轮只要求列出或下载原卷。"""
+        if result is None or result.kind != "found":
+            return None
+        if not any(item.action == "query_papers" for item in actions) or any(
+            item.action not in {"introduce", "query_papers"} or item.status != "success"
+            for item in actions
+        ):
+            return None
+        # 只接管明确的单一查卷句。比较、优先选择、解题以及多段需求仍交给终局回复。
+        match = re.fullmatch(
+            r"\s*(?:请|我想|我要|想)?(?:帮我)?(?:找(?:一下)?|查(?:一下)?|搜(?:索)?|"
+            r"下载|列出|看看|给我|发我)"
+            r"(?P<scope>[^，,。；;！!？?\n：:]{1,60}?)"
+            r"(?:历年真题|考试试卷|试卷|真题|原卷|卷子|试题)(?:的?pdf)?[。！!？?]?\s*",
+            user_text,
+            re.IGNORECASE,
+        )
+        if match is None or re.search(
+            r"推荐|建议|先做|哪个好|哪一?份|哪套|哪张|对比|比较|分析|"
+            r"解答|讲解|答案[和与及]|复习建议|再帮|然后|以及|并且|并帮|顺便|同时",
+            match["scope"],
+        ):
+            return None
+        return result.message
+
+    @staticmethod
+    def _standalone_explanation_reply(
+        tutoring: Any, actions: list[ActionResultItem], answer_scope: str | None = None
+    ) -> str | None:
+        """完整单题讲解直接采用已生成并授权展示的教学结果。"""
+        if getattr(tutoring, "kind", None) != "explanation" or answer_scope is not None:
+            return None
+        lesson_actions = {"tutoring", "explain_problem", "explain_question", "search_questions", "select_question", "introduce"}
+        if any(item.status != "success" or item.action not in lesson_actions for item in actions):
+            return None
+        sections: list[str] = []
+        if tutoring.knowledge_points:
+            sections.append("## 知识点\n\n" + "\n".join(
+                f"- **{point.name}**：{point.explanation}" for point in tutoring.knowledge_points
+            ))
+        if tutoring.error_analysis:
+            sections.append(f"## 你解法中的具体问题\n\n{tutoring.error_analysis}")
+        if tutoring.steps:
+            sections.append("## 解题步骤\n\n" + "\n\n".join(
+                f"### {step.index}. {step.title}\n\n{step.content}" for step in tutoring.steps
+            ))
+        if tutoring.final_answer:
+            sections.append(f"## 最终答案\n\n{tutoring.final_answer}")
+        return "\n\n".join(sections) or None
 
     @classmethod
     def _selection_reply(cls, material: ReplyMaterial) -> str | None:
@@ -112,7 +172,7 @@ class NarrationMixin:
             return None
         details = material.results[-1].details
         title, number = details.get("paper_title"), details.get("number_label")
-        kind = {"choice": "选择题", "fill": "填空题", "code": "编程题"}.get(details.get("question_type"))
+        kind = QUESTION_TYPE_LABELS.get(details.get("question_type"))
         if not title or not number or not kind:
             return None
         return f"已选中《{title}》的{kind}第 {number} 题。"
@@ -128,7 +188,7 @@ class NarrationMixin:
         超出长度时截断并注明，不静默丢题。
         """
 
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         cards: list[QuestionCard] = []
         if ctx.question_card is not None:
             cards.append(ctx.question_card)
@@ -172,6 +232,12 @@ class NarrationMixin:
                 break
             lines.append(text)
             used += len(text)
+        if not lines and ctx.active_problem is not None:
+            src_text = str(getattr(getattr(ctx.active_problem, "source", None), "text", "") or "")
+            if src_text.startswith("个人资料《") and getattr(ctx.active_problem, "statement_text", None):
+                lines.append(
+                    f"绑定资料原题（{src_text}）：\n{str(ctx.active_problem.statement_text)[:1200]}"
+                )
         return lines
 
     async def _stream_reply(
@@ -325,36 +391,28 @@ class NarrationMixin:
                 # 本轮主动查看解答时，不让旧评价覆盖刚打开的解答。
                 return f"参考解答（已向学生开放）：{solution[:900]}"
             if evaluation is not None:
-                # 判定与“是否需要补步骤”是两件事：判错不等于要补充，
-                # 依据不足也不等于答错。分别表达，正文才不会改写原评价含义。
-                if evaluation.is_correct is True:
-                    verdict = "正确"
-                elif evaluation.is_correct is False:
-                    verdict = "错误"
-                else:
-                    verdict = "依据不足，暂时无法判定对错"
-                if getattr(evaluation, "needs_supplement", False):
-                    verdict += "；需要补充解题过程后才能判断"
-                parts = [
-                    f"判定：{verdict}",
-                    f"点评：{evaluation.final_answer_assessment[:300]}",
-                    f"步骤分析：{evaluation.step_by_step_analysis[:400]}",
-                    f"建议：{evaluation.guidance[:300]}",
-                ]
+                from app.conversations.final_reply import evaluation_brief_text
+
+                brief = evaluation_brief_text(exercise, getattr(exercise, "evaluation_json", None))
+                if brief is None:
+                    # 兼容内存对象（仅 EvaluationView 而无 evaluation_json 字符串）
+                    payload_json = evaluation.model_dump_json()
+                    brief = evaluation_brief_text(exercise, payload_json)
+                pieces = [brief] if brief else []
                 attempts = getattr(exercise, "attempts", None) or []
                 attachments = attempts[-1].attachments if attempts else getattr(exercise, "attachments", [])
                 if attachments:
-                    parts.insert(0, f"评价阶段已读取 {len(attachments)} 张过程图片；以下是已完成的批改结果。正文无需重新识图，不得否认评价阶段收到图片。")
-                if solution:
-                    parts.append(f"参考解答（已向学生开放）：{solution[:900]}")
-                return "\n".join(parts)
+                    pieces.insert(0, f"评价阶段已读取 {len(attachments)} 张过程图片；正文无需重新识图，不得否认已收到图片。")
+                return "\n".join(pieces) or None
             if solution:
                 return f"参考解答（已向学生开放）：{solution[:900]}"
+        if getattr(ctx, "answer_scope", None) in {"hint", "topic"} and getattr(ctx, "authorized_text", None):
+            return str(ctx.authorized_text)[:1200]
         return None
 
     @staticmethod
     def _question_titles(cards: list[QuestionCard]) -> list[str]:
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         return [
             f"第 {card.number_label} 题（{kinds.get(card.question_type, '题目')}）"
             for card in cards[:5]
@@ -364,13 +422,25 @@ class NarrationMixin:
     def _dynamic_suggestions(
         final_state: dict[str, Any],
         composite_results: list[ActionResultItem],
+        ctx: _DynamicContext | None = None,
     ) -> list[SuggestionItem]:
         if any(it.status == "failed" for it in composite_results):
             return []
-        return [
-            SuggestionItem(label=label, action=label)
-            for label in (final_state.get("suggested_actions") or [])
-        ]
+        default_target: str | None = None
+        if ctx is not None:
+            default_target = (
+                getattr(ctx, "problem_id", None)
+                or getattr(getattr(ctx, "active_problem", None), "id", None)
+                or getattr(getattr(ctx, "active_exercise", None), "problem_id", None)
+                or getattr(getattr(ctx, "question_card", None), "question_id", None)
+            )
+        items: list[SuggestionItem] = []
+        for label in (final_state.get("suggested_actions") or []):
+            target_id = None
+            if default_target and ("错题" in str(label) or "保存" in str(label)):
+                target_id = str(default_target)
+            items.append(SuggestionItem(label=label, action=label, target_id=target_id))
+        return items
 
     def _question_context_line(
         self, ctx: _DynamicContext, review_state: dict[str, Any]
@@ -390,7 +460,7 @@ class NarrationMixin:
         title = context.get("paper_title")
         if title:
             parts.append(f"当前试卷：《{title}》")
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         kind = kinds.get(context.get("question_type") or "")
         if kind:
             parts.append(f"当前题型：{kind}")

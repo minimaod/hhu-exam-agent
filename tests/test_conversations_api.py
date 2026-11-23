@@ -6,6 +6,7 @@
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -143,6 +144,119 @@ def test_conversation_management_contract() -> None:
         assert (
             post_turn(client, str(uuid4()), REQUEST_ONE).status_code == 404
         )
+
+
+@pytest.mark.parametrize("release_after_first_busy", [True, False])
+def test_delete_conversation_handles_sqlite_write_lock(
+    study_db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_after_first_busy: bool,
+) -> None:
+    with TestClient(app) as client:
+        target = create_conversation(client)
+        other = create_conversation(client)
+        endpoint = f"/api/conversations/{target['id']}"
+        assert client.get(endpoint + "/delete-impact").status_code == 200
+
+        original_open = ConversationRepository._open
+
+        def open_with_short_timeout(repository: ConversationRepository) -> sqlite3.Connection:
+            connection = original_open(repository)
+            connection.execute("PRAGMA busy_timeout = 20")
+            return connection
+
+        monkeypatch.setattr(ConversationRepository, "_open", open_with_short_timeout)
+        with closing(sqlite3.connect(study_db_path, check_same_thread=False)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            original_warning = conversation_repository.logger.warning
+            busy_errors = []
+
+            def warn_and_release(message, *args, **kwargs):
+                if message.startswith("Conversation delete SQLite failure"):
+                    busy_errors.append(args[1])
+                    if release_after_first_busy and len(busy_errors) == 1:
+                        writer.rollback()
+                original_warning(message, *args, **kwargs)
+
+            monkeypatch.setattr(conversation_repository.logger, "warning", warn_and_release)
+            response = client.delete(endpoint)
+            if release_after_first_busy:
+                assert response.status_code == 200, response.text
+                assert busy_errors == ["SQLITE_BUSY"]
+            else:
+                assert response.status_code == 503
+                assert "正在写入" in response.json()["detail"]
+                assert busy_errors == ["SQLITE_BUSY", "SQLITE_BUSY"]
+                assert client.get(endpoint).status_code == 200
+                writer.rollback()
+                assert client.delete(endpoint).status_code == 200
+
+        assert client.get(endpoint).status_code == 404
+        assert client.get(f"/api/conversations/{other['id']}").status_code == 200
+
+
+def test_delete_conversation_with_large_saved_artifact_uses_memory_temp_store(
+    study_db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TestClient(app) as client:
+        conversation = create_conversation(client)
+        cid = conversation["id"]
+        endpoint = f"/api/conversations/{cid}"
+        material_id, artifact_id = str(uuid4()), str(uuid4())
+        notes = "<p>" + "保留复习笔记。" * 30000 + "</p>"
+        with closing(sqlite3.connect(study_db_path)) as database, database:
+            database.execute("PRAGMA foreign_keys = ON")
+            owner, now = database.execute(
+                "SELECT owner_id, created_at FROM conversations WHERE id = ?", (cid,)
+            ).fetchone()
+            database.execute(
+                """
+                INSERT INTO personal_materials (
+                    id, owner_id, display_name, stored_name, file_sha256,
+                    size_bytes, page_count, created_at, updated_at
+                ) VALUES (?, ?, 'review.pdf', 'review-test.pdf', ?, 1024, 1, ?, ?)
+                """,
+                (material_id, owner, "a" * 64, now, now),
+            )
+            database.execute(
+                """
+                INSERT INTO conversation_materials (id, owner_id, conversation_id, material_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (str(uuid4()), owner, cid, material_id, now),
+            )
+            database.execute(
+                """
+                INSERT INTO material_artifacts (
+                    id, owner_id, material_id, file_sha256, start_page, end_page,
+                    rule_version, status, conversation_id, notes_html, notes_status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, 1, 'test', 'ready', ?, ?, 'ready', ?, ?)
+                """,
+                (artifact_id, owner, material_id, "a" * 64, cid, notes, now, now),
+            )
+
+        original_open = ConversationRepository._open
+        statements: list[str] = []
+
+        def open_with_file_temp_store(repository: ConversationRepository) -> sqlite3.Connection:
+            connection = original_open(repository)
+            connection.execute("PRAGMA temp_store = FILE")
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        monkeypatch.setattr(ConversationRepository, "_open", open_with_file_temp_store)
+        response = client.delete(endpoint)
+        assert response.status_code == 200, response.text
+        assert statements.index("PRAGMA temp_store = MEMORY") < statements.index("BEGIN IMMEDIATE")
+        assert client.get(endpoint).status_code == 404
+        assert client.get(f"/api/materials/pdfs/{material_id}").status_code == 200
+        artifact = client.get(f"/api/materials/artifacts/{artifact_id}")
+        assert artifact.status_code == 200
+        assert artifact.json()["conversation_id"] is None
+        assert artifact.json()["notes_html"] == notes
+        with closing(sqlite3.connect(study_db_path)) as database:
+            assert database.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert database.execute("SELECT COUNT(*) FROM conversation_materials").fetchone()[0] == 0
 
 
 def test_turn_is_streamed_saved_and_restored(install_service) -> None:

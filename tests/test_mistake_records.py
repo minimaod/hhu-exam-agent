@@ -119,6 +119,22 @@ def test_direct_record_create_is_idempotent(env: Env) -> None:
     assert env.client.get("/api/mistake-records").json()["total"] == 1
 
 
+@pytest.mark.parametrize(
+    ("statement", "expected_title"),
+    [
+        (r"求极限 $\lim_{x \to 0} \left(\frac{\tan x}{x}\right)^{1/x^2}$。", "求极限…"),
+        ("$" + " + ".join(["x"] * 30) + "$ 求值。", "未命名错题"),
+    ],
+)
+def test_generated_mistake_title_does_not_truncate_math(env: Env, statement: str, expected_title: str) -> None:
+    conversation_id = env.client.post("/api/conversations", json={}).json()["id"]
+    _problem(env, conversation_id, statement)
+    record_id = _record(env, conversation_id)
+    detail = env.client.get(f"/api/mistake-records/{record_id}").json()
+    assert detail["title"] == expected_title
+    assert detail["statement_text"] == statement
+
+
 def test_record_list_order_and_patch(env: Env) -> None:
     conversation_id = env.client.post("/api/conversations", json={}).json()["id"]
     _problem(env, conversation_id, "第一题")

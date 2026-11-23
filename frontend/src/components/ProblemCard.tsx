@@ -1,4 +1,5 @@
 import type { TutoringResult, ProblemView } from "../lib/conversationsApi";
+import MathText from "./MathText";
 import SourceBadge from "./SourceBadge";
 
 type Explanation = Extract<TutoringResult, { kind: "explanation" }>;
@@ -6,51 +7,39 @@ type Explanation = Extract<TutoringResult, { kind: "explanation" }>;
 type ProblemCardProps = {
   result: Explanation;
   showStatement?: boolean;
-  /** 正文已经完整讲过一遍时，卡片默认收起，避免同一段讲解重复展开。 */
-  compact?: boolean;
+  canCorrect?: boolean;
   busy: boolean;
   onFeedback: (problem: ProblemView) => void;
   onRecord: (problem: ProblemView) => void;
   onCorrect: (problem: ProblemView) => void;
   onSupplement: (problem: ProblemView) => void;
-  onNew: () => void;
 };
 
 export default function ProblemCard({
   result,
   showStatement = true,
-  compact = false,
+  canCorrect = true,
   busy,
   onFeedback,
   onRecord,
   onCorrect,
   onSupplement,
-  onNew,
 }: ProblemCardProps) {
   const problem = result.problem;
   const recorded = Boolean(result.record_id);
 
   return (
-    <div className="rounded-2xl border border-slate-200/90 bg-white/95 p-5 shadow-card">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="rounded-full border border-river/30 bg-river/10 px-2.5 py-0.5 text-[11px] font-medium text-river">
-            第 {problem.version} 版题目
-          </span>
+    <article className="lesson-sheet">
+      <header className="sheet-meta">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <SourceBadge source={problem.source} />
-          {recorded && (
-            <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-[11px] font-medium text-emerald-700">
-              已记录到错题本
-            </span>
-          )}
+          {recorded && <span className="sheet-badge">已记录到错题本</span>}
         </div>
-        <span className="text-[11px] text-slate-400">
-          {problem.status === "explained" ? "已讲解" : "待补充"}
-        </span>
-      </div>
+        <span>{problem.status === "explained" ? "已讲解" : "待补充"}</span>
+      </header>
 
-      {showStatement && <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-7 text-ink">
-        {problem.statement_text}
+      {showStatement && <p className="lesson-statement">
+        <MathText text={problem.statement_text} />
       </p>}
 
       {problem.attachments.some((image) => showStatement || image.role === "solution") && (
@@ -74,114 +63,24 @@ export default function ProblemCard({
       )}
 
       {(problem.student_answer_text || problem.solution_text) && (
-        <div className="mt-3 rounded-xl border border-amber-200/80 bg-amber-50/50 p-3">
-          <p className="text-[11px] font-medium text-amber-900">你提交的解法</p>
+        <div className="student-work">
+          <p className="text-xs font-medium text-amber-900">你提交的解法</p>
           {problem.student_answer_text && (
             <p className="mt-1 whitespace-pre-wrap text-xs leading-6 text-amber-950">
-              答案：{problem.student_answer_text}
+              答案：<MathText text={problem.student_answer_text} />
             </p>
           )}
           {problem.solution_text && (
             <p className="mt-1 whitespace-pre-wrap text-xs leading-6 text-amber-950">
-              过程：{problem.solution_text}
+              过程：<MathText text={problem.solution_text} />
             </p>
           )}
         </div>
       )}
 
-      <div className="mt-4">
-        <h4 className="text-xs font-semibold tracking-wide text-slate-500">
-          知识点
-        </h4>
-        <ul className="mt-2 space-y-1.5">
-          {result.knowledge_points.map((point) => (
-            <li key={point.name} className="text-sm leading-6 text-slate-700">
-              <span className="font-medium text-ink">{point.name}：</span>
-              {point.explanation}
-            </li>
-          ))}
-        </ul>
-      </div>
-
-      {compact ? (
-        <details className="mt-4 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
-          <summary className="cursor-pointer text-xs font-medium text-river">
-            正文已经完整讲解，需要时展开讲解卡片
-          </summary>
-          <div className="mt-3 space-y-4">
-            <ol className="space-y-2">
-              {result.steps.map((step) => (
-                <li key={step.index} className="rounded-xl bg-white p-3">
-                  <p className="text-sm font-medium text-ink">
-                    {step.index}. {step.title}
-                  </p>
-                  <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
-                    {step.content}
-                  </p>
-                </li>
-              ))}
-            </ol>
-            <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
-              <p className="text-[11px] font-medium text-emerald-800">最终答案</p>
-              <p className="mt-1 whitespace-pre-wrap break-words text-sm font-medium text-emerald-950">
-                {result.final_answer}
-              </p>
-            </div>
-            {result.error_analysis && (
-              <div className="rounded-xl border border-rose-200 bg-rose-50/80 p-3">
-                <p className="text-[11px] font-medium text-rose-800">
-                  你解法中的具体问题
-                </p>
-                <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-rose-950">
-                  {result.error_analysis}
-                </p>
-              </div>
-            )}
-          </div>
-        </details>
-      ) : (
-        <>
-          <div className="mt-4">
-            <h4 className="text-xs font-semibold tracking-wide text-slate-500">
-              解题步骤
-            </h4>
-            <ol className="mt-2 space-y-2">
-              {result.steps.map((step) => (
-                <li key={step.index} className="rounded-xl bg-slate-50/80 p-3">
-                  <p className="text-sm font-medium text-ink">
-                    {step.index}. {step.title}
-                  </p>
-                  <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
-                    {step.content}
-                  </p>
-                </li>
-              ))}
-            </ol>
-          </div>
-
-          <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
-            <p className="text-[11px] font-medium text-emerald-800">最终答案</p>
-            <p className="mt-1 whitespace-pre-wrap break-words text-sm font-medium text-emerald-950">
-              {result.final_answer}
-            </p>
-          </div>
-
-          {result.error_analysis && (
-            <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50/80 p-3">
-              <p className="text-[11px] font-medium text-rose-800">
-                你解法中的具体问题
-              </p>
-              <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-rose-950">
-                {result.error_analysis}
-              </p>
-            </div>
-          )}
-        </>
-      )}
-
       {result.uncertainties.length > 0 && (
         <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50/70 p-3">
-          <p className="text-[11px] font-medium text-amber-800">需要你确认</p>
+          <p className="text-xs font-medium text-amber-800">需要你确认</p>
           <ul className="mt-1 list-disc space-y-1 pl-5 text-xs leading-6 text-amber-950">
             {result.uncertainties.map((item) => (
               <li key={item}>{item}</li>
@@ -190,7 +89,7 @@ export default function ProblemCard({
         </div>
       )}
 
-      <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-100 pt-3">
+      <div className="lesson-actions">
         <button
           type="button"
           onClick={() => onFeedback(problem)}
@@ -205,16 +104,18 @@ export default function ProblemCard({
           disabled={busy || recorded}
           className="rounded-lg border border-river/40 bg-white px-3 py-1.5 text-xs font-medium text-river hover:bg-river/5 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {recorded ? "已记录" : "记录这题"}
+          {recorded ? "已加入错题本" : "加入错题本"}
         </button>
-        <button
-          type="button"
-          onClick={() => onCorrect(problem)}
-          disabled={busy}
-          className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
-        >
-          纠正题干
-        </button>
+        {canCorrect && (
+          <button
+            type="button"
+            onClick={() => onCorrect(problem)}
+            disabled={busy}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+          >
+            纠正题干
+          </button>
+        )}
         {problem.status === "awaiting_supplement" && (
           <button
             type="button"
@@ -225,15 +126,7 @@ export default function ProblemCard({
             补充题目
           </button>
         )}
-        <button
-          type="button"
-          onClick={onNew}
-          disabled={busy}
-          className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60"
-        >
-          开始新题
-        </button>
       </div>
-    </div>
+    </article>
   );
 }

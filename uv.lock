@@ -549,6 +549,8 @@ dependencies = [
     { name = "openai" },
     { name = "pillow" },
     { name = "pydantic" },
+    { name = "pymupdf" },
+    { name = "pypdf" },
     { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "qdrant-client" },
@@ -560,9 +562,6 @@ dev = [
     { name = "httpx" },
     { name = "httpx2" },
     { name = "pytest" },
-]
-ingest = [
-    { name = "pymupdf" },
 ]
 
 [package.metadata]
@@ -576,6 +575,8 @@ requires-dist = [
     { name = "openai", specifier = ">=3.37,<4.0" },
     { name = "pillow", specifier = ">=11,<12" },
     { name = "pydantic", specifier = ">=2.9,<3.0" },
+    { name = "pymupdf", specifier = ">=1.26,<3.0" },
+    { name = "pypdf", specifier = ">=5.0,<7.0" },
     { name = "python-dotenv", specifier = ">=1.2,<2.0" },
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "qdrant-client", specifier = ">=1.12,<2.0" },
@@ -588,7 +589,7 @@ dev = [
     { name = "httpx2", specifier = ">=2.16,<3.0" },
     { name = "pytest", specifier = ">=8.3,<9.0" },
 ]
-ingest = [{ name = "pymupdf", specifier = ">=1.26,<3.0" }]
+ingest = []
 
 [[package]]
 name = "hpack"
@@ -1790,6 +1791,15 @@ version = "2.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b1/86/91671857614bbf931c04532c11572c70fa2031862b1332befcd3bcde1f51/pymupdf4llm-2.0-py3-none-any.whl", hash = "sha256:43d4b4a2d0bf8b9b4d7f21a48875ef0016018dbad6677ef6b01ef2b0f6e392dd", size = 904, upload-time = "2026-10-19T09:47:36.281Z" },
+]
+
+[[package]]
+name = "pypdf"
+version = "6.21.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/e1/ec8f4d155c997c45917153a5521e60d6ee6389d68abdcbc8e44e564caffc/pypdf-6.21.4.tar.gz", hash = "sha256:c8817e3f888d47a087872ded69812c1ef30cacb871d6e053e0c00bbaf0bc2163", size = 7109255, upload-time = "2026-10-28T17:00:54.81Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/4b/77e8ad4ac42c9d93600f40541a50e9feb3a61d2bbee2d76f659346072051/pypdf-6.21.4-py3-none-any.whl", hash = "sha256:33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c", size = 410430, upload-time = "2026-10-28T17:00:53.146Z" },
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from app.conversations.protocol import ActionPlan
+from app.question_bank.models import QUESTION_TYPES, QuestionType
 
 ToolName = Literal[
     "confirm_course",
@@ -45,10 +46,14 @@ ToolName = Literal[
     "view_question_detail",
     "list_shown_questions",
     "view_learning_summary",
+    # F019 第三阶段：会话内个人资料复习。
+    "list_conversation_materials",
+    "generate_material_artifact",
+    "solve_uploaded_exam",
 ]
 
 ExamType = Literal["midterm", "final", "other"]
-QuestionType = Literal["choice", "fill", "code"]
+_QUESTION_TYPE_ENUM: list[str | None] = [*QUESTION_TYPES, None]
 
 # 只允许进入“最终回复材料”的 details 键。新增业务字段时必须先在这里登记，
 # 否则回复模型看不到，避免把答案正文一类的私有字段顺手带进正文。
@@ -86,6 +91,12 @@ _PUBLIC_DETAIL_KEYS = frozenset(
         "paper_id",
         "paper_title",
         "papers",
+        "result_cards_rendered",
+        "has_question_bank",
+        "bank_status",
+        "generated_mode",
+        "knowledge_point",
+        "from_question",
         # 查卷唯一命中的下载入口与定位条件：正文只写这里给出的链接。
         "download_url",
         "academic_year",
@@ -114,6 +125,23 @@ _PUBLIC_DETAIL_KEYS = frozenset(
         "build_id",
         "content_sha256",
         "has_more",
+        # F019 第三阶段：个人资料与成果卡的公开元信息（不含答案正文）。
+        "material_id",
+        "material_title",
+        "materials",
+        "artifact_id",
+        "outputs",
+        "start_page",
+        "end_page",
+        "page_count",
+        "notes_status",
+        "quiz_status",
+        "graph_status",
+        "sufficient",
+        "scanned_pages",
+        "question_count",
+        "reused",
+        "coverage_warnings",
     }
 )
 
@@ -159,6 +187,7 @@ class SearchQuestionsArgs(_Strict):
     number_label: str | None = Field(default=None, max_length=20)
     paper_id: str | None = Field(default=None, max_length=80)
     offset: int | None = Field(default=None, ge=0)
+    limit: int | None = Field(default=None, ge=1, le=20)
     continue_from_previous: bool = False
     auto_explain: bool = False
     scope: Literal["current", "paper", "bank"] = "current"
@@ -179,6 +208,7 @@ class ListPaperQuestionsArgs(_Strict):
     paper_id: str | None = Field(default=None, max_length=80)
     question_type: QuestionType | None = None
     offset: int | None = Field(default=None, ge=0)
+    limit: int | None = Field(default=None, ge=1, le=20)
     continue_from_previous: bool = False
     limit: int | None = Field(default=None, ge=1, le=64)
 
@@ -231,12 +261,21 @@ class ExplainProblemArgs(_Strict):
     scope: Literal["full", "hint", "topic"] = "full"
     # current=讲工作区里的题；new=讲本轮新输入/新题，避免误绑旧题卡。
     target: Literal["current", "new"] = "current"
+    focus: str | None = Field(default=None, max_length=200)
+    student_answer: str | None = Field(default=None, max_length=2000)
 
 
 class AnswerFollowupArgs(_Strict):
     question: str = Field(min_length=1, max_length=500)
     target: Literal["auto", "problem", "exercise"] = "auto"
     ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
+    intent: Literal[
+        "auto",
+        "why_step",
+        "beginner_example",
+        "alt_method",
+        "check_process",
+    ] = "auto"
 
 
 class SaveMistakeArgs(_Strict):
@@ -247,6 +286,8 @@ class SaveMistakeArgs(_Strict):
 class GenerateExerciseArgs(_Strict):
     from_question: bool = False
     ref: str | None = Field(default=None, pattern=r"^Q[1-9][0-9]{0,3}$")
+    course: str | None = Field(default=None, max_length=64)
+    topic: str | None = Field(default=None, max_length=200)
     basis: BasisArgs | None = None
 
 
@@ -307,6 +348,36 @@ class DeleteMemoryArgs(_Strict):
     entry_id: str = Field(min_length=6, max_length=80)
     reason: str | None = Field(default=None, max_length=200)
     basis: BasisArgs | None = None
+
+
+class ListConversationMaterialsArgs(_Strict):
+    pass
+
+
+class GenerateMaterialArtifactArgs(_Strict):
+    material_id: str | None = Field(default=None, max_length=80)
+    outputs: list[Literal["notes", "quiz", "graph"]] = Field(min_length=1, max_length=3)
+    start_page: int | None = Field(default=None, ge=1)
+    end_page: int | None = Field(default=None, ge=1)
+    course_hint: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def _check_pages(self) -> "GenerateMaterialArtifactArgs":
+        if (
+            self.start_page is not None
+            and self.end_page is not None
+            and self.end_page < self.start_page
+        ):
+            raise ValueError("结束页码不能小于起始页码。")
+        return self
+
+
+class SolveUploadedExamArgs(_Strict):
+    material_id: str | None = Field(default=None, max_length=300)
+    focus: str | None = Field(default=None, max_length=700)
+    answer_only: bool = False
+    start_page: int | None = Field(default=None, ge=1)
+    end_page: int | None = Field(default=None, ge=1)
 
 
 @dataclass(frozen=True)
@@ -414,7 +485,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=(
             "在已审核真题库中按课程、考试类型、题型、题号或知识内容检索真题。"
             "指定了试卷时返回该条件下的题目（同卷同题型一次给全，并报告总数与本次范围）；"
-            "没指定试卷时按相关度返回，最多 20 道。查题结果是中间事实：拿到结果后可以继续"
+            "没指定试卷时按相关度返回（默认 3 道，最多 20 道；学生明确只要一道题时传 limit=1）。"
+            "查题结果是中间事实：拿到结果后可以继续"
             "选题、讲解或直接回答学生的问题，不必一律让学生先作答。只有真正返回的卡片才算真题。"
         ),
         args_model=SearchQuestionsArgs,
@@ -428,7 +500,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 },
                 "question_type": {
                     "type": ["string", "null"],
-                    "enum": ["choice", "fill", "code", None],
+                    "enum": _QUESTION_TYPE_ENUM,
                 },
                 "knowledge_points": {
                     "type": ["array", "null"],
@@ -444,6 +516,12 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "type": ["integer", "null"],
                     "minimum": 0,
                     "description": "具体页码（从 0 起）。学生说“继续”时留空并置 continue_from_previous",
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "本次最多返回的题目数量；学生明确只要一道题（如“来一道/找一道”）时传 1",
                 },
                 "continue_from_previous": {
                     "type": "boolean",
@@ -489,7 +567,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 },
                 "question_type": {
                     "type": ["string", "null"],
-                    "enum": ["choice", "fill", "code", None],
+                    "enum": _QUESTION_TYPE_ENUM,
                     "description": "题型；不填表示整卷所有题型",
                 },
                 "offset": {
@@ -533,7 +611,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 },
                 "question_type": {
                     "type": ["string", "null"],
-                    "enum": ["choice", "fill", "code", None],
+                    "enum": _QUESTION_TYPE_ENUM,
                 },
                 "paper_id": _nullable("string"),
             }
@@ -543,7 +621,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="explain_problem",
         action="explain_problem",
         description=(
-            "对当前题目进行讲解，或对当前题目补充题干、纠正题干。"
+            "对当前题目进行讲解、核对学生对真题提交的答案，或对当前题目补充题干、纠正题干。"
             "开始一道完全不同的新题时 mode=new；给尚未讲清的题补充信息用 supplement；"
             "纠正已讲解题目的题干用 correction。"
         ),
@@ -569,13 +647,25 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "enum": ["current", "new"],
                     "description": "讲工作区当前题=current；讲本轮新题=new",
                 },
+                "focus": {
+                    "type": ["string", "null"],
+                    "description": "可选：学生要求侧重讲法，如“零基础举例”“只看某条件”“换种方法”",
+                },
+                "student_answer": {
+                    "type": ["string", "null"],
+                    "description": "可选：学生对当前真题提交的答案（如填空/编程/选择答案），传入后直接核对并讲解",
+                },
             }
         ),
     ),
     ToolSpec(
         name="answer_followup",
         action="followup_problem",
-        description="回答学生对母题或当前变式练习的追问。追问练习题或其解答时 target=exercise；明确问原题时 target=problem；不明确时 auto。",
+        description=(
+            "回答学生对当前题目或练习的追问，如局部某步为什么、没学过需要例子、"
+            "换一种解法，或定位已提交过程哪里出错。追问练习题用 target=exercise；"
+            "明确问原题时 target=problem；不明确时 auto。"
+        ),
         args_model=AnswerFollowupArgs,
         schema=_object(
             {
@@ -588,6 +678,22 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                     "type": ["string", "null"],
                     "pattern": "^Q[1-9][0-9]{0,3}$",
                 },
+                "intent": {
+                    "type": "string",
+                    "enum": [
+                        "auto",
+                        "why_step",
+                        "beginner_example",
+                        "alt_method",
+                        "check_process",
+                    ],
+                    "description": (
+                        "追问类型：why_step=解释某一步为什么/条件；"
+                        "beginner_example=没学过需要具体简单例子；"
+                        "alt_method=同一题换一种解法；"
+                        "check_process=定位已提交过程哪里错了；auto=自动。"
+                    ),
+                },
             },
             required=("question",),
         ),
@@ -596,7 +702,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="generate_exercise",
         action="generate_exercise",
         description=(
-            "学生明确要求练习时生成一道与当前题核心知识点相关的类似题。"
+            "学生明确要求练习时生成一道练习题：既可以基于当前已讲解的题目生成类似题，"
+            "也可以在没有原题或没有真题库时按 course 与 topic 自主生成练习题（非真题）。"
             "生成后必须等待学生作答，参考解答不能提前展示。"
         ),
         args_model=GenerateExerciseArgs,
@@ -604,11 +711,19 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             {
                 "from_question": {
                     "type": "boolean",
-                    "description": "从当前真题生成变式时为 true",
+                    "description": "从当前真题生成变式时为 true；自主按考点出题时为 false",
                 },
                 "ref": {
                     "type": ["string", "null"],
                     "pattern": "^Q[1-9][0-9]{0,3}$",
+                },
+                "course": {
+                    "type": ["string", "null"],
+                    "description": "自主出题时的课程名；不填则沿用当前课程",
+                },
+                "topic": {
+                    "type": ["string", "null"],
+                    "description": "没有已讲解原题时，指定要练习的考点或题型要求（如“求极限”“不定积分”）",
                 },
                 "basis": _basis_schema(),
             }
@@ -617,7 +732,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="evaluate_exercise",
         action="evaluate_exercise",
-        description="学生提交当前练习的答案或解题过程后，评价作答。不作答时不调用。",
+        description=(
+            "仅用于评价 AI 生成的练习题（ExerciseCard）的作答。不作答时不调用；"
+            "若当前是真题卡片且没有待作答练习题，学生交答案请用 explain_problem(target=\"current\", student_answer=...)。"
+        ),
         args_model=NoArgs,
         schema=_object({}),
     ),
@@ -658,7 +776,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="save_mistake",
         action="record_mistake",
         description=(
-            "把当前题目保存到错题本。只有学生明确要求保存、或确认了清晰的保存建议时才调用。"
+            "把当前题目保存到错题本。只有学生明确表达保存意愿（如“加入错题本”“添加到错题本里面”“记下来”“先存起来”等），"
+            "或肯定确认了上一轮唯一明确的保存建议时才调用；若目标存在多道候选题目导致不明确，先问学生“要保存哪一道？”。"
         ),
         args_model=SaveMistakeArgs,
         schema=_object({
@@ -845,7 +964,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             {
                 "question_type": {
                     "type": ["string", "null"],
-                    "enum": ["choice", "fill", "code", None],
+                    "enum": _QUESTION_TYPE_ENUM,
                 },
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
@@ -871,6 +990,72 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
             }
         ),
+    ),
+    ToolSpec(
+        name="list_conversation_materials",
+        action="list_conversation_materials",
+        description=(
+            "只读查看当前会话已上传或关联的个人 PDF 资料、可读性检查情况和已生成的成果（笔记/测试/图谱）。"
+            "在多份资料需要确认目标，或学生询问“刚才传的资料有哪些页/做好了什么”时使用。"
+        ),
+        args_model=ListConversationMaterialsArgs,
+        schema=_object({}),
+    ),
+    ToolSpec(
+        name="generate_material_artifact",
+        action="generate_material_artifact",
+        description=(
+            "基于当前会话关联的个人 PDF 资料，按学生实际选择生成章节笔记(notes)、章节测试(quiz)或知识图谱(graph)。"
+            "只填写明确要求的 outputs；解答上传原题使用 solve_uploaded_exam。"
+            "当会话中有多份资料且学生未指明具体文件时，应先用 ask_user 请学生选择。"
+        ),
+        args_model=GenerateMaterialArtifactArgs,
+        schema=_object(
+            {
+                "material_id": {
+                    "type": ["string", "null"],
+                    "description": "目标 PDF 资料 ID；会话仅有一份资料时可省略，有多份资料时必须明确指定",
+                },
+                "outputs": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["notes", "quiz", "graph"]},
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "description": "要生成的成果类型：notes=章节笔记，quiz=章节测试，graph=知识图谱。",
+                },
+                "start_page": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "起始物理页码（1-based）；未指定可省略",
+                },
+                "end_page": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "结束物理页码（1-based）；未指定可省略",
+                },
+                "course_hint": {
+                    "type": ["string", "null"],
+                    "description": "可选课程提示",
+                },
+            },
+            required=("outputs",),
+        ),
+    ),
+    ToolSpec(
+        name="solve_uploaded_exam",
+        action="solve_uploaded_exam",
+        description=(
+            "依学生自然语言从本会话的上传原卷定位题目并按要求回答。支持题型、题干特征、考点、"
+            "题号、页码和整卷。题型或内容明确即可使用，无需先问编号。可只给答案、讲思路或完整推导。"
+        ),
+        args_model=SolveUploadedExamArgs,
+        schema=_object({
+            "material_id": {"type": ["string", "null"], "description": "目标资料 ID；当前会话只有一份试卷时可省略。"},
+            "focus": {"type": ["string", "null"], "description": "可选的自然语言范围或跨轮承接，例如填空题只要答案、带表格的联合分布题。原话已清楚时可省略。"},
+            "answer_only": {"type": "boolean", "description": "用户只要求答案时为 true，可省略。"},
+            "start_page": {"type": ["integer", "null"], "minimum": 1, "description": "明确指定或续讲时的起始物理页；否则省略。"},
+            "end_page": {"type": ["integer", "null"], "minimum": 1, "description": "明确指定的结束物理页；否则省略。"},
+        }),
     ),
 )
 
@@ -1041,4 +1226,7 @@ def tool_label(tool: str | None) -> str:
         "view_question_detail": "查看题目详情",
         "list_shown_questions": "列出已展示题目",
         "view_learning_summary": "查看学习摘要",
+        "list_conversation_materials": "查看会话资料",
+        "generate_material_artifact": "生成资料复习成果",
+        "solve_uploaded_exam": "解答上传试卷",
     }.get(tool, tool)

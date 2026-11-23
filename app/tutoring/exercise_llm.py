@@ -9,7 +9,7 @@
 import base64
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.config import DeepSeekSettings
 from app.llm import (
@@ -47,12 +47,17 @@ class AnswerEvaluation(BaseModel):
 
     is_correct: bool | None = None
     final_answer_assessment: str = Field(min_length=1, max_length=1200)
-    step_by_step_analysis: str = Field(min_length=1, max_length=3000)
+    step_by_step_analysis: str = Field(default="", max_length=3000)
     guidance: str = Field(min_length=1, max_length=2000)
     needs_supplement: bool = False
     # 本次作答是否在参考解答展示之后完成；答案正确也不等于独立掌握。
     independence_assessment: Literal["independent", "after_reveal", "unclear"] | None = None
     independence_note: str | None = Field(default=None, max_length=800)
+
+    @field_validator("step_by_step_analysis", mode="before")
+    @classmethod
+    def _coerce_none_analysis(cls, value: Any) -> Any:
+        return "" if value is None else value
 
 
 EXERCISE_GENERATION_PROMPT = """\
@@ -63,6 +68,23 @@ EXERCISE_GENERATION_PROMPT = """\
 2. 必须提供详尽无误的标准参考解答（步骤清晰、结果明确）。
 3. 必须避开“近期已生成的题目”：不能只是换个标点或重复同一组数字与条件；优先改变数值、条件、操作顺序或情境。
 4. 若已提供“避免重复的题干”，本次生成必须与它实质不同。
+5. 严禁虚构年份、学校、学期或“真题来源”。
+6. 请只输出一个 JSON 对象，不要包含 Markdown 标记或多余文字。格式：
+{
+  "statement": "练习题完整题干",
+  "knowledge_point": "考查的核心知识点名称",
+  "reference_solution": "练习题完整参考解答与关键步骤"
+}
+"""
+
+STANDALONE_EXERCISE_PROMPT = """\
+你是河海大学考试复习助手。当前没有对应真题原题，请严格围绕学生指定的复习课程和考点，独立设计一道难度适中、适合大学期末复习的自测练习题（非历年真题）。
+
+要求：
+1. 题干必须完整清晰、条件充足、表述严谨，符号规范。
+2. 必须提供详尽无误的标准参考解答（关键推导清晰、结果明确）。
+3. 严禁在题干中虚构任何学校、年份、学期、试卷名或“历年真题”字样。
+4. 必须避开“近期已生成的题目”与“避免重复的题干”，保证题目具备实质变化。
 5. 请只输出一个 JSON 对象，不要包含 Markdown 标记或多余文字。格式：
 {
   "statement": "练习题完整题干",
@@ -72,20 +94,20 @@ EXERCISE_GENERATION_PROMPT = """\
 """
 
 ANSWER_EVALUATION_PROMPT = """\
-你是河海大学考试复习助手。请对比练习题干和标准参考解答，对学生的作答（包括文字答案及解题过程/图片）进行客观、详尽的评价。
+你是河海大学考试复习助手。请对比练习题干和标准参考解答，对学生的作答（包括最终答案以及选填的文字步骤或过程图片）进行客观、准确的评价。
 
 评判规则：
-1. 分别评价最终答案和推导过程。
-2. 容错与补充原则：如果学生上传的解题图片模糊、关键公式无法辨识，或过程严重缺失无法确认思路，请将 needs_supplement 设为 true，is_correct 设为 null，并在 guidance 中温和请求补充过程，绝不能武断直接判为做错！
-3. 若完全正确，is_correct 设为 true，肯定学生的思路并简析亮点。
-4. 若答案或过程有明显错误，is_correct 设为 false，在 step_by_step_analysis 中指出具体错误发生在哪一步，在 guidance 中给出针对性点拨，引导学生纠错。
+1. 解答过程为选填项：当学生提交了明确的最终答案（即使未写文字过程也未上传过程图片）时，请直接对比标准参考解答判定最终答案对错，将 is_correct 设为 true 或 false，且必须将 needs_supplement 设为 false。严禁因为未填写选填的解题过程就把 needs_supplement 设为 true 或要求学生补写过程。
+2. 仅在确实无法判别时设 needs_supplement 为 true：只有当学生上传了过程/手写图片但画面模糊、残缺、公式无法辨识，或者学生既没有提交明确的最终答案、过程也不足以判断结果时，才将 needs_supplement 设为 true、is_correct 设为 null，并在 guidance 中温和提示补充。
+3. 若学生提供了文字解题过程或过程图片：在 step_by_step_analysis 中逐层评价其过程是否规范、推理是否严密，明确指出正确之处或具体错误步骤；不要在未提供过程时猜测错误原因。
+4. 若学生未提供解题过程（既无文字过程也无过程图片）：step_by_step_analysis 必须输出空字符串 ""，不要写“未提供完整过程，暂无法定位具体错误步骤”等占位套话；如答案有误，只需在 final_answer_assessment 写明答案错在哪里，在 guidance 中简明给出本题核心思路点拨即可（无需催促补写过程，参考解答会随评价卡片一并展示）。
 5. 独立性：结合“作答背景”判断这次作答是否在参考解答展示之后完成。若已展示参考解答，即使答案正确，也只能视为对照作答，不能表述为独立掌握；independence_assessment 必须是 after_reveal，并在 independence_note 中说明这是对照练习，建议遮住解答后脱稿重做。若未展示参考解答，independence_assessment 可为 independent；信息不足时用 unclear。
 6. 请只输出一个 JSON 对象，不要包含 Markdown 标记或多余文字。格式：
 {
   "is_correct": true 或 false 或 null,
   "final_answer_assessment": "对最终结果的评价说明",
-  "step_by_step_analysis": "对解题过程和思路的逐层分析",
-  "guidance": "针对性建议或纠错引导",
+  "step_by_step_analysis": "有解题过程时评价其规范性与步骤问题；未提供过程时为空字符串",
+  "guidance": "针对性建议或核心思路点拨",
   "needs_supplement": true 或 false,
   "independence_assessment": "independent 或 after_reveal 或 unclear",
   "independence_note": "关于是否独立完成的简短说明，不得夸大掌握程度"
@@ -108,10 +130,11 @@ class DeepSeekExerciseAgent:
     async def generate_exercise(
         self,
         *,
-        original_statement: str,
-        knowledge_points: str,
+        original_statement: str | None = None,
+        knowledge_points: str = "",
         steps_summary: str | None = None,
         course: str | None = None,
+        topic: str | None = None,
         recent_statements: list[str] | None = None,
         avoid_statements: list[str] | None = None,
     ) -> GeneratedExercise:
@@ -137,17 +160,29 @@ class DeepSeekExerciseAgent:
                 "【上一次生成与近期题目重复，本次必须实质变化】：\n"
                 f"{lines}\n\n"
             )
-        human_content = (
-            f"{course_hint}"
-            f"【原题内容】：\n{original_statement}\n\n"
-            f"【核心知识点】：\n{knowledge_points}\n\n"
-            f"【原题解题步骤简述】：\n{steps_summary or '无'}\n\n"
-            f"{recent_block}"
-            f"{avoid_block}"
-            "请生成一道类似练习题并提供参考解答，输出 JSON。"
-        )
+        if original_statement and original_statement.strip():
+            system_prompt = EXERCISE_GENERATION_PROMPT
+            human_content = (
+                f"{course_hint}"
+                f"【原题内容】：\n{original_statement}\n\n"
+                f"【核心知识点】：\n{knowledge_points}\n\n"
+                f"【原题解题步骤简述】：\n{steps_summary or '无'}\n\n"
+                f"{recent_block}"
+                f"{avoid_block}"
+                "请生成一道类似练习题并提供参考解答，输出 JSON。"
+            )
+        else:
+            system_prompt = STANDALONE_EXERCISE_PROMPT
+            target_topic = topic or knowledge_points or "核心知识点综合练习"
+            human_content = (
+                f"{course_hint}"
+                f"【目标考点或题型要求】：\n{target_topic}\n\n"
+                f"{recent_block}"
+                f"{avoid_block}"
+                "请按要求自主生成一道适合该课程复习的练习题（非真题）并提供参考解答，输出 JSON。"
+            )
         messages = [
-            {"role": "system", "content": EXERCISE_GENERATION_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": human_content},
         ]
 
@@ -204,13 +239,23 @@ class DeepSeekExerciseAgent:
             "supplement": "补充过程后的再次评价",
             "correction": "订正后的再次评价",
         }.get(attempt_kind, "作答")
+        has_process = bool((student_solution_text or "").strip()) or has_images
+        process_block = (
+            student_solution_text.strip()
+            if (student_solution_text or "").strip()
+            else (
+                "（未写文字过程，请结合附图评价解题过程规范性）"
+                if has_images
+                else "未提供（解题过程为选填项；请直接对比参考解答判断最终答案对错，设 needs_supplement=false，step_by_step_analysis 留空，不要提示补写过程）"
+            )
+        )
         text_content = (
             f"【练习题目】：\n{statement}\n\n"
             f"【标准参考解答】：\n{reference_solution}\n\n"
             f"【本次作答类型】：{kind_label}\n\n"
             f"【作答背景】：{background}\n\n"
             f"【学生提交的最终答案】：\n{student_answer or '（未单独写最终答案）'}\n\n"
-            f"【学生文字解题过程】：\n{student_solution_text or '（未写文字过程）'}\n\n"
+            f"【学生解题过程（选填，已提供={'是' if has_process else '否'}）】：\n{process_block}\n\n"
             "请对学生的作答进行客观评价，严格输出 JSON。"
         )
 

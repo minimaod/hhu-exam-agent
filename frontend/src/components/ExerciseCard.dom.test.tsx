@@ -220,4 +220,93 @@ describe("练习卡片：尝试历史与订正/补充", () => {
     expect(screen.queryByDisplayValue("3")).toBeNull();
     expect(screen.queryByText("最终答案：")).toBeNull();
   });
+
+  test("自主生成且无真题来源时额外展示“模型生成 · 非真题”标签", () => {
+    const { rerender } = render(<ExerciseCard exercise={exercise()} />);
+    expect(screen.getByText("AI 生成类似题")).toBeTruthy();
+    expect(screen.getByText("模型生成 · 非真题")).toBeTruthy();
+
+    rerender(
+      <ExerciseCard
+        exercise={exercise({
+          source_question: {
+            question_id: "py-2024-choice-1",
+            paper_id: "py-2024",
+            paper_title: "Python 期末试卷",
+            number_label: "1",
+            question_type: "choice",
+            build_id: "b1",
+            source_version: "v1",
+            content_sha256: "abc",
+          },
+        })}
+      />,
+    );
+    expect(screen.getByText("AI 生成类似题")).toBeTruthy();
+    expect(screen.queryByText("模型生成 · 非真题")).toBeNull();
+    expect(screen.getByText(/根据真题生成：第 1 题/)).toBeTruthy();
+  });
+
+  test("未填选填过程仅提交最终答案时隐藏空白过程诊断并完整显示短参考解答", () => {
+    const evalNoProcess = evaluation({
+      is_correct: false,
+      needs_supplement: false,
+      final_answer_assessment: "答案 3 与标准结果 5 不一致。",
+      step_by_step_analysis: "未提供完整过程，暂无法定位具体错误步骤。",
+      guidance: "先对复合变量 u、v 分别使用链式法则求偏导。",
+    });
+    const { rerender } = render(
+      <ExerciseCard
+        exercise={exercise({
+          status: "submitted",
+          reference_solution_text: "利用链式法则得 ∂z/∂u = 5，∂z/∂v = 5。",
+          student_answer_text: "3",
+          student_solution_text: "",
+          evaluation: evalNoProcess,
+          attempts: [
+            attempt({
+              student_answer_text: "3",
+              student_solution_text: null,
+              evaluation: evalNoProcess,
+            }),
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText("答案有误")).toBeTruthy();
+    expect(screen.queryByText(/过程诊断/)).toBeNull();
+    expect(screen.queryByText(/暂无法定位具体错误步骤/)).toBeNull();
+    expect(screen.getByText("利用链式法则得 ∂z/∂u = 5，∂z/∂v = 5。")).toBeTruthy();
+
+    rerender(
+      <ExerciseCard
+        exercise={exercise({
+          status: "submitted",
+          reference_solution_text: "利用链式法则得 ∂z/∂u = 5，∂z/∂v = 5。",
+          student_answer_text: "3",
+          student_solution_text: "dz/du = fx * 2u = 3",
+          evaluation: evaluation({
+            is_correct: false,
+            needs_supplement: false,
+            step_by_step_analysis: "漏掉了 f_y·y_u 这一项。",
+          }),
+          attempts: [
+            attempt({
+              student_answer_text: "3",
+              student_solution_text: "dz/du = fx * 2u = 3",
+              evaluation: evaluation({
+                is_correct: false,
+                needs_supplement: false,
+                step_by_step_analysis: "漏掉了 f_y·y_u 这一项。",
+              }),
+            }),
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/过程诊断/)).toBeTruthy();
+    expect(screen.getByText(/漏掉了 f_y·y_u 这一项/)).toBeTruthy();
+  });
 });

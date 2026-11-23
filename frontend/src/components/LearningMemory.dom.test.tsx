@@ -214,3 +214,59 @@ test("读取失败时如实说明并给出重试", async () => {
   ).toBeTruthy();
   expect(screen.getByRole("button", { name: "重试" })).toBeTruthy();
 });
+
+test("按会话科目归属显示“按会话科目”，待确认条目不重复显示两次标签", async () => {
+  const base = makeView();
+  const convEntry = {
+    ...base.entries[0],
+    entry_id: "exercise:33333333-3333-4333-8333-333333333333",
+    course: "高等数学",
+    course_source: "conversation" as const,
+  };
+  const pendingEntry = {
+    ...base.entries[0],
+    entry_id: "exercise:44444444-4444-4444-8444-444444444444",
+    course: null,
+    course_source: "unknown" as const,
+  };
+  fetchMemoryCourses.mockResolvedValue({
+    items: [{ course: "高等数学", label: "高等数学", evidence: 1 }],
+    pending: 1,
+  });
+  fetchLearningMemory.mockResolvedValue({
+    ...base,
+    course: "高等数学",
+    entries: [convEntry],
+    pending_course_entries: [pendingEntry],
+  });
+
+  render(<LearningMemory />);
+
+  expect(await screen.findByText("按会话科目")).toBeTruthy();
+  expect(screen.getAllByText("课程待确认")).toHaveLength(1);
+});
+
+test("逐条记录用 KaTeX 渲染数学公式且总览标题不重复科目名", async () => {
+  const base = makeView();
+  fetchMemoryCourses.mockResolvedValue({
+    items: [{ course: "高等数学", label: "高等数学", evidence: 1 }],
+    pending: 0,
+  });
+  fetchLearningMemory.mockResolvedValue({
+    ...base,
+    course: "高等数学",
+    range_text: "高等数学近 30 天的学习记录：1 条证据、1 道题（2026-11-15）",
+    entries: [
+      {
+        ...base.entries[0],
+        course: "高等数学",
+        statement_excerpt: "求极限 $\\lim_{x\\to 0}\\frac{\\sin x}{x}$。",
+      },
+    ],
+  });
+
+  const { container } = render(<LearningMemory />);
+  expect(await screen.findByRole("heading", { name: "高等数学 · 近 30 天" })).toBeTruthy();
+  expect(container.querySelector(".katex-html")).toBeTruthy();
+  expect(container.textContent).not.toContain("$\\lim");
+});

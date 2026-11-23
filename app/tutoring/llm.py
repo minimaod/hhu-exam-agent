@@ -120,6 +120,7 @@ class DeepSeekTutor:
         solution_text: str | None,
         statement_images: list[ImagePayload],
         solution_images: list[ImagePayload],
+        focus: str | None = None,
     ) -> Explanation:
         student_part = (
             f"学生答案：\n{student_answer.strip()}\n" if student_answer and student_answer.strip() else ""
@@ -131,15 +132,21 @@ class DeepSeekTutor:
         )
         if not student_part and not solution_part and not solution_images:
             work_note = "学生没有提交答案或解法；error_analysis 必须为 null。"
+        elif not solution_part and not solution_images:
+            work_note = (
+                "学生只提交了最终答案、没有提供解题过程或过程图片；"
+                "不要猜测或编造学生的中间过程错误，仅判断答案本身并提醒补充过程。"
+            )
         else:
             work_note = (
                 "学生提交了答案/解法（文字或图片）。请具体指出错误发生在哪一步；"
                 "如果正确但过程不完整，也说明可补充之处。"
             )
+        focus_part = f"学生本轮侧重要求：{focus.strip()}\n" if focus and focus.strip() else ""
 
         prompt_text = (
             f"当前题目：\n{statement}\n\n"
-            f"{student_part}{solution_part}"
+            f"{focus_part}{student_part}{solution_part}"
             f"{work_note}\n\n"
             "请按 json 输出知识点、步骤、最终答案和错误分析。"
         )
@@ -158,20 +165,53 @@ class DeepSeekTutor:
         explanation: Explanation,
         recent_followups: list[tuple[str, str]],
         question: str,
+        intent: str = "auto",
+        has_student_process: bool | None = None,
+        student_solution_text: str | None = None,
+        student_solution_images: list[ImagePayload] | None = None,
     ) -> FollowupAnswer:
         history = "\n".join(
             f"学生：{q}\n老师：{a}" for q, a in recent_followups[-3:]
         ) or "（无）"
+        process_text = (student_solution_text or "").strip()
+        process_images = list(student_solution_images or [])
+        effective_has_process = (
+            bool(process_text) or bool(process_images)
+            if student_solution_text is not None or student_solution_images is not None
+            else bool(has_student_process)
+        )
+        intent_hints = {
+            "why_step": "学生主要在追问某个步骤/推导为什么成立，请补全条件与中间变形，不要重讲整题。",
+            "beginner_example": "学生表示还没学过相关前置概念，请先用一个最简单具体的例子建立直觉，再衔接本题。",
+            "alt_method": "学生明确要求换一种解题方法，请给出与已有讲解不同路线的新思路并补全关键步骤。",
+            "check_process": (
+                "学生在核对自己的过程哪里出错；当前已附带学生实际提交的过程材料（文字与/或过程附图），请严格依据可见材料定位错步。"
+                if effective_has_process
+                else "学生在问自己的过程哪里错了，但当前记录中没有可用且清晰的文字或图片解题过程！必须明确告知缺少可核对的过程材料、无法定位具体错步，严禁推测或编造。"
+            ),
+        }
+        intent_note = intent_hints.get(intent, "")
+        extra = f"\n追问重点指引：{intent_note}\n" if intent_note else "\n"
+        process_section = ""
+        if process_text or process_images:
+            parts: list[str] = []
+            if process_text:
+                parts.append(process_text[:2500])
+            if process_images:
+                parts.append(f"（另附学生解题过程图片 {len(process_images)} 张，请仔细辨识附图推导步骤。）")
+            process_section = "\n学生提交的解题过程：\n" + "\n".join(parts) + "\n"
         prompt_text = (
             f"当前题目：\n{statement}\n\n"
             f"已有讲解（json）：\n{json.dumps(explanation.model_dump(mode='json'), ensure_ascii=False)}\n\n"
             f"最近追问：\n{history}\n\n"
-            f"学生的新追问：\n{question}\n\n"
+            f"{process_section}"
+            f"学生的新追问：\n{question}"
+            f"{extra}\n"
             "请只回答这道题的追问，按 json 输出 answer 和 related_steps。"
         )
         raw = await self._call(
             system_prompt=FOLLOWUP_SYSTEM_PROMPT,
-            human=prompt_text,
+            human=_human_content(prompt_text, process_images),
             max_tokens=FOLLOWUP_MAX_TOKENS,
             timeout=FOLLOWUP_TIMEOUT,
         )

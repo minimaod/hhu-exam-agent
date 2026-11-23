@@ -39,6 +39,7 @@ from app.question_bank.config import (
     SPECIAL_TOKENS,
 )
 from app.question_bank.embedding import FastEmbedder, model_fingerprint
+from app.question_bank.models import QUESTION_TYPES
 from app.question_bank.paths import (
     BankLayoutError,
     BankPaths,
@@ -47,7 +48,7 @@ from app.question_bank.paths import (
     relative,
     write_current,
 )
-from app.question_bank.taxonomy import LabelMatch, Taxonomy, load_taxonomy
+from app.question_bank.taxonomy import LabelMatch, MultiCourseTaxonomy, Taxonomy, load_taxonomies, load_taxonomy
 from app.question_bank.textbuild import FragmentTooLongError, build_retrieval_text, make_fragments
 from app.question_bank.tokenization import load_stopwords, tokenize
 from app.question_bank.vector_store import VectorStore
@@ -104,55 +105,71 @@ def load_bank_inputs(
     paths: BankPaths,
     corrections: Iterable[Path] | None = None,
 ) -> tuple[list[dict], dict, list[dict]]:
-    source_dir = paths.root / SOURCE_DIR
-    manifest_path = source_dir / "manifest.json"
+    source_dirs = [paths.root / SOURCE_DIR, *paths.extra_source_dirs]
+    manifest_path = source_dirs[0] / "manifest.json"
     if not manifest_path.is_file():
         raise BuildError(f"源数据清单不存在：{manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     records: list[dict] = []
-    for path in sorted(source_dir.glob("*.jsonl")):
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except ValueError as exc:
-                raise BuildError(f"{path.name} 第 {line_no} 行不是 JSON") from exc
-            if not record.get("question_id"):
-                raise BuildError(f"{path.name} 第 {line_no} 行缺少 question_id")
-            records.append(record)
+    catalog = {row["id"]: row for row in json.loads((DEFAULT_PAPERS_ROOT / "catalog.json").read_text(encoding="utf-8"))}
+    papers: list[dict] = []
+    seen_papers: set[str] = set()
+
+    for source_dir in source_dirs:
+        sub_manifest_path = source_dir / "manifest.json"
+        if not sub_manifest_path.is_file():
+            continue
+        sub_manifest = json.loads(sub_manifest_path.read_text(encoding="utf-8"))
+        for path in sorted(source_dir.glob("*.jsonl")):
+            for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError as exc:
+                    raise BuildError(f"{path.name} 第 {line_no} 行不是 JSON") from exc
+                if not record.get("question_id"):
+                    raise BuildError(f"{path.name} 第 {line_no} 行缺少 question_id")
+                records.append(record)
+        for item in sub_manifest.get("papers") or []:
+            paper_id = item["paper_id"]
+            if paper_id in seen_papers:
+                raise BuildError(f"源数据存在重复试卷：{paper_id}")
+            seen_papers.add(paper_id)
+            meta = catalog.get(paper_id) or {}
+            papers.append(
+                {
+                    "paper_id": paper_id,
+                    "title": item.get("title") or meta.get("title") or paper_id,
+                    "course": item.get("course") or meta.get("course") or COURSE,
+                    "exam_type": item.get("exam_type") or meta.get("exam_type"),
+                    "academic_year": item.get("academic_year") or meta.get("academic_year"),
+                    "exam_date": item.get("exam_date") or meta.get("exam_date"),
+                    "pdf_rel_path": meta.get("file_path"),
+                    "pdf_sha256": item.get("pdf_sha256"),
+                    "physical_pages": item.get("pages"),
+                }
+            )
     ids = [record["question_id"] for record in records]
     if len(ids) != len(set(ids)):
         raise BuildError("源数据存在重复 question_id")
-    catalog = {row["id"]: row for row in json.loads((DEFAULT_PAPERS_ROOT / "catalog.json").read_text(encoding="utf-8"))}
-    papers: list[dict] = []
-    for item in manifest.get("papers") or []:
-        paper_id = item["paper_id"]
-        meta = catalog.get(paper_id) or {}
-        papers.append(
-            {
-                "paper_id": paper_id,
-                "title": item.get("title") or meta.get("title") or paper_id,
-                "course": item.get("course") or meta.get("course") or COURSE,
-                "exam_type": meta.get("exam_type"),
-                "academic_year": meta.get("academic_year"),
-                "exam_date": meta.get("exam_date"),
-                "pdf_rel_path": meta.get("file_path"),
-                "pdf_sha256": item.get("pdf_sha256"),
-                "physical_pages": item.get("pages"),
-            }
-        )
-    if len(papers) != 20:
-        raise BuildError(f"源数据应有 20 卷，实际 {len(papers)} 卷")
+    if len(papers) < 20:
+        raise BuildError(f"源数据至少应有 20 卷，实际 {len(papers)} 卷")
     by_paper = {paper["paper_id"] for paper in papers}
     unknown = {record["paper_id"] for record in records} - by_paper
     if unknown:
         raise BuildError(f"题目引用了未知试卷：{sorted(unknown)}")
-    correction_paths = (
-        [Path(path) for path in corrections]
-        if corrections is not None
-        else [paths.root / "review/p4/mentor-corrections.json"]
-    )
+    if corrections is not None:
+        correction_paths = [Path(path) for path in corrections]
+    else:
+        default_candidates = [
+            paths.root / "review/p4/mentor-corrections.json",
+            paths.root / "review/mentor-final-20261029/mentor-corrections.json",
+            paths.root / "review/ext-2020plus/corrections.json",
+        ]
+        correction_paths = [p for p in default_candidates if p.is_file()]
+        if not correction_paths:
+            correction_paths = [paths.root / "review/p4/mentor-corrections.json"]
     for path in correction_paths:
         try:
             records = apply_corrections(records, papers, Path(path))
@@ -162,7 +179,9 @@ def load_bank_inputs(
 
 
 def source_version(records: Iterable[dict], papers: Iterable[dict]) -> str:
-    material = {
+    papers_list = list(papers)
+    courses = sorted({str(paper.get("course") or COURSE) for paper in papers_list})
+    material: dict[str, Any] = {
         "schema": BUILD_SCHEMA,
         "course": COURSE,
         "papers": sorted(
@@ -175,17 +194,23 @@ def source_version(records: Iterable[dict], papers: Iterable[dict]) -> str:
                     "pdf_sha256": paper.get("pdf_sha256"),
                     "pages": paper.get("physical_pages"),
                 }
-                for paper in papers
+                for paper in papers_list
             ],
             key=lambda item: item["paper_id"],
         ),
         "records": [QDB.content_payload(record) for record in sorted(records, key=lambda item: item["question_id"])],
     }
+    if len(courses) > 1 or (courses and courses[0] != COURSE):
+        material["courses"] = courses
     return "sv-" + _sha_json(material)[:16]
 
 
 def taxonomy_version(paths: BankPaths) -> str:
-    return "tx-" + _sha_file(paths.taxonomy_file)[:16]
+    files = paths.taxonomy_files
+    if len(files) == 1:
+        return "tx-" + _sha_file(files[0])[:16]
+    hashes = {path.name: _sha_file(path) for path in files}
+    return "tx-" + _sha_json(hashes)[:16]
 
 
 def ensure_reviews(paths: BankPaths) -> dict[str, Any]:
@@ -213,7 +238,7 @@ def reviews_version(payload: dict[str, Any]) -> str:
 
 def prepare_labels(
     records: list[dict],
-    taxonomy: Taxonomy,
+    taxonomy: Taxonomy | MultiCourseTaxonomy,
     decisions: dict[str, dict],
 ) -> tuple[dict[str, list[dict]], int]:
     labels: dict[str, list[dict]] = {}
@@ -254,7 +279,7 @@ def prepare_labels(
 def prepare_texts(
     records: list[dict],
     labels: dict[str, list[dict]],
-    taxonomy: Taxonomy,
+    taxonomy: Taxonomy | MultiCourseTaxonomy,
     embedder: FastEmbedder,
 ) -> tuple[dict[str, str], dict[str, list[dict]], list[dict]]:
     texts: dict[str, str] = {}
@@ -341,7 +366,7 @@ def build(
 ) -> dict[str, Any]:
     config = config or RetrievalConfig()
     records, manifest, papers = load_bank_inputs(paths, corrections)
-    taxonomy = load_taxonomy(paths.taxonomy_file)
+    taxonomy = load_taxonomies(paths.taxonomy_files)
     review_payload = ensure_reviews(paths)
     decisions = review_payload.get("decisions") or {}
     embedder = FastEmbedder(paths.model_dir)
@@ -379,10 +404,15 @@ def build(
     temp.mkdir(parents=True)
 
     try:
+        extra_crop_roots = [
+            paths.root / "review" / source_dir.name / "crops"
+            for source_dir in paths.extra_source_dirs
+        ]
         asset_rows = QDB.copy_assets(
             records,
             review_root=paths.root / CROPS,
             target_dir=temp / "assets",
+            extra_review_roots=extra_crop_roots,
         )
         asset_map = {(row["question_id"], row["ordinal"]): row for row in asset_rows}
 
@@ -402,7 +432,7 @@ def build(
                     index,
                 ),
             )
-        counts = {"choice": 0, "fill": 0, "code": 0}
+        counts = {key: 0 for key in QUESTION_TYPES}
         answer_states: dict[str, int] = {}
         issues: list[dict] = []
         for record in records:
@@ -480,6 +510,11 @@ def build(
         vector_count = store.count()
         store.close()
 
+        courses_list = sorted({str(paper.get("course") or COURSE) for paper in papers})
+        by_course: dict[str, int] = {}
+        for record in records:
+            c_name = str(record.get("course") or COURSE)
+            by_course[c_name] = by_course.get(c_name, 0) + 1
         db_sha = _sha_file(temp / "questions.sqlite3")
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -490,6 +525,8 @@ def build(
             "taxonomy_version": taxonomy_v,
             "review_version": review_v,
             "course": COURSE,
+            "courses": courses_list,
+            "kp_courses": dict(taxonomy.course_by_slug),
             "created_at": _now(),
             "collection": COLLECTION,
             "model": model,
@@ -508,6 +545,7 @@ def build(
             "counts": {
                 "questions": len(records),
                 "searchable": sum(1 for record in records if not QDB.content_issue(record)),
+                "by_course": by_course,
                 "by_type": counts,
                 "answer_states": answer_states,
                 "fragments": len(flat),
@@ -1025,16 +1063,22 @@ def prune(paths: BankPaths, keep: int, yes: bool) -> list[str]:
 
 def plan(paths: BankPaths, *, corrections: Iterable[Path] | None = None) -> dict[str, Any]:
     records, manifest, papers = load_bank_inputs(paths, corrections)
-    taxonomy = load_taxonomy(paths.taxonomy_file)
+    taxonomy = load_taxonomies(paths.taxonomy_files)
     issues = [record for record in records if QDB.content_issue(record)]
     model = model_fingerprint(paths.model_dir)
+    courses_list = sorted({str(paper.get("course") or COURSE) for paper in papers})
     payload = {
         "course": COURSE,
+        "courses": courses_list,
         "papers": len(papers),
         "questions": len(records),
+        "by_course": {
+            c_name: sum(1 for record in records if record["course"] == c_name)
+            for c_name in courses_list
+        },
         "by_type": {
             key: sum(1 for record in records if record["question_type"] == key)
-            for key in ("choice", "fill", "code")
+            for key in QUESTION_TYPES
         },
         "searchable": len(records) - len(issues),
         "content_issues": len(issues),

@@ -152,21 +152,105 @@ def _assert_v8(db_path: Path) -> tuple[int, int]:
         connection.close()
 
 
+def _assert_v9(db_path: Path) -> tuple[int, int]:
+    connection = schema._open(db_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != 9 or not schema._is_compatible_v9(connection):
+            raise ConversationStorageError("v9 结构校验失败。")
+        unowned = connection.execute(
+            "SELECT COUNT(*) FROM conversations WHERE owner_id IS NULL"
+        ).fetchone()[0]
+        if unowned:
+            raise ConversationStorageError("v9 仍存在无归属会话。")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise ConversationStorageError("v9 外键检查失败。")
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ConversationStorageError("v9 完整性检查失败。")
+        conversations = connection.execute(
+            "SELECT COUNT(*) FROM conversations"
+        ).fetchone()[0]
+        memory_rows = connection.execute(
+            "SELECT COUNT(*) FROM memory_corrections"
+        ).fetchone()[0] + connection.execute(
+            "SELECT COUNT(*) FROM memory_exclusions"
+        ).fetchone()[0]
+        return int(conversations), int(memory_rows)
+    finally:
+        connection.close()
+
+
+def _assert_v11(db_path: Path) -> tuple[int, int]:
+    connection = schema._open(db_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != 11 or not schema._is_compatible_v11(connection):
+            raise ConversationStorageError("v11 结构校验失败。")
+        unowned = connection.execute(
+            "SELECT COUNT(*) FROM conversations WHERE owner_id IS NULL"
+        ).fetchone()[0]
+        if unowned:
+            raise ConversationStorageError("v11 仍存在无归属会话。")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise ConversationStorageError("v11 外键检查失败。")
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ConversationStorageError("v11 完整性检查失败。")
+        conversations = connection.execute(
+            "SELECT COUNT(*) FROM conversations"
+        ).fetchone()[0]
+        memory_rows = connection.execute(
+            "SELECT COUNT(*) FROM memory_corrections"
+        ).fetchone()[0] + connection.execute(
+            "SELECT COUNT(*) FROM memory_exclusions"
+        ).fetchone()[0]
+        return int(conversations), int(memory_rows)
+    finally:
+        connection.close()
+
+
+def _assert_v12(db_path: Path) -> tuple[int, int]:
+    connection = schema._open(db_path)
+    try:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != 12 or not schema._is_compatible_v12(connection):
+            raise ConversationStorageError("v12 结构校验失败。")
+        unowned = connection.execute(
+            "SELECT COUNT(*) FROM conversations WHERE owner_id IS NULL"
+        ).fetchone()[0]
+        if unowned:
+            raise ConversationStorageError("v12 仍存在无归属会话。")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise ConversationStorageError("v12 外键检查失败。")
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ConversationStorageError("v12 完整性检查失败。")
+        conversations = connection.execute(
+            "SELECT COUNT(*) FROM conversations"
+        ).fetchone()[0]
+        memory_rows = connection.execute(
+            "SELECT COUNT(*) FROM memory_corrections"
+        ).fetchone()[0] + connection.execute(
+            "SELECT COUNT(*) FROM memory_exclusions"
+        ).fetchone()[0]
+        return int(conversations), int(memory_rows)
+    finally:
+        connection.close()
+
+
 def migrate_database(
     db_path: Path,
     *,
     owner: schema.SchemaOwner | None = None,
     backup_dir: Path,
 ) -> MigrationReport:
-    """把 v6/v7 迁移到 v8；v7→v8 不需要管理员账号。"""
+    """把 v6/v7/v8/v9/v10/v11 迁移到 v12；v7–v11→v12 不需要管理员账号。"""
 
     version = _read_version(db_path)
-    if version == 8:
-        conversations, memory_rows = _assert_v8(db_path)
-        return MigrationReport(8, True, None, conversations, memory_rows)
-    if version not in (6, 7):
+    if version == 12:
+        conversations, memory_rows = _assert_v12(db_path)
+        return MigrationReport(12, True, None, conversations, memory_rows)
+    if version not in (6, 7, 8, 9, 10, 11):
         raise ConversationStorageError(
-            "F013 迁移只支持 v6 或 v7 数据库；请先升级到 v6。"
+            "迁移只支持 v6、v7、v8、v9、v10 或 v11 数据库；请先升级到 v6。"
         )
     if version == 6 and owner is None:
         raise ConversationStorageError("v6 升级需要管理员账号。")
@@ -176,22 +260,22 @@ def migrate_database(
         schema.initialize_database(db_path, migration_owner=owner)
     except ConversationStorageError as exc:
         actual_version = _read_version(db_path)
-        if actual_version == 8:
+        if actual_version == 12:
             raise MigrationCommittedCheckError(
-                "迁移事务已提交为 v8，但提交后的启动处理失败；"
+                "迁移事务已提交为 v12，但提交后的启动处理失败；"
                 f"请检查数据库后再决定是否从备份恢复：{backup_path}；原因：{exc}"
             ) from exc
         raise MigrationRolledBackError(
             f"迁移事务已回滚，数据库仍为 v{actual_version}；备份：{backup_path}；原因：{exc}"
         ) from exc
     try:
-        conversations, memory_rows = _assert_v8(db_path)
+        conversations, memory_rows = _assert_v12(db_path)
     except ConversationStorageError as exc:
         raise MigrationCommittedCheckError(
-            f"迁移已提交为 v8，但提交后校验失败：{exc}；请从备份恢复：{backup_path}"
+            f"迁移已提交为 v12，但提交后校验失败：{exc}；请从备份恢复：{backup_path}"
         ) from exc
     return MigrationReport(
-        8, False, backup_path, conversations, memory_rows
+        12, False, backup_path, conversations, memory_rows
     )
 
 

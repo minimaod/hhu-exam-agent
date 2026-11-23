@@ -44,7 +44,7 @@ export type MemoryEntry = {
   entry_id: string;
   kind: "exercise" | "attempt" | "selfreport";
   course: string | null;
-  course_source: "user" | "paper" | "problem" | "unknown";
+  course_source: "user" | "paper" | "problem" | "conversation" | "unknown";
   knowledge_points: string[];
   knowledge_points_normalized: boolean[];
   statement_excerpt: string | null;

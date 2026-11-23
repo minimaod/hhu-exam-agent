@@ -30,8 +30,17 @@ function fixture(overrides: Partial<ExerciseView> = {}): ConversationDetail {
   };
 }
 
-async function open(options: { fail?: boolean; status?: string; retryable?: boolean; detailFailOnReads?: number[]; exerciseOverrides?: Partial<ExerciseView>; awaitForm?: boolean; withClarification?: boolean } = {}) {
+async function open(options: { fail?: boolean; status?: string; retryable?: boolean; detailFailOnReads?: number[]; exerciseOverrides?: Partial<ExerciseView>; awaitForm?: boolean; withClarification?: boolean; latestSteps?: NonNullable<ConversationDetail["turns"][number]["composite_results"]> } = {}) {
   const detail = fixture(options.exerciseOverrides);
+  if (options.latestSteps) {
+    detail.turns.push({
+      ...detail.turns[0],
+      request_id: "66666666-6666-4666-8666-666666666666",
+      seq: 2,
+      query: "换个话题",
+      composite_results: options.latestSteps,
+    });
+  }
   if (options.withClarification) {
     // F008 移除输入模式按钮后，“补充”只剩历史卡片上的明确对象操作；
     // 这里补一条“题目需补充”的辅导轮次，让“补充当前题”按钮真实出现。
@@ -103,23 +112,51 @@ async function open(options: { fail?: boolean; status?: string; retryable?: bool
 afterEach(() => { vi.unstubAllGlobals(); });
 
 describe("真实工作区 → streamTurn → fetch 请求链路", () => {
+  test.each([
+    { steps: ["query_papers"], tutoring: false },
+    { steps: ["introduce"], tutoring: false },
+    { steps: ["followup_problem", "query_papers"], tutoring: false },
+    { steps: ["query_papers", "followup_problem"], tutoring: true },
+    { steps: ["followup_problem"], tutoring: true },
+  ])("根据本轮最后完成的相关动作切换输入提示 %j", async ({ steps, tutoring }) => {
+    await open({ latestSteps: steps.map((action) => ({ action, status: "success", message: action, details: {} })) });
+    const composer = screen.getByRole("textbox", { name: "学习指令" });
+    expect(composer.getAttribute("placeholder")).toMatch(
+      tutoring ? /围绕当前题目继续追问/ : /输入完整题干/,
+    );
+  });
+
+  test.each(["换一道题目", "换一道数组的题目"])("直接发送「%s」作为自然语言请求", async (query) => {
+    const { requests } = await open({});
+    expect(screen.queryByRole("button", { name: "输入新题" })).toBeNull();
+
+    const composer = screen.getByRole("textbox", { name: "学习指令" });
+    fireEvent.change(composer, { target: { value: query } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0]).toMatchObject({ kind: "auto", query });
+    expect(requests[0]).not.toHaveProperty("start_new");
+    expect(requests[0]).not.toHaveProperty("question_action");
+  });
+
   test("失败后练习与主输入草稿按会话隔离，返回原会话仍可编辑", async () => {
     await open({ fail: true });
     fireEvent.change(screen.getByLabelText("最终答案"), { target: { value: "A 卡片答案" } });
     fireEvent.change(screen.getByLabelText("解题步骤 / 推导思路（选填）"), { target: { value: "A 卡片过程" } });
-    fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "A 主输入答案" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "学习指令" }), { target: { value: "A 主输入答案" } });
     fireEvent.click(screen.getByRole("button", { name: "提交作答并评价" }));
     await screen.findByRole("alert");
     fireEvent.click(screen.getByRole("button", { name: /请求链路 B/ }));
     await screen.findByRole("heading", { name: "请求链路 B" });
     expect((screen.getByLabelText("最终答案") as HTMLInputElement).value).toBe("");
-    expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("");
-    fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "B 主输入答案" } });
+    expect((screen.getByRole("textbox", { name: "学习指令" }) as HTMLTextAreaElement).value).toBe("");
+    fireEvent.change(screen.getByRole("textbox", { name: "学习指令" }), { target: { value: "B 主输入答案" } });
     fireEvent.click(screen.getByRole("button", { name: /请求链路 A/ }));
     await screen.findByRole("heading", { name: "请求链路 A" });
     expect((screen.getByLabelText("最终答案") as HTMLInputElement).value).toBe("A 卡片答案");
     expect((screen.getByLabelText("解题步骤 / 推导思路（选填）") as HTMLTextAreaElement).value).toBe("A 卡片过程");
-    expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("A 主输入答案");
+    expect((screen.getByRole("textbox", { name: "学习指令" }) as HTMLTextAreaElement).value).toBe("A 主输入答案");
   });
   test.each(["failed", "partial"])("%s 结果保留草稿，重试只引用原轮次", async (status) => {
     const state = await open({ status, retryable: true });
@@ -145,45 +182,40 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
     const state = await open();
     if (withAnswer) fireEvent.change(screen.getByLabelText("最终答案"), { target: { value: "[10,20]" } });
     fireEvent.change(screen.getByLabelText("解题步骤 / 推导思路（选填）"), { target: { value: "y 与 x 引用同一列表，+= 原地修改。" } });
-    fireEvent.change(screen.getByPlaceholderText("我的解题过程；也可以添加解法图片"), { target: { value: "主输入区旧过程" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "学习指令" }), { target: { value: "主输入区旧过程" } });
     fireEvent.click(screen.getByRole("button", { name: "提交作答并评价" }));
     await waitFor(() => expect(state.requests).toHaveLength(1));
     expect(state.requests[0]).toMatchObject({ kind: "exercise", exercise_id: eid, solution_text: "y 与 x 引用同一列表，+= 原地修改。" });
     expect(state.requests[0].student_answer).toBe(withAnswer ? "[10,20]" : undefined);
     await screen.findAllByText("解题步骤：");
-    expect((screen.getByPlaceholderText("我的解题过程；也可以添加解法图片") as HTMLTextAreaElement).value).toBe("主输入区旧过程");
+    expect((screen.getByRole("textbox", { name: "学习指令" }) as HTMLTextAreaElement).value).toBe("主输入区旧过程");
     await state.refresh();
     expect(screen.getAllByText(/y 与 x 引用同一列表/).length).toBeGreaterThan(0);
   });
 
-  test("折叠草稿不改变自然语言操作类型，发送后仍保留", async () => {
+  test("主输入框发送普通请求，无附加答案过程抽屉", async () => {
     const state = await open();
-    fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "旧答案" } });
-    fireEvent.change(screen.getByPlaceholderText("我的解题过程；也可以添加解法图片"), { target: { value: "旧过程" } });
-    fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "再来一道类似题" } });
+    expect(screen.queryByRole("button", { name: "补充答案/过程" })).toBeNull();
+    fireEvent.change(screen.getByRole("textbox", { name: "学习指令" }), { target: { value: "再来一道类似题" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(state.requests).toHaveLength(1));
     expect(state.requests[0]).toMatchObject({ kind: "auto", query: "再来一道类似题" });
     expect(state.requests[0]).not.toHaveProperty("solution_text");
     expect(state.requests[0]).not.toHaveProperty("student_answer");
-    await waitFor(() => expect((screen.getByPlaceholderText(/围绕当前题目继续追问/) as HTMLTextAreaElement).value).toBe(""));
-    expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("旧答案");
   });
 
   test("显式补充携带字段和目标；409 明显、持续可见且保留草稿", async () => {
     const state = await open({ fail: true, withClarification: true });
     fireEvent.click(screen.getByRole("button", { name: "补充当前题" }));
-    fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "旧答案" } });
-    fireEvent.change(screen.getByPlaceholderText("我的解题过程；也可以添加解法图片"), { target: { value: "补充过程" } });
-    fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "补充信息" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "学习指令" }), { target: { value: "答案是 2，补充过程是先代入" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("当前题目已经讲解过");
-    expect(state.requests[0]).toMatchObject({ kind: "supplement", problem_id: pid, student_answer: "旧答案", solution_text: "补充过程" });
+    expect(state.requests[0]).toMatchObject({ kind: "supplement", problem_id: pid, query: "答案是 2，补充过程是先代入" });
     fireEvent.click(within(alert).getByRole("button", { name: "刷新会话记录" }));
     await waitFor(() => expect(state.reads()).toBeGreaterThanOrEqual(3));
     expect(screen.getByRole("alert").textContent).toContain("当前题目已经讲解过");
-    expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("旧答案");
+    expect((screen.getByRole("textbox", { name: "学习指令" }) as HTMLTextAreaElement).value).toBe("答案是 2，补充过程是先代入");
     fireEvent.click(screen.getByRole("button", { name: "切回普通聊天" }));
     expect(screen.getByPlaceholderText(/围绕当前题目继续追问/)).toBeTruthy();
   });
@@ -233,7 +265,6 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
   test("409 后详情读取失败，告警与草稿仍保留，恢复记录后可继续", async () => {
     const state = await open({ fail: true, detailFailOnReads: [2], withClarification: true });
     fireEvent.click(screen.getByRole("button", { name: "补充当前题" }));
-    fireEvent.change(screen.getByPlaceholderText("我的答案"), { target: { value: "要保留的答案" } });
     fireEvent.change(screen.getByPlaceholderText(/围绕当前题目继续追问/), { target: { value: "补充信息" } });
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
     expect((await screen.findByRole("alert")).textContent).toContain("当前题目已经讲解过");
@@ -244,7 +275,6 @@ describe("真实工作区 → streamTurn → fetch 请求链路", () => {
     await screen.findByPlaceholderText(/围绕当前题目继续追问/);
     expect(state.reads()).toBeGreaterThanOrEqual(3);
     expect(screen.getByRole("alert").textContent).toContain("当前题目已经讲解过");
-    expect((screen.getByPlaceholderText("我的答案") as HTMLTextAreaElement).value).toBe("要保留的答案");
     expect((screen.getByPlaceholderText(/围绕当前题目继续追问/) as HTMLTextAreaElement).value).toBe("补充信息");
   });
 });
@@ -341,7 +371,7 @@ test("真题卡片按钮发送明确的 question kind 与来源轮次", async ()
   expect(requests[4]).not.toHaveProperty("exercise_id");
   expect(requests[4]).not.toHaveProperty("solution_text");
   expect(screen.getAllByText("下列 Python 表达式的值是？")).toHaveLength(1);
-  expect(screen.getAllByRole("button", { name: "查看题目主卡" }).length).toBeGreaterThan(0);
+  expect(screen.getAllByRole("button", { name: "回到题目" }).length).toBeGreaterThan(0);
   const toggle = screen.getByRole("button", { name: "会话列表" });
   expect(toggle.getAttribute("aria-expanded")).toBe("false");
   fireEvent.click(toggle);
@@ -352,3 +382,123 @@ test("真题卡片按钮发送明确的 question kind 与来源轮次", async ()
   expect(screen.getAllByText("下列 Python 表达式的值是？")).toHaveLength(1);
 });
 
+
+
+test("同会话、同文案、切换资料清单项后发送最新 item_id", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const makeJson = (data: unknown, status = 200) =>
+    new Response(JSON.stringify(data), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url === "/api/conversations" && method === "GET") {
+        return makeJson({
+          items: [
+            {
+              id: "conv-mat-1",
+              title: "资料复习",
+              created_at: "2026-11-16T00:00:00Z",
+              updated_at: "2026-11-16T00:00:00Z",
+            },
+          ],
+          total: 1,
+        });
+      }
+      if (url === "/api/conversations/conv-mat-1" && method === "GET") {
+        return makeJson({
+          conversation: {
+            id: "conv-mat-1",
+            title: "资料复习",
+            created_at: "2026-11-16T00:00:00Z",
+            updated_at: "2026-11-16T00:00:00Z",
+          },
+          turns: [],
+          active_problem: null,
+          active_exercise: null,
+          record: null,
+        });
+      }
+      if (url === "/api/usage/today") {
+        return makeJson({
+          requests: { used: 0, limit: 30, remaining: 30, unlimited: false },
+          images: { used: 0, limit: 20, remaining: 20, unlimited: false },
+          site_exhausted: false,
+          reset_at: "2026-11-17T00:00:00+08:00",
+        });
+      }
+      if (url === "/api/papers" || url === "/api/papers?") {
+        return makeJson({ items: [], total: 0 });
+      }
+      if (url === "/api/conversations/conv-mat-1/turns" && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        requests.push(body);
+        const sse = `event: result\ndata: ${JSON.stringify({
+          request_id: body.request_id,
+          kind: "dynamic",
+          assistant_message: "已讲解条目 B",
+          result: null,
+          tutoring: null,
+          question: null,
+          question_results: null,
+          business_status: "succeeded",
+          retryable: false,
+        })}\n\n`;
+        return new Response(sse, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      }
+      return makeJson({ detail: `unexpected ${method} ${url}` }, 404);
+    }),
+  );
+
+  const props = {
+    downloads: {},
+    onDownload: () => {},
+    onOpenRecord: () => {},
+    openConversationId: "conv-mat-1",
+    storageKey: "test-switch-material-item",
+    onPrefillConsumed: () => {},
+  };
+
+  const { rerender } = render(
+    <ConversationWorkspace
+      {...props}
+      prefillDraft={{
+        conversationId: "conv-mat-1",
+        text: "请讲解我选中的资料知识点",
+        materialGuideId: "11111111-1111-4111-8111-111111111111",
+        materialItemId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        materialStudyMode: "explain",
+      }}
+    />,
+  );
+
+  await waitFor(() => {
+    const input = screen.getByPlaceholderText(/输入完整题干/) as HTMLTextAreaElement;
+    expect(input.value).toBe("请讲解我选中的资料知识点");
+  });
+
+  // 同会话、同文案，发送前改选条目 B
+  rerender(
+    <ConversationWorkspace
+      {...props}
+      prefillDraft={{
+        conversationId: "conv-mat-1",
+        text: "请讲解我选中的资料知识点",
+        materialGuideId: "11111111-1111-4111-8111-111111111111",
+        materialItemId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        materialStudyMode: "explain",
+      }}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() => expect(requests).toHaveLength(1));
+  expect(requests[0].material_item_id).toBe("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+});

@@ -239,3 +239,47 @@ def load_usage_config_state() -> UsageConfigState:
         )
     except (ValueError, QueryConfigError) as exc:
         return UsageConfigState(error=f"用量配置无效：{exc}")
+
+
+# ---------------------------------------------------------------------------
+# F019 第二阶段：个人资料 PDF 上传与隔离解析配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_MATERIAL_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_MATERIAL_MAX_PAGES = 80
+DEFAULT_MATERIAL_MAX_RANGE_PAGES = 40
+DEFAULT_MATERIAL_PARSE_TIMEOUT_SECONDS = 20.0
+DEFAULT_MATERIAL_MAX_PER_USER = 20
+
+
+@dataclass(frozen=True)
+class MaterialConfigState:
+    max_bytes: int = DEFAULT_MATERIAL_MAX_BYTES
+    max_pages: int = DEFAULT_MATERIAL_MAX_PAGES
+    max_range_pages: int = DEFAULT_MATERIAL_MAX_RANGE_PAGES
+    parse_timeout_seconds: float = DEFAULT_MATERIAL_PARSE_TIMEOUT_SECONDS
+    max_per_user: int = DEFAULT_MATERIAL_MAX_PER_USER
+
+
+# ---------------------------------------------------------------------------
+# F020：资料自愿贡献与公共题库审核配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONTRIBUTION_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_CONTRIBUTION_MAX_PAGES = 200
+DEFAULT_CONTRIBUTION_PARSE_TIMEOUT_SECONDS = 20.0
+
+
+@dataclass(frozen=True)
+class ContributionConfigState:
+    max_bytes: int = DEFAULT_CONTRIBUTION_MAX_BYTES
+    max_pages: int = DEFAULT_CONTRIBUTION_MAX_PAGES
+    parse_timeout_seconds: float = DEFAULT_CONTRIBUTION_PARSE_TIMEOUT_SECONDS
+    storage_dir: str | None = None
+
+
+def load_contribution_config_state() -> ContributionConfigState:
+    """读取自愿贡献资料存储配置（支持 CONTRIBUTION_STORAGE_DIR 覆盖）。"""
+
+    storage_dir = os.environ.get("CONTRIBUTION_STORAGE_DIR", "").strip() or None
+    return ContributionConfigState(storage_dir=storage_dir)

@@ -118,18 +118,18 @@ describe("会话轮次的展示修正", () => {
     expect(screen.queryByText(other.statement)).toBeNull();
   });
 
-  test("后续轮次只显示同版本题目引用，保留已查看事实和回主卡动作", () => {
+  test("后续轮次只显示同版本题目引用和回到题目动作，不暴露内部状态词", () => {
     const question = questionCard({ selected: true, answer_revealed: true,
       answer_detail: { state: "original", text: "ANSWER-ONCE" } });
     const key = `${question.question_id}:${question.build_id}:${question.content_sha256}`;
     const jump = vi.fn();
-    renderTurn({ turn: turn({ request_id: "followup", question }),
+    renderTurn({ turn: turn({ request_id: "followup", kind: "explain_question", question }),
       questionOwners: new Map([[key, "owner"]]), questionSnapshots: new Map([[key, question]]),
       onJumpToQuestion: jump });
     expect(screen.queryByText(question.statement)).toBeNull();
     expect(screen.queryByText("ANSWER-ONCE")).toBeNull();
-    expect(screen.getByText("答案已查看")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "查看题目主卡" }));
+    expect(screen.queryByText("答案已查看")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "回到题目" }));
     expect(jump).toHaveBeenCalledWith(key);
   });
 
@@ -184,9 +184,9 @@ describe("会话轮次的展示修正", () => {
     });
 
     expect(screen.getAllByText("已生成针对性练习题（待作答）")).toHaveLength(1);
-    expect(screen.getByText("生成练习")).toBeTruthy();
-    expect(screen.getByText("已保存到错题本。")).toBeTruthy();
-    expect(screen.getByText("保存到错题本")).toBeTruthy();
+    expect(screen.queryByText("生成练习")).toBeNull();
+    expect(screen.queryByText("已保存到错题本。")).toBeNull();
+    expect(screen.queryByText("保存到错题本")).toBeNull();
     expect(container.textContent).not.toContain("generate_exercise");
     expect(container.textContent).not.toContain("record_mistake");
   });
@@ -222,7 +222,7 @@ describe("会话轮次的展示修正", () => {
     expect(screen.getByText("查询结果")).toBeTruthy();
     expect(screen.getByText("高等数学（上）期末试卷")).toBeTruthy();
     // 目录没有登记日期时如实说明
-    expect(screen.getByText("日期未登记")).toBeTruthy();
+    expect(screen.getByText("时间待补充")).toBeTruthy();
     expect(container.textContent).not.toContain("paper-internal-id");
   });
 
@@ -260,7 +260,7 @@ describe("会话轮次的展示修正", () => {
       screen.getAllByText(/这道练习题已经完成评价/).length,
     ).toBe(1);
     expect(screen.getAllByText("未完成").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("评价作答")).toBeTruthy();
+    expect(screen.queryByText("评价作答")).toBeNull();
   });
 
   test("只带练习上下文的追问轮次不重复展示题目卡片提示", () => {
@@ -367,10 +367,59 @@ describe("会话轮次的展示修正", () => {
     // 回执不放作答表单，避免和题目主卡重复
     expect(screen.queryByLabelText("最终答案")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "查看题目主卡" }));
+    fireEvent.click(screen.getByRole("button", { name: "回到题目" }));
     expect(onJump).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "回到题目并订正" }));
     expect(onCorrect).toHaveBeenCalledTimes(1);
+  });
+
+  test("讲解轮次不再在卡片外重复展示来源标签，并过滤重复建议按钮", () => {
+    renderTurn({
+      turn: turn({
+        assistant_message: "已讲解。",
+        tutoring: {
+          kind: "explanation",
+          problem: {
+            id: "problem-1",
+            root_problem_id: "root-1",
+            version: 1,
+            status: "explained",
+            clarity: "clear",
+            statement_text: "求极限 lim x->0 sin(x)/x",
+            student_answer_text: null,
+            solution_text: null,
+            attachments: [],
+            source: {
+              type: "registered_paper",
+              paper_id: "paper-1",
+              paper_title: "2024-2025 高等数学期末",
+            },
+            self_reported_understood: false,
+            created_at: "2026-10-25T12:00:00+00:00",
+            updated_at: "2026-10-25T12:00:00+00:00",
+          },
+          knowledge_points: [{ name: "重要极限", explanation: "基本极限公式" }],
+          steps: [{ index: 1, title: "套用公式", content: "直接得 1" }],
+          final_answer: "1",
+          error_analysis: null,
+          uncertainties: [],
+          self_reported_understood: false,
+          record_id: null,
+        },
+        suggestions: [
+          { label: "讲解这道题", action: "讲解这道题", target_id: null },
+          { label: "保存到错题本", action: "保存到错题本", target_id: null },
+          { label: "生成一道变式", action: "生成一道变式", target_id: null },
+        ],
+      }),
+    });
+
+    expect(screen.getAllByText(/来源：2024-2025 高等数学期末/)).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "讲解这道题" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "保存到错题本" })).toBeNull();
+    expect(screen.getByRole("button", { name: "生成一道变式" })).toBeTruthy();
+    // 正常成功轮次不再渲染绿色“成功”状态胶囊
+    expect(screen.queryByText("成功")).toBeNull();
   });
 });
 
@@ -408,22 +457,124 @@ describe("真题讲解正文与讲解卡片不重复展开", () => {
     } as Partial<StoredTurn>);
   }
 
-  test("正文已经讲完时，讲解卡片默认收起而不是再展开一遍", () => {
-    const body =
-      "这道题考的是列表推导式，先看循环范围，再看条件过滤，最后才是取值表达式。" +
-      "第一步把 for 的范围写对，第二步补上 if 条件，第三步把结果放进方括号里。" +
-      "注意不要在方括号里写 return，也不要把结果拼成字符串。" +
-      "最后确认一下变量名，题目里给的变量叫 nums 和 limit，不要自己另起名字，" +
-      "也不要漏掉 if 后面的比较符号，很多同学会在这里丢分。";
-    renderTurn({ turn: explanationTurn(body) });
-    expect(screen.getByText(/正文已经完整讲解，需要时展开讲解卡片/)).toBeTruthy();
-    // 卡片里的步骤默认不展开，避免和正文重复。
-    expect(screen.queryByText("解题步骤")).toBeNull();
+  test.each(["complete", "truncated", "failed"] as const)(
+    "旧轮次正文改写了推导，仍只展示一次结构化讲解（%s）",
+    (reply_status) => {
+      const paraphrase = "先观察公式再检查选项。由于循环范围不同，本题选 B。";
+      const { container } = renderTurn({ turn: { ...explanationTurn(paraphrase), reply_status } });
+      expect(screen.queryByText(paraphrase)).toBeNull();
+      expect(screen.queryByText(/查看完整解析与答案/)).toBeNull();
+      expect(screen.getAllByText("解题步骤")).toHaveLength(1);
+      expect(screen.getAllByText("最终答案")).toHaveLength(1);
+      expect(container.querySelector(".lesson-sheet")?.textContent).not.toContain("解题步骤");
+      expect(screen.getByText("我懂了")).toBeTruthy();
+    },
+  );
+
+  test("已绑定题库原题的讲解卡只保留学习反馈和收藏动作", () => {
+    const question = questionCard({ selected: true });
+    renderTurn({ turn: { ...explanationTurn("已讲解。"), question } });
+    const lesson = screen.getByRole("button", { name: "我懂了" }).closest(".lesson-sheet");
+    expect(lesson?.textContent).toContain("加入错题本");
+    expect(lesson?.textContent).not.toContain("开始新题");
+    expect(lesson?.textContent).not.toContain("纠正题干");
   });
 
-  test("正文很短时仍然直接展示讲解卡片", () => {
-    renderTurn({ turn: explanationTurn("已讲解。") });
-    expect(screen.getByText("解题步骤")).toBeTruthy();
-    expect(screen.queryByText(/正文已经完整讲解/)).toBeNull();
+  test("讲解组合轮保留另一个问题的独立回答", () => {
+    renderTurn({
+      turn: {
+        ...explanationTurn("另一道题可用直接代入。"),
+        composite_results: [
+          { action: "explain_question", status: "success", message: "已讲解" },
+          { action: "followup_problem", status: "success", message: "已回答另一道题" },
+        ],
+      },
+    });
+    expect(screen.getByText("另一道题可用直接代入。")).toBeTruthy();
+    expect(screen.getAllByText("解题步骤")).toHaveLength(1);
+  });
+
+  test("查卷结果卡存在时，清洗历史或流式正文中的重复试卷表格与清单", () => {
+    const duplicatedBody = [
+      "已找到 1 份高等数学期末试卷：",
+      "| 试卷名称 | 学年 |",
+      "| --- | --- |",
+      "| 2024-2025高数AII期末考试试题 | 2024-2025 |",
+      "- 2024-2025高数AII期末考试试题（[下载](/api/papers/math-1/download)）",
+    ].join("\n");
+    renderTurn({
+      turn: turn({
+        assistant_message: duplicatedBody,
+        result: {
+          type: "result",
+          kind: "found",
+          message: "找到 1 份【高等数学】试卷（期末）。",
+          filters: { course: "高等数学", exam_type: "final" },
+          total: 1,
+          items: [
+            {
+              id: "math-1",
+              title: "2024-2025高数AII期末考试试题",
+              course: "高等数学",
+              academic_year: "2024-2025",
+              exam_type: "final",
+              exam_date: null,
+              download_url: "/api/papers/math-1/download",
+            },
+          ],
+        },
+      }),
+    });
+    expect(screen.getAllByText("2024-2025高数AII期末考试试题")).toHaveLength(1);
+    expect(screen.getByText("已找到 1 份高等数学期末试卷：")).toBeTruthy();
+  });
+
+  test("正文非空且 introduce 成功时不展示底部重复条，缺正文时也不泄露内部动作名", () => {
+    const { rerender } = renderTurn({
+      turn: turn({
+        assistant_message: "高等数学馆藏 14 份真题试卷，可以直接查看或下载原卷来复习。",
+        composite_results: [
+          {
+            action: "introduce",
+            status: "success",
+            message: "已确认复习科目为【高等数学】；馆藏真题试卷 14 份",
+          },
+        ],
+      }),
+    });
+
+    expect(screen.queryByText("介绍可用能力")).toBeNull();
+    expect(
+      screen.queryByText("已确认复习科目为【高等数学】；馆藏真题试卷 14 份"),
+    ).toBeNull();
+
+    rerender(
+      <ConversationTurn
+        turn={turn({
+          assistant_message: "",
+          composite_results: [
+            {
+              action: "introduce",
+              status: "success",
+              message: "已确认复习科目为【高等数学】；馆藏真题试卷 14 份",
+            },
+          ],
+        })}
+        onDownload={noop}
+        onRetry={noop}
+        onFeedback={noop}
+        onRecord={noop}
+        onCorrect={noop}
+        onSupplement={noop}
+        onNew={noop}
+        onIntentChoice={noop}
+        onOpenRecord={noop}
+        isLatestTurn
+        busy={false}
+      />,
+    );
+
+    expect(screen.queryByText("介绍可用能力")).toBeNull();
+    expect(screen.getByText(/已确认复习科目为【高等数学】/)).toBeTruthy();
   });
 });

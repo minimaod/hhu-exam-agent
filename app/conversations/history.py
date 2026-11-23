@@ -43,6 +43,7 @@ HISTORY_ARG_FIELDS: dict[str, set[str]] = {
         "number_label",
         "paper_id",
         "offset",
+        "limit",
         "continue_from_previous",
         "query",
         "scope",

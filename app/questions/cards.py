@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import quote
 
 from app.question_bank.models import (
+    QUESTION_TYPE_LABELS,
     AnswerDetail,
     AnswerSummary,
     QuestionSummary,
@@ -80,6 +81,7 @@ def _source(
     *,
     paper_id: str,
     paper_title: str | None,
+    course: str | None = None,
     exam_type: str | None,
     academic_year: str | None,
     number_label: str,
@@ -88,6 +90,7 @@ def _source(
     return QuestionSourceView(
         paper_id=paper_id,
         paper_title=paper_title,
+        course=course,
         exam_type=exam_type,
         academic_year=academic_year,
         question_number=number_label,
@@ -153,6 +156,7 @@ def card_from_summary(
         source=_source(
             paper_id=paper.paper_id,
             paper_title=paper.title,
+            course=paper.course,
             exam_type=paper.exam_type,
             academic_year=paper.academic_year,
             number_label=summary.number_label,
@@ -236,6 +240,7 @@ def card_from_record(
         source=_source(
             paper_id=str(record["paper_id"]),
             paper_title=str(record.get("paper_title") or "") or None,
+            course=str(record.get("course") or "") or None,
             exam_type=record.get("exam_type"),
             academic_year=record.get("academic_year"),
             number_label=str(record["number_label"]),
@@ -324,11 +329,10 @@ def compose_material(card: QuestionCard, evidence: EvidenceBundle) -> str:
     exam = {"midterm": "期中", "final": "期末"}.get(card.source.exam_type or "", "考试")
     year = card.source.academic_year or "年份未知"
     title = card.source.paper_title or card.source.paper_id
-    kind = {"choice": "选择题", "fill": "填空题", "code": "编程题"}[
-        card.question_type
-    ]
+    kind = QUESTION_TYPE_LABELS.get(card.question_type, "题目")
+    course_name = card.source.course or "历年真题"
     parts = [
-        f"【真题材料｜Python语言程序设计 {year} {exam} 第{card.number_label}题（{kind}）】",
+        f"【真题材料｜{course_name} {year} {exam} 第{card.number_label}题（{kind}）】",
         f"卷名：{title}",
         f"题干：{card.statement}",
     ]

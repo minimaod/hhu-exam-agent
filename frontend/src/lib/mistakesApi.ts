@@ -58,6 +58,7 @@ export type MistakeRecordDetail = {
   student_answer_text: string | null;
   solution_text: string | null;
   source: Source;
+  is_model_generated?: boolean;
   attachments: AttachmentView[];
   explanation: {
     knowledge_points: KnowledgePoint[];
@@ -72,6 +73,7 @@ export type MistakeRecordDetail = {
   revisions: RevisionView[];
   conversation_has_newer_version: boolean;
   newer_problem: ProblemRef | null;
+  primary_exercise?: ExerciseView | null;
   exercises?: ExerciseView[];
   created_at: string;
   updated_at: string;
@@ -297,6 +299,45 @@ export async function listMistakeRecords(
     throw new MistakesApiError("后端返回的错题列表格式不符合约定。");
   }
   return { items: payload.items, total: payload.total };
+}
+
+export async function createMistakeRecord(options: {
+  requestId: string;
+  conversationId: string;
+  problemId?: string;
+  title?: string;
+  feedbackText?: string;
+}): Promise<MistakeRecordDetail> {
+  const body: Record<string, unknown> = {
+    request_id: options.requestId,
+    conversation_id: options.conversationId,
+  };
+  if (options.problemId) {
+    body.problem_id = options.problemId;
+  }
+  if (options.title) {
+    body.title = options.title;
+  }
+  if (options.feedbackText) {
+    body.feedback_text = options.feedbackText;
+  }
+  let response: Response;
+  try {
+    response = await apiFetch(PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch {
+    throw new MistakesApiError("无法保存到错题本，请确认后端正在运行。");
+  }
+  await ensureOk(response);
+  const payload = await readJson(response);
+  if (!isMistakeRecordDetail(payload)) {
+    throw new MistakesApiError("后端返回的错题记录格式不符合约定。");
+  }
+  return payload;
 }
 
 export async function getMistakeRecord(
