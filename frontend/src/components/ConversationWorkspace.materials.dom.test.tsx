@@ -817,3 +817,83 @@ test("生成记录共用一张成果卡，工作台按知识点跳转、对照�
   expect(within(reopened).getByLabelText<HTMLTextAreaElement>("知识点批注").value).toBe("复习通量");
   expect(reads).toBeGreaterThanOrEqual(2);
 });
+
+test("资料进度请求限流后退避，生成完成后结束轮询", async () => {
+  const detail = makeDetail([makeMaterialItem()]);
+  let progressCalls = 0;
+  let progressStatus = 200;
+  let completeGeneration!: (response: Response) => void;
+  const pendingGeneration = new Promise<Response>((resolve) => {
+    completeGeneration = resolve;
+  });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/api/conversations")) {
+      return Response.json({ items: [detail.conversation], total: 1 });
+    }
+    if (url.endsWith(`/api/conversations/${cid}`)) return Response.json(detail);
+    if (url.endsWith(`/api/conversations/${cid}/materials/${mid}/generate`)) {
+      return pendingGeneration;
+    }
+    if (url.endsWith(`/api/conversations/${cid}/materials/progress`)) {
+      progressCalls += 1;
+      return Response.json({ items: [], chat_turn_request_id: null }, { status: progressStatus });
+    }
+    if (url.includes("/api/usage")) return Response.json(makeUsage());
+    return Response.json({ items: [] });
+  }));
+
+  vi.useFakeTimers();
+  let unmount: (() => void) | undefined;
+  const advance = (milliseconds: number) => act(async () => {
+    await vi.advanceTimersByTimeAsync(milliseconds);
+  });
+  try {
+    await act(async () => {
+      ({ unmount } = render(<ConversationWorkspace downloads={{}} onDownload={vi.fn()} onOpenRecord={vi.fn()} />));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /高数与物理复习/ }));
+    });
+    await advance(250);
+    expect(progressCalls).toBe(1);
+
+    progressStatus = 429;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "生成知识图谱" }));
+    });
+    await advance(250);
+    expect(progressCalls).toBe(2);
+    await advance(2_399);
+    expect(progressCalls).toBe(2);
+    await advance(1);
+    expect(progressCalls).toBe(3);
+    await advance(4_799);
+    expect(progressCalls).toBe(3);
+
+    progressStatus = 200;
+    await advance(1);
+    expect(progressCalls).toBe(4);
+    await advance(1_199);
+    expect(progressCalls).toBe(4);
+    await advance(1);
+    expect(progressCalls).toBe(5);
+
+    progressStatus = 429;
+    await act(async () => {
+      completeGeneration(Response.json({
+        artifact: makeArtifactDetail({ notesStatus: "none", quizStatus: "none", graphStatus: "ready" }),
+      }));
+    });
+    expect(progressCalls).toBe(6);
+
+    progressStatus = 200;
+    await advance(1_200);
+    expect(progressCalls).toBe(7);
+    await advance(60_000);
+    expect(progressCalls).toBe(7);
+  } finally {
+    unmount?.();
+    vi.useRealTimers();
+  }
+});

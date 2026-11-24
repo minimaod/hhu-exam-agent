@@ -157,6 +157,8 @@ type ConversationWorkspaceProps = {
 const STORAGE_KEY = "hhu-exam-review.current-conversation";
 const MAX_FILES = 4;
 const MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+const MATERIAL_PROGRESS_POLL_MS = 1_200;
+const MATERIAL_PROGRESS_MAX_POLL_MS = 30_000;
 
 function readStoredId(key: string): string | null {
   try {
@@ -2050,28 +2052,29 @@ export default function ConversationWorkspace({
       let cancelled = false;
       let timerId: number | null = null;
       let seenActive = Boolean(options?.initialActive);
+      let nextDelay = MATERIAL_PROGRESS_POLL_MS;
 
       const tick = async () => {
         if (cancelled) return;
         const res = await syncConversationProgress(conversationId);
         if (cancelled) return;
         if (res.ok) {
+          nextDelay = MATERIAL_PROGRESS_POLL_MS;
           if (res.active) {
             seenActive = true;
-          } else if (options?.reloadOnEmpty && seenActive && !optimisticTasksRef.current.has(conversationId)) {
+          } else if (!optimisticTasksRef.current.has(conversationId)) {
             stopProgressPolling(conversationId);
-            if (currentIdRef.current === conversationId) {
+            if (options?.reloadOnEmpty && seenActive && currentIdRef.current === conversationId) {
               void loadDetail(conversationId);
             }
             return;
-          } else if (options?.reloadOnEmpty && !seenActive && !optimisticTasksRef.current.has(conversationId)) {
-            stopProgressPolling(conversationId);
-            return;
           }
+        } else {
+          nextDelay = Math.min(nextDelay * 2, MATERIAL_PROGRESS_MAX_POLL_MS);
         }
         timerId = window.setTimeout(() => {
           void tick();
-        }, 600);
+        }, nextDelay);
       };
 
       progressPollStopRef.current.set(conversationId, () => {
