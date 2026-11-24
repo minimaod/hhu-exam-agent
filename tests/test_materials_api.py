@@ -273,8 +273,9 @@ def test_material_full_lifecycle_preview_isolation_and_delete(
         assert client_a.get(f"/api/conversations/{conv_id}").status_code == 404
 
 
-def test_readability_refreshes_legacy_pdf_text_without_overwriting_ocr(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("refresh_with", ["readability", "page_preview"])
+def test_material_refreshes_legacy_pdf_text_without_overwriting_ocr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh_with: str,
 ) -> None:
     from app.materials import service as mat_service
     from app.materials.ocr import OCR_PAGE_VERSION
@@ -315,11 +316,22 @@ def test_readability_refreshes_legacy_pdf_text_without_overwriting_ocr(
                 ],
             )
 
+        read_pdfs.clear()
+        pages_url = f"/api/materials/pdfs/{material_id}/pages"
         for _ in range(2):
-            response = client.post(readability_url, json=params, headers=TEST_CSRF_HEADERS)
-            assert response.status_code == 200
+            if refresh_with == "readability":
+                response = client.post(readability_url, json=params, headers=TEST_CSRF_HEADERS)
+                assert response.status_code == 200
+            else:
+                response = client.get(f"{pages_url}/1")
+                assert response.status_code == 200
+                assert response.json()["extracted_text"].strip() == original
 
-        assert read_pdfs.count((1, 2)) == 2
+        ocr = client.get(f"{pages_url}/2")
+        assert ocr.status_code == 200
+        assert ocr.json()["extracted_text"] == recognized
+        expected_range = (1, 2) if refresh_with == "readability" else (1, 1)
+        assert read_pdfs == [expected_range]
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
                 "SELECT extracted_text, parser_version FROM personal_material_pages "

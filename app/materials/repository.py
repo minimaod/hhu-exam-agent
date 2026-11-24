@@ -430,9 +430,9 @@ class MaterialRepository:
                 FROM personal_material_pages p
                 JOIN personal_materials m ON m.id = p.material_id
                 WHERE p.material_id = ? AND m.owner_id = ? AND m.status = 'active'
-                  AND p.page_no = ?
+                  AND p.page_no = ? AND p.parser_version != ?
                 """,
-                (material_id, self._owner_id, page_no),
+                (material_id, self._owner_id, page_no, PARSER_VERSION),
             ).fetchone()
             if row is None:
                 return None
