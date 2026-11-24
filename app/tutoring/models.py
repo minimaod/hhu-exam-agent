@@ -75,6 +75,34 @@ class KnowledgePoint(BaseModel):
     explanation: str = Field(min_length=1, max_length=800)
 
 
+def fit_knowledge_point_name(
+    value: str | None,
+    *,
+    fallback: str = "当前考点",
+    max_len: int = 80,
+) -> str:
+    """将派生知识点名称安全收敛到 KnowledgePoint.name 长度上限内。"""
+
+    text = " ".join((value or "").split())
+    if not text:
+        return fallback
+    if len(text) <= max_len:
+        return text
+    cutoff = max(1, max_len - 1)
+    head = text[:cutoff].rstrip()
+    # 避免截断在成对的 $ 行内公式内部留下半截 LaTeX
+    if head.count("$") % 2 == 1:
+        dollar_pos = head.rfind("$")
+        prefix = head[:dollar_pos].rstrip(" ，,、:：;；-")
+        if prefix:
+            head = prefix
+        else:
+            head = head.replace("$", "").strip()
+    if not head:
+        return fallback
+    return f"{head}…" if len(head) < max_len else head[:max_len]
+
+
 class Step(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -231,6 +259,7 @@ class RecordSummary(BaseModel):
     title: str
     statement_excerpt: str
     source: Source
+    is_model_generated: bool = False
     problem_version: int
     self_reported_understood: bool
     created_at: datetime

@@ -17,6 +17,7 @@ from app.conversations.repository import (
 )
 from app.querying.models import QueryFilters, ResultEvent
 from app.papers.models import PaperItem
+from tests.f012_support import TEST_MIGRATION_OWNER
 
 
 def build_result(kind: str = "found", course: str = "高等数学") -> ResultEvent:
@@ -335,7 +336,7 @@ def test_version_zero_but_complete_schema_is_adopted(tmp_path: Path) -> None:
         connection.commit()
 
     reopened = ConversationRepository(db_path)
-    reopened.initialize()
+    reopened.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION

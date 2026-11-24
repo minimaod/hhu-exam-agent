@@ -14,11 +14,12 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from app.conversations.models import Turn
+from app.question_bank.models import QUESTION_TYPE_LABELS
 from app.questions.models import QuestionCard, QuestionSelection
 
 REF_PATTERN = re.compile(r"^Q([1-9][0-9]{0,3})$")
 MAX_REFS = 200
-_QUESTION_KINDS = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+_QUESTION_KINDS = QUESTION_TYPE_LABELS
 
 
 @dataclass(frozen=True)
@@ -48,15 +49,27 @@ class RefEntry:
         }
 
 
+def card_identity(card_or_source: Any) -> tuple[str, str, str]:
+    """提取题卡、选中记录或练习来源的 (question_id, build_id, content_sha256) 三元组。"""
+
+    return (
+        str(getattr(card_or_source, "question_id", None) or ""),
+        str(getattr(card_or_source, "build_id", None) or ""),
+        str(getattr(card_or_source, "content_sha256", None) or ""),
+    )
+
+
 class RefTable:
-    """会话内短引用表；同一题目只保留第一次出现的绑定。"""
+    """会话内短引用表；按 (题号, build_id, 内容哈希) 保留首次出现的引用。"""
 
     def __init__(self, entries: Iterable[RefEntry]) -> None:
         self._entries = list(entries)
         self._by_ref = {entry.ref: entry for entry in self._entries}
         self._by_question: dict[str, RefEntry] = {}
+        self._by_identity: dict[tuple[str, str, str], RefEntry] = {}
         for entry in self._entries:
             self._by_question.setdefault(entry.question_id, entry)
+            self._by_identity.setdefault(card_identity(entry), entry)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -68,7 +81,27 @@ class RefTable:
     def resolve(self, ref: str) -> RefEntry | None:
         return self._by_ref.get(str(ref or "").strip().upper())
 
-    def by_question_id(self, question_id: str) -> RefEntry | None:
+    def by_question_id(
+        self,
+        question_id: str,
+        *,
+        build_id: str | None = None,
+        content_sha256: str | None = None,
+    ) -> RefEntry | None:
+        if build_id is not None and content_sha256 is not None:
+            return self._by_identity.get(
+                (str(question_id or ""), str(build_id or ""), str(content_sha256 or ""))
+            )
+        if build_id is not None or content_sha256 is not None:
+            for entry in self._entries:
+                if entry.question_id != question_id:
+                    continue
+                if build_id is not None and entry.build_id != build_id:
+                    continue
+                if content_sha256 is not None and entry.content_sha256 != content_sha256:
+                    continue
+                return entry
+            return None
         return self._by_question.get(question_id)
 
     def find(
@@ -88,9 +121,18 @@ class RefTable:
         return matches
 
     def public(self, selection: QuestionSelection | None) -> list[dict[str, Any]]:
-        selected_id = selection.question_id if selection is not None else None
+        if selection is None:
+            return [entry.public(selected=False) for entry in self._entries]
+        selected_ident = card_identity(selection)
+        has_version = bool(selected_ident[1] or selected_ident[2])
         return [
-            entry.public(selected=entry.question_id == selected_id)
+            entry.public(
+                selected=(
+                    card_identity(entry) == selected_ident
+                    if has_version
+                    else entry.question_id == selection.question_id
+                )
+            )
             for entry in self._entries
         ]
 
@@ -107,34 +149,36 @@ def build_ref_table(
     turns: Iterable[Turn],
     extra_cards: Iterable[QuestionCard] = (),
 ) -> RefTable:
-    """按轮次顺序给已展示过的题卡编号；同一题目复用第一次的引用。"""
+    """按轮次顺序给已展示过的题卡编号；同一题号不同版本分配新引用，保留旧引用指向。"""
 
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
     entries: list[RefEntry] = []
-    for turn in sorted(turns, key=lambda item: item.seq):
-        for card in list(turn.question_results) + ([turn.question] if turn.question else []):
-            if card is None or card.question_id in seen:
-                continue
-            if len(entries) >= MAX_REFS:
-                break
-            seen.add(card.question_id)
-            entries.append(
-                _entry(conversation_id, turn.request_id, card, f"Q{len(entries) + 1}")
-            )
+
+    def _register(card: QuestionCard | None, request_id: str) -> bool:
+        if card is None:
+            return False
+        ident = card_identity(card)
+        if ident in seen:
+            return False
         if len(entries) >= MAX_REFS:
+            return True
+        seen.add(ident)
+        entries.append(
+            _entry(conversation_id, request_id, card, f"Q{len(entries) + 1}")
+        )
+        return len(entries) >= MAX_REFS
+
+    for turn in sorted(turns, key=lambda item: item.seq):
+        full = False
+        for card in list(turn.question_results) + ([turn.question] if turn.question else []):
+            if _register(card, turn.request_id):
+                full = True
+                break
+        if full:
             break
     for card in extra_cards:
-        if card is None or card.question_id in seen or len(entries) >= MAX_REFS:
-            continue
-        seen.add(card.question_id)
-        entries.append(
-            _entry(
-                conversation_id,
-                card.source_request_id or "",
-                card,
-                f"Q{len(entries) + 1}",
-            )
-        )
+        if _register(card, (card.source_request_id if card else None) or ""):
+            break
     return RefTable(entries)
 
 
@@ -220,7 +264,11 @@ def build_workspace(
     shown = table.public(selection)
     selection_info: dict[str, Any] | None = None
     if selection is not None:
-        entry = table.by_question_id(selection.question_id)
+        entry = table.by_question_id(
+            selection.question_id,
+            build_id=selection.build_id,
+            content_sha256=selection.content_sha256,
+        )
         selection_info = {
             "ref": entry.ref if entry is not None else None,
             "question_id": selection.question_id,

@@ -81,7 +81,7 @@ def test_saved_attachment_is_resolved_and_deleted(
 def test_pending_attachment_cleanup_only_removes_old_unused(
     tmp_path: Path,
 ) -> None:
-    repository = ConversationRepository(tmp_path / "study.sqlite3")
+    repository = ConversationRepository.for_maintenance(tmp_path / "study.sqlite3")
     repository.initialize()
     conversation = repository.create_conversation()
     attachment = repository.create_attachment(

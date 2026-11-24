@@ -4,16 +4,23 @@
 图片/来源不合法和模型配置缺失由 app/main.py 的异常处理器统一映射。
 """
 
+import asyncio
+import logging
+from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from typing import Annotated, Callable, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.api.materials import _material_service
 from app.api.query import get_query_config
-from app.config import QueryConfigState
+from app.auth.dependencies import require_user
+from app.auth.models import User
+from app.config import MaterialConfigState, QueryConfigState
 from app.conversations.dispatch import DeepSeekIntentRouter
 from app.conversations.graph import SchedulerAgent
 from app.tutoring.exercise_llm import DeepSeekExerciseAgent
@@ -24,14 +31,28 @@ from app.conversations.models import (
     ConversationSummary,
     ExerciseView,
     TurnKind,
+    TurnProgressEvent,
 )
 from app.conversations.reply import StreamingReply
+from app.conversations.repository import ConversationRepository
 from app.conversations.service import (
     ConversationService,
     ConversationStoreState,
     TurnInput,
 )
+from app.conversations.turn_types import ExecuteTurn
 from app import images
+from app.materials.errors import MaterialCoverageRequiredError, MaterialTooLargeError
+from app.materials.models import (
+    ArtifactInputMode,
+    ArtifactDetailView,
+    ConversationDeleteImpactView,
+    ConversationMaterialItem,
+    ConversationMaterialProgressResponse,
+    ConversationMaterialUploadResponse,
+    ConversationMaterialsResponse,
+    OutputKind,
+)
 from app.mistakes.service import MistakeRecordService
 from app.memory.service import LearningMemoryService
 from app.papers.service import PaperService, get_paper_service
@@ -40,10 +61,12 @@ from app.querying.service import SSE_HEADERS, QueryService
 from app.questions.models import QuestionCard
 from app.questions.runtime import QuestionRuntime
 from app.sse import encode_sse_event
+from app.streaming import ClosingStreamingResponse, DISCONNECT_POLL_SECONDS
 from app.tutoring.llm import DeepSeekTutor
 from app.tutoring.models import Source
 
 router = APIRouter(tags=["conversations"])
+logger = logging.getLogger(__name__)
 
 MAX_QUERY_LENGTH = 1000
 MAX_TUTORING_TEXT = 2000
@@ -88,6 +111,15 @@ class TurnRequest(BaseModel):
     question_source_turn: UUID | None = None
     # 卡片按钮的确定性动作；只允许针对 question_id 指定的题，避免串到当前题。
     question_action: Literal["exercise", "record"] | None = None
+    # F019 第二阶段：个人资料清单项跳转学习；只传 ID，材料由后端校验并加载。
+    material_guide_id: UUID | None = None
+    material_item_id: UUID | None = None
+    material_study_mode: Literal["explain", "exercise", "evaluate"] | None = None
+    material_artifact_id: UUID | None = None
+    material_question_id: UUID | None = None
+    material_kc_id: str | None = Field(default=None, max_length=60)
+    material_workbench_view: Literal["notes", "graph", "quiz"] | None = None
+    material_source_pages: list[int] = Field(default_factory=list, max_length=40)
 
     @field_validator("query")
     @classmethod
@@ -174,6 +206,7 @@ def get_conversation_service_state(
     request: Request,
     config: Annotated[QueryConfigState, Depends(get_query_config)],
     papers: Annotated[PaperService, Depends(get_paper_service)],
+    user: Annotated[User, Depends(require_user)],
 ) -> ConversationServiceState:
     """按启动时的数据库状态和查询配置组装服务状态。
 
@@ -181,41 +214,58 @@ def get_conversation_service_state(
     """
 
     state: ConversationStoreState = request.app.state.conversation_store
-    if state.repository is None:
+    if state.db_path is None or state.error is not None:
         return ConversationServiceState(
             service=None,
             error=state.error or "本地学习数据暂时不可用，请稍后再试。",
         )
+    repository = ConversationRepository(state.db_path).scoped(user.id)
 
     settings = config.settings
+    client = getattr(request.app.state, "model_http_client", None)
+    quota = getattr(request.app.state, "usage_gate", None)
+    usage_config = getattr(request.app.state, "usage_config", None)
+    usage_error = getattr(usage_config, "error", None)
+    if usage_error:
+        # 额度配置无效时不创建任何真实模型适配器，避免绕过记账。
+        settings = None
+    lease_registry = getattr(request.app.state, "lease_registry", None)
     make_query: Callable[[], QueryService] | None = None
     make_tutor: Callable[[], DeepSeekTutor] | None = None
     make_router: Callable[[], DeepSeekIntentRouter] | None = None
     make_exercise_agent: Callable[[], DeepSeekExerciseAgent] | None = None
     make_scheduler: Callable[[], SchedulerAgent] | None = None
     make_reply: Callable[[], StreamingReply] | None = None
+    make_auth_verifier: Callable[[], Any] | None = None
     if settings is not None:
 
         def _make_query() -> QueryService:
             return QueryService(
-                understand=DeepSeekUnderstanding(settings),
+                understand=DeepSeekUnderstanding(
+                    settings, http_async_client=client
+                ),
                 papers=papers,
             )
 
         def _make_tutor() -> DeepSeekTutor:
-            return DeepSeekTutor(settings)
+            return DeepSeekTutor(settings, http_async_client=client)
 
         def _make_router() -> DeepSeekIntentRouter:
-            return DeepSeekIntentRouter(settings)
+            return DeepSeekIntentRouter(settings, http_async_client=client)
 
         def _make_exercise_agent() -> DeepSeekExerciseAgent:
-            return DeepSeekExerciseAgent(settings)
+            return DeepSeekExerciseAgent(settings, http_async_client=client)
 
         def _make_scheduler() -> SchedulerAgent:
-            return SchedulerAgent(settings)
+            return SchedulerAgent(settings, http_async_client=client)
 
         def _make_reply() -> StreamingReply:
-            return StreamingReply(settings)
+            return StreamingReply(settings, http_async_client=client)
+
+        def _make_auth_verifier():
+            from app.conversations.authorization import DeepSeekAuthVerifier
+
+            return DeepSeekAuthVerifier(settings, http_async_client=client)
 
         make_query = _make_query
         make_tutor = _make_tutor
@@ -223,9 +273,10 @@ def get_conversation_service_state(
         make_exercise_agent = _make_exercise_agent
         make_scheduler = _make_scheduler
         make_reply = _make_reply
+        make_auth_verifier = _make_auth_verifier
 
     records = MistakeRecordService(
-        state.repository,
+        repository,
         papers,
         make_tutor=make_tutor,
         tutoring_error=config.error,
@@ -234,10 +285,12 @@ def get_conversation_service_state(
     runtime: QuestionRuntime | None = getattr(
         request.app.state, "question_runtime", None
     )
-    memory = LearningMemoryService(state.repository.db_path, papers=papers)
+    memory = LearningMemoryService(
+        state.db_path, papers=papers, owner_id=user.id
+    )
     return ConversationServiceState(
         service=ConversationService(
-            repository=state.repository,
+            repository=repository,
             make_query=make_query,
             query_error=config.error,
             make_tutor=make_tutor,
@@ -246,11 +299,16 @@ def get_conversation_service_state(
             make_exercise_agent=make_exercise_agent,
             make_scheduler=make_scheduler,
             make_reply=make_reply,
+            make_auth_verifier=make_auth_verifier,
             papers=papers,
             records=records,
             memory=memory,
+            make_material_service=lambda: _material_service(request, user),
             attachments_root=images.ATTACHMENTS_ROOT,
             question_runtime=runtime,
+            quota=quota,
+            usage_error=usage_error,
+            lease_registry=lease_registry,
         ),
         error=None,
     )
@@ -319,6 +377,7 @@ async def create_turn(
     conversation_id: UUID,
     payload: TurnRequest,
     request: Request,
+    user: Annotated[User, Depends(require_user)],
     state: Annotated[
         ConversationServiceState,
         Depends(get_conversation_service_state),
@@ -354,8 +413,34 @@ async def create_turn(
             else None
         ),
         question_action=payload.question_action,
+        material_guide_id=(
+            str(payload.material_guide_id)
+            if payload.material_guide_id is not None
+            else None
+        ),
+        material_item_id=(
+            str(payload.material_item_id)
+            if payload.material_item_id is not None
+            else None
+        ),
+        material_study_mode=payload.material_study_mode,
+        material_artifact_id=(
+            str(payload.material_artifact_id)
+            if payload.material_artifact_id is not None
+            else None
+        ),
+        material_question_id=(
+            str(payload.material_question_id)
+            if payload.material_question_id is not None
+            else None
+        ),
+        material_kc_id=payload.material_kc_id,
+        material_workbench_view=payload.material_workbench_view,
+        material_source_pages=tuple(payload.material_source_pages),
     )
     prepared = service.prepare_turn(str(conversation_id), data)
+    if isinstance(prepared, ExecuteTurn) and prepared.operation == "dispatch":
+        return _stream_dispatch_turn(request, user.id, service, prepared)
 
     async def encode_stream():
         async for event in service.stream_prepared(prepared, request):
@@ -366,6 +451,104 @@ async def create_turn(
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+
+
+class _WorkerRequest(Request):
+    async def is_disconnected(self) -> bool:
+        # The response owns subscription lifetime. The worker owns the turn.
+        return False
+
+
+def _material_turn_tasks(
+    request: Request,
+) -> dict[tuple[str, str, str], asyncio.Task[None]]:
+    tasks = getattr(request.app.state, "material_turn_tasks", None)
+    if tasks is None:
+        tasks = request.app.state.material_turn_tasks = {}
+    return tasks
+
+
+def _stream_dispatch_turn(
+    request: Request, owner_id: str, service: ConversationService, prepared: ExecuteTurn
+) -> StreamingResponse:
+    tasks = _material_turn_tasks(request)
+    key = (owner_id, prepared.conversation_id, prepared.request_id)
+    events: asyncio.Queue[str | None] = asyncio.Queue()
+    subscribed = True
+    started = False
+
+    async def run_turn() -> None:
+        nonlocal started
+        started = True
+        try:
+            worker_request = _WorkerRequest(request.scope)
+            async with aclosing(service.stream_prepared(prepared, worker_request)) as stream:
+                async for event in stream:
+                    if subscribed and isinstance(event, TurnProgressEvent) and event.stage == "generating_material":
+                        tasks[key] = worker
+                    if subscribed:
+                        events.put_nowait(encode_sse_event(event))
+        except Exception:
+            logger.exception("会话轮次执行失败")
+        finally:
+            tasks.pop(key, None)
+            if subscribed:
+                events.put_nowait(None)
+
+    worker = asyncio.create_task(run_turn())
+
+    def unsubscribe() -> None:
+        nonlocal subscribed
+        if not subscribed:
+            return
+        subscribed = False
+        if key not in tasks and not worker.done() and not worker.cancelling():
+            if started:
+                worker.cancel()
+            else:
+                # Let stream_prepared enter its lease finalizer before cancellation.
+                asyncio.get_running_loop().call_soon(worker.cancel)
+
+    async def encode_stream():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(events.get(), timeout=DISCONNECT_POLL_SECONDS)
+                except TimeoutError:
+                    if await request.is_disconnected():
+                        return
+                    continue
+                if event is None:
+                    return
+                yield event
+        finally:
+            unsubscribe()
+            if key not in tasks:
+                with suppress(asyncio.CancelledError):
+                    await worker
+
+    return ClosingStreamingResponse(
+        encode_stream(), on_close=unsubscribe, media_type="text/event-stream", headers=SSE_HEADERS
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/turns/{request_id}/stop-material",
+    status_code=204,
+    summary="停止当前会话中的资料生成轮次",
+)
+async def stop_material_turn(
+    conversation_id: UUID,
+    request_id: UUID,
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[ConversationServiceState, Depends(get_conversation_service_state)],
+) -> Response:
+    await run_in_threadpool(require_service(state)._require_owned_conversation, str(conversation_id))
+    task = _material_turn_tasks(request).get((user.id, str(conversation_id), str(request_id)))
+    if task is not None and not task.cancelling():
+        task.cancel()
+    return Response(status_code=204)
 
 
 @router.post(
@@ -398,10 +581,9 @@ def reveal_exercise_solution(
     ],
 ) -> ExerciseView:
     service = require_service(state)
-    ex = service._repository.reveal_exercise_solution(
-        str(exercise_id), conversation_id=str(conversation_id)
+    return service.reveal_exercise_solution(
+        str(conversation_id), str(exercise_id)
     )
-    return service._build_exercise_view(ex, allow_solution=True)
 
 
 _QUESTION_HEADERS = {
@@ -475,4 +657,311 @@ def read_question_answer(
     )
     return JSONResponse(
         content=card.model_dump(mode="json"), headers=_QUESTION_HEADERS
+    )
+
+
+# ---------------------------------------------------------------------------
+# F019 第三阶段：会话内个人资料上传、关联、按需生成与删除影响接口
+# ---------------------------------------------------------------------------
+
+
+class ConversationMaterialGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    coverage_mode: ArtifactInputMode = "full"
+
+    start_page: int | None = Field(default=None, ge=1)
+    end_page: int | None = Field(default=None, ge=1)
+    course_hint: str | None = Field(default=None, max_length=80)
+    outputs: list[OutputKind] = Field(
+        default_factory=lambda: ["notes", "quiz", "graph"],
+        min_length=1,
+        max_length=3,
+    )
+
+
+class ConversationMaterialGenerateResponse(BaseModel):
+    artifact: ArtifactDetailView
+    turn_request_id: str | None = None
+
+
+class ConversationMaterialDetachResponse(BaseModel):
+    detached: bool = True
+    conversation_id: str
+    material_id: str
+
+
+class DeleteConversationResponse(BaseModel):
+    deleted: bool = True
+    conversation_id: str
+
+
+@router.get(
+    "/conversations/{conversation_id}/materials",
+    response_model=ConversationMaterialsResponse,
+    summary="列出会话关联的个人 PDF 资料与生成产物",
+)
+def list_conversation_materials(
+    conversation_id: UUID,
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> ConversationMaterialsResponse:
+    require_service(state)._require_owned_conversation(str(conversation_id))
+    items = _material_service(request, user).list_conversation_materials(
+        str(conversation_id)
+    )
+    return ConversationMaterialsResponse(
+        conversation_id=str(conversation_id), items=items
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/materials/upload",
+    status_code=201,
+    response_model=ConversationMaterialUploadResponse,
+    summary="在会话内上传个人 PDF 资料并做基础可读性检查",
+)
+async def upload_conversation_material(
+    conversation_id: UUID,
+    file: Annotated[UploadFile, File(...)],
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> ConversationMaterialUploadResponse:
+    conv_svc = require_service(state)
+    conv_svc._require_owned_conversation(str(conversation_id))
+    mat_svc = _material_service(request, user)
+    config: MaterialConfigState = getattr(
+        request.app.state, "material_config", MaterialConfigState()
+    )
+    data = await file.read(config.max_bytes + 1)
+    if len(data) > config.max_bytes:
+        mb = config.max_bytes // (1024 * 1024)
+        raise MaterialTooLargeError(f"单个 PDF 文件不能超过 {mb} MB。")
+    res = await mat_svc.upload_pdf_for_conversation(
+        conversation_id=str(conversation_id),
+        filename=file.filename,
+        data=data,
+    )
+    req_id = conv_svc.record_material_upload_turn(
+        str(conversation_id),
+        item=res.item,
+        assistant_notice=res.assistant_notice,
+        is_attach=False,
+    )
+    return ConversationMaterialUploadResponse(
+        conversation_id=res.conversation_id,
+        item=res.item,
+        assistant_notice=res.assistant_notice,
+        turn_request_id=req_id,
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/materials/{material_id}/attach",
+    response_model=ConversationMaterialItem,
+    summary="将已有个人资料关联到当前学习会话",
+)
+def attach_conversation_material(
+    conversation_id: UUID,
+    material_id: UUID,
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> ConversationMaterialItem:
+    conv_svc = require_service(state)
+    conv_svc._require_owned_conversation(str(conversation_id))
+    item = _material_service(request, user).attach_to_conversation(
+        conversation_id=str(conversation_id),
+        material_id=str(material_id),
+    )
+    ov = item.readability
+    title = item.material.display_name.rsplit(".", 1)[0]
+    if ov is not None and not ov.sufficient:
+        notice = (
+            f"已将《{title}》关联到当前会话（共 {item.material.page_count} 页）。"
+            "该资料可用文字不足，目前仅支持原件预览。"
+        )
+    else:
+        notice = (
+            f"已将《{title}》关联到当前会话，共 {item.material.page_count} 页。"
+            "你想先看章节笔记、做一套章节测试，还是看知识图谱？也可以指定页码。"
+        )
+    conv_svc.record_material_upload_turn(
+        str(conversation_id),
+        item=item,
+        assistant_notice=notice,
+        is_attach=True,
+    )
+    return item
+
+
+@router.delete(
+    "/conversations/{conversation_id}/materials/{material_id}",
+    response_model=ConversationMaterialDetachResponse,
+    summary="从当前会话移除个人资料关联（保留原 PDF 与既有成果）",
+)
+def detach_conversation_material(
+    conversation_id: UUID,
+    material_id: UUID,
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> ConversationMaterialDetachResponse:
+    require_service(state)._require_owned_conversation(str(conversation_id))
+    _material_service(request, user).detach_from_conversation(
+        conversation_id=str(conversation_id),
+        material_id=str(material_id),
+    )
+    return ConversationMaterialDetachResponse(
+        detached=True,
+        conversation_id=str(conversation_id),
+        material_id=str(material_id),
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/materials/{material_id}/generate",
+    response_model=ConversationMaterialGenerateResponse,
+    summary="在会话内按需生成章节笔记、章节测试或知识图谱",
+)
+async def generate_conversation_material_artifact(
+    conversation_id: UUID,
+    material_id: UUID,
+    body: ConversationMaterialGenerateRequest,
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> ConversationMaterialGenerateResponse:
+    conv_svc = require_service(state)
+    conv_svc._require_owned_conversation(str(conversation_id))
+    mat_svc = _material_service(request, user)
+    mat_svc.attach_to_conversation(
+        conversation_id=str(conversation_id), material_id=str(material_id)
+    )
+    detail = mat_svc.get_material_detail(str(material_id))
+    max_range = getattr(
+        getattr(mat_svc, "_config", None), "max_range_pages", 40
+    )
+    start_page = body.start_page or 1
+    end_page = (
+        body.end_page
+        if body.end_page is not None
+        else (
+            start_page
+            if body.start_page is not None
+            else min(detail.material.page_count, max_range)
+        )
+    )
+    try:
+        artifact = await mat_svc.generate_or_get_artifact(
+            str(material_id),
+            start_page=start_page,
+            end_page=end_page,
+            course_hint=body.course_hint,
+            outputs=body.outputs,
+            conversation_id=str(conversation_id),
+            coverage_mode=body.coverage_mode,
+        )
+    except MaterialCoverageRequiredError as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
+    req_id = conv_svc.record_material_artifact_turn(
+        str(conversation_id),
+        artifact=artifact,
+        outputs=list(body.outputs),
+    )
+    return ConversationMaterialGenerateResponse(
+        artifact=artifact,
+        turn_request_id=req_id,
+    )
+
+
+class ConversationMaterialTurnProgressResponse(ConversationMaterialProgressResponse):
+    chat_turn_request_id: str | None = None
+
+
+@router.get(
+    "/conversations/{conversation_id}/materials/progress",
+    response_model=ConversationMaterialTurnProgressResponse,
+    summary="查询当前会话正在进行的个人资料处理进度",
+)
+async def get_conversation_material_progress(
+    conversation_id: UUID,
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> ConversationMaterialTurnProgressResponse:
+    conv_svc = require_service(state)
+    await run_in_threadpool(conv_svc._require_owned_conversation, str(conversation_id))
+    material_service = _material_service(request, user)
+    items = material_service.list_conversation_progress(str(conversation_id))
+    chat_turn_request_id = next(
+        (
+            request_id
+            for owner_id, conv_id, request_id in _material_turn_tasks(request)
+            if owner_id == user.id and conv_id == str(conversation_id)
+        ),
+        None,
+    )
+    return ConversationMaterialTurnProgressResponse(
+        conversation_id=str(conversation_id),
+        items=items,
+        chat_turn_request_id=chat_turn_request_id,
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/delete-impact",
+    response_model=ConversationDeleteImpactView,
+    summary="查询删除会话前的影响范围（交代关联资料与成果去向）",
+)
+def get_conversation_delete_impact(
+    conversation_id: UUID,
+    request: Request,
+    user: Annotated[User, Depends(require_user)],
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> ConversationDeleteImpactView:
+    require_service(state)._require_owned_conversation(str(conversation_id))
+    return _material_service(request, user).get_conversation_delete_impact(
+        str(conversation_id)
+    )
+
+
+@router.delete(
+    "/conversations/{conversation_id}",
+    response_model=DeleteConversationResponse,
+    summary="删除学习会话（保留关联资料与已生成成果）",
+)
+def delete_conversation(
+    conversation_id: UUID,
+    state: Annotated[
+        ConversationServiceState,
+        Depends(get_conversation_service_state),
+    ],
+) -> DeleteConversationResponse:
+    require_service(state).delete_conversation(str(conversation_id))
+    return DeleteConversationResponse(
+        deleted=True, conversation_id=str(conversation_id)
     )

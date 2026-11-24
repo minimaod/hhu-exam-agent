@@ -10,6 +10,7 @@ import pytest
 from app.conversations import schema
 from app.conversations.errors import ConversationStorageError
 from app.conversations.repository import ConversationRepository
+from tests.f012_support import TEST_MIGRATION_OWNER
 
 
 def file_hash(path: Path) -> str:
@@ -141,7 +142,7 @@ def test_v3_database_backfills_first_attempt(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
     build_v3(path)
 
-    ConversationRepository(path).initialize()
+    ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
@@ -169,7 +170,7 @@ def test_v3_database_backfills_first_attempt(tmp_path: Path) -> None:
         assert linked == [("att-v3", "student_solution")]
 
     repo = ConversationRepository(path)
-    repo.initialize()
+    repo.initialize(migration_owner=TEST_MIGRATION_OWNER)
     exercise = repo.get_exercise("ex-v3")
     assert exercise is not None
     assert len(exercise.attempts) == 1
@@ -190,7 +191,7 @@ def test_v4_migration_failure_rolls_back(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(schema, "_v4_migration_statements", broken_statements)
 
     with pytest.raises(ConversationStorageError):
-        ConversationRepository(path).initialize()
+        ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     assert file_hash(path) == before
     with sqlite3.connect(path) as connection:

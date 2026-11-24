@@ -37,15 +37,15 @@ export default function QueryResult({
 }: QueryResultProps) {
   if (result.kind === "found") {
     return (
-      <div>
+      <section className="turn-archive">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <h3 className="text-sm font-semibold text-ink">查询结果</h3>
-          <p className="text-[11px] text-slate-500">共 {result.total} 份</p>
+          <p className="text-xs text-slate-500">共 {result.total} 份</p>
         </div>
         {showMessage && (
           <p className="mt-1 text-sm leading-6 text-slate-700">{result.message}</p>
         )}
-        <ul className="mt-3 space-y-3">
+        <ul className="paper-index mt-3">
           {result.items.map((paper) => (
             <PaperCard
               key={paper.id}
@@ -55,14 +55,14 @@ export default function QueryResult({
             />
           ))}
         </ul>
-      </div>
+      </section>
     );
   }
 
   const copy = NON_FOUND_COPY[result.kind];
 
   return (
-    <div className="rounded-2xl border border-slate-200/90 bg-white/90 p-5 shadow-card backdrop-blur">
+    <div className="reading-note">
       <p className="text-sm font-semibold text-ink">{copy.title}</p>
       {showMessage && (
         <p className="mt-1 text-sm leading-6 text-slate-700">{result.message}</p>

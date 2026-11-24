@@ -85,9 +85,9 @@ class FakeChatModel:
 
 
 def setup_service(tmp_path: Path):
-    db_path = tmp_path / "study.sqlite3"
-    repo = ConversationRepository(db_path)
-    repo.initialize()
+    from tests.f012_support import scoped_repository
+
+    repo = scoped_repository(tmp_path / "study.sqlite3")
 
     papers_repo = PaperRepository(DEFAULT_PAPERS_ROOT)
     papers = PaperService(papers_repo)

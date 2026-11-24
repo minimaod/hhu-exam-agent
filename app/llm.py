@@ -38,6 +38,7 @@ def build_chat_model(
     json_mode: bool = True,
     http_async_client: Any | None = None,
     stream_usage: bool = False,
+    max_retries: int = 0,
 ) -> ChatOpenAI:
     extra_body: dict[str, Any] = {
         "thinking": {"type": "disabled"},
@@ -54,7 +55,7 @@ def build_chat_model(
         api_key=settings.api_key,
         base_url=settings.base_url,
         timeout=timeout,
-        max_retries=0,
+        max_retries=max_retries,
         temperature=0.0,
         extra_body=extra_body,
         # 仅测试注入 MockTransport；生产路径为 None。

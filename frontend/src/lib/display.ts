@@ -167,9 +167,55 @@ export function formatExamDate(value: string | null | undefined): {
 } {
   const trimmed = value?.trim();
   if (!trimmed) {
-    return { text: "日期未登记", known: false };
+    return { text: "时间待补充", known: false };
   }
   return { text: trimmed, known: true };
+}
+
+/** 文件大小：小于 1 MB 按 KB 显示，否则换算为保留一位小数的 MB。 */
+export function formatFileSize(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) {
+    return "大小未知";
+  }
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// 与 MathText 的公式定界规则一致：$$…$$、\[…\]、\(…\)、$…$
+const MATH_TOKEN = /(?<!\\)\$\$[\s\S]+?\$\$|(?<!\\)\\\[[\s\S]+?\\\]|(?<!\\)\\\([\s\S]+?\\\)|(?<![\\$])\$(?!\$)(?:\\.|[^\\$\n])+?\$|(?<opener>(?<!\\)(?:\$\$|\\\[|\\\(|(?<!\$)\$(?!\$)))/g;
+
+/**
+ * 按长度截断文本，但不把公式从中间切开：截断点落在公式内部时退到公式之前，
+ * 公式位于开头时保留整段公式；被截断时补省略号。与后端 app/text_excerpt.py 规则一致。
+ */
+export function mathSafeExcerpt(text: string, limit: number, ellipsis = "…"): string {
+  const compact = text.trim();
+  if (compact.length <= limit) {
+    return compact;
+  }
+  let cut = Math.max(limit - ellipsis.length, 1);
+  for (const match of compact.matchAll(MATH_TOKEN)) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (start >= cut) {
+      break;
+    }
+    if (match.groups?.opener) {
+      cut = start;
+      break;
+    }
+    if (cut < end) {
+      cut = start > 0 ? start : end;
+      break;
+    }
+  }
+  const head = compact.slice(0, cut).trimEnd();
+  if (head.length >= compact.length) {
+    return compact;
+  }
+  return `${head}${ellipsis}`;
 }
 
 export type SuggestionIntent = "answer" | "reveal" | "save" | "practice" | "chat";
@@ -200,7 +246,7 @@ const VERDICT_LABELS: Record<string, string> = {
   wrong_independent: "独立作答错误",
   correct_independent: "独立作答正确",
   after_reveal: "看答案后作答",
-  insufficient: "证据不足",
+  insufficient: "记录不足",
   unclear: "独立性未确认",
   self_report: "学生自述",
   no_attempt: "尚未作答",
@@ -229,3 +275,112 @@ export type DownloadState = {
 };
 
 export type DownloadStates = Record<string, DownloadState>;
+
+type LessonContent = {
+  knowledge_points: { name: string; explanation: string }[];
+  steps: { index: number; title: string; content: string }[];
+  final_answer: string;
+  error_analysis: string | null;
+};
+
+export function explanationBody(lesson: LessonContent): string {
+  const sections: string[] = [];
+  if (lesson.knowledge_points.length) {
+    sections.push("## 知识点\n\n" + lesson.knowledge_points.map(
+      ({ name, explanation }) => "- **" + name + "**：" + explanation,
+    ).join("\n"));
+  }
+  if (lesson.error_analysis) {
+    sections.push("## 你解法中的具体问题\n\n" + lesson.error_analysis);
+  }
+  if (lesson.steps.length) {
+    sections.push("## 解题步骤\n\n" + lesson.steps.map(
+      ({ index, title, content }) => "### " + index + ". " + title + "\n\n" + content,
+    ).join("\n\n"));
+  }
+  if (lesson.final_answer) sections.push("## 最终答案\n\n" + lesson.final_answer);
+  return sections.join("\n\n");
+}
+
+function paperFields(value: string) {
+  const text = value.normalize("NFKC");
+  const year = text.match(/\d{4}\s*[-—–]\s*\d{4}|\d{4}\s*级/)?.[0];
+  const term = text.match(/第([一二两12])学期/)?.[1];
+  const type = text.match(/期[中末]/)?.[0];
+  const core = normalizeText(text
+    .replace(/\d{4}\s*[-—–]\s*\d{4}|\d{4}\s*级/g, "")
+    .replace(/学年|第[一二两12]学期/g, "")
+    .replace(/(?:期末|期中)?(?:考试)?(?:试题及答案|试题|试卷|真题)/g, ""));
+  return {
+    year: year ? normalizeText(year) : "",
+    term: term ? (term === "一" || term === "1" ? "1" : "2") : "",
+    type,
+    core: core.replace(/^高数/, "高等数学"),
+  };
+}
+
+const PAPER_METADATA_HEADINGS = /^(?:序号|学年|学期|学年学期|年份|科目|课程|试卷|卷名|试卷名称|试卷标题|考试|考试类型|考试日期|考试时间|类型|时间|日期|下载|原卷|原始pdf|pdf|下载链接|试卷下载)$/i;
+
+function isAcademicYear(value: string): boolean {
+  return /^\d{4}\s*[-—–]\s*\d{4}(?:\s*学年)?$/.test(value.trim());
+}
+
+function isPaperMetadata(value: string): boolean {
+  return isAcademicYear(value) || /^(?:\d{1,2}|[-—–]+|\d{4}[-—–]\d{1,2}[-—–]\d{1,2}|期[中末]|高等数学|高数|时间待补充|(?:下载)?(?:原始)?pdf|下载(?:原卷)?|原卷)$/i.test(value.normalize("NFKC").replace(/\s/g, ""));
+}
+
+function tableCells(line: string): string[] {
+  return line.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
+}
+
+/** 已有结果卡时移除能核实的试卷清单，保留每一条额外分析和比较。 */
+export function stripDuplicatePaperList(
+  assistantText: string,
+  items: ReadonlyArray<{ id: string; title: string }>,
+): string {
+  if (!assistantText.trim() || !items.length) return assistantText;
+
+  const entries = items.map(({ title }) => paperFields(title));
+  const matchesEntry = (value: string) => {
+    const content = value
+      .replace(/^\s*(?:[-*•]|\d+[.)、])\s+/, "")
+      .replace(/\[([^\]]+)\]\(\/api\/papers\/([^/)]+)\/download\)/g, "$1")
+      .replace(/[（(]\s*(?:下载(?:原卷)?|(?:原始)?PDF)\s*[)）]\s*$/i, "")
+      .replace(/^【|】$/g, "")
+      .replace(/[*_]/g, "");
+    const fields = paperFields(content);
+    return entries.some((entry) =>
+      fields.core.length >= 3 &&
+      fields.core === entry.core &&
+      fields.year === entry.year &&
+      (!fields.term || !entry.term || fields.term === entry.term) &&
+      (!fields.type || !entry.type || fields.type === entry.type),
+    );
+  };
+  const matchesRow = (row: string) => {
+    const cells = tableCells(row);
+    // 年份和题名可分列。只忽略已知目录字段，保留包含额外说明的行。
+    return matchesEntry(cells.filter((cell) => !isPaperMetadata(cell) || isAcademicYear(cell)).join(" ")) ||
+      (cells.some(matchesEntry) && cells.every((cell) => isPaperMetadata(cell) || matchesEntry(cell)));
+  };
+
+  const lines = assistantText.split(/\r?\n/);
+  const kept: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const separator = lines[index + 1] ?? "";
+    if (line.includes("|") && /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(separator)) {
+      let next = index + 2;
+      while (next < lines.length && lines[next].includes("|") && lines[next].trim()) next += 1;
+      const rows = lines.slice(index + 2, next);
+      const metadataTable = tableCells(line).every((cell) => PAPER_METADATA_HEADINGS.test(normalizeText(cell).replace(/[／/]/g, "")));
+      if (!metadataTable || !rows.length || !rows.every(matchesRow)) {
+        kept.push(...lines.slice(index, next));
+      }
+      index = next - 1;
+    } else if (!matchesEntry(line)) {
+      kept.push(line);
+    }
+  }
+  return kept.join("\n").trim();
+}

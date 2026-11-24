@@ -27,6 +27,7 @@ from app.questions.errors import (
     QuestionSelectionInvalidError,
     QuestionSourceChangedError,
 )
+from app.question_bank.models import QUESTION_TYPE_LABELS
 from app.questions.models import QuestionCard
 
 READ_ONLY_ACTIONS = frozenset(
@@ -35,6 +36,7 @@ READ_ONLY_ACTIONS = frozenset(
         "view_question_detail",
         "list_shown_questions",
         "view_learning_summary",
+        "list_conversation_materials",
     }
 )
 
@@ -51,7 +53,7 @@ _MEMORY_DETAIL_KEYS = frozenset(
     }
 )
 
-_KINDS = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+_KINDS = QUESTION_TYPE_LABELS
 
 
 class ReadToolMixin:
@@ -105,7 +107,13 @@ class ReadToolMixin:
             if paper_state is None
             else None,
         )
-        ctx.ref_table = build_ref_table(ctx.conversation_id, turns)
+        ctx.ref_table = build_ref_table(
+            ctx.conversation_id,
+            turns,
+            extra_cards=[ctx.question_card]
+            if (selection is not None and ctx.question_card is not None)
+            else [],
+        )
         return ctx.workspace
 
     def _ensure_ref_table(self, ctx: _DynamicContext) -> Any:
@@ -147,7 +155,11 @@ class ReadToolMixin:
         if ref:
             return table.resolve(ref)
         if ctx.question_selection is not None:
-            return table.by_question_id(ctx.question_selection.question_id)
+            return table.by_question_id(
+                ctx.question_selection.question_id,
+                build_id=ctx.question_selection.build_id,
+                content_sha256=ctx.question_selection.content_sha256,
+            )
         return None
 
     def _view_question_detail_outcome(

@@ -1,9 +1,18 @@
 import type { Source } from "../lib/conversationsApi";
 
-export default function SourceBadge({ source }: { source: Source }) {
+export default function SourceBadge({
+  source,
+  isModelGenerated = false,
+}: {
+  source: Source;
+  isModelGenerated?: boolean;
+}) {
+  if (isModelGenerated) {
+    return <span className="source-note">模型生成 · 非真题</span>;
+  }
   if (source.type === "none") {
     return (
-      <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] text-slate-500">
+      <span className="source-note">
         未关联来源
       </span>
     );
@@ -12,7 +21,7 @@ export default function SourceBadge({ source }: { source: Source }) {
     return (
       <span
         title={source.text ?? ""}
-        className="max-w-full truncate rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] text-amber-800"
+        className="source-note source-note--unverified"
       >
         学生自述来源（未核实）：{source.text}
       </span>
@@ -21,9 +30,9 @@ export default function SourceBadge({ source }: { source: Source }) {
   return (
     <span
       title={source.paper_title ?? source.paper_id ?? ""}
-      className="max-w-full truncate rounded-full border border-river/30 bg-river/10 px-2.5 py-0.5 text-[11px] text-river"
+      className="source-note text-river"
     >
-      已登记来源：{source.paper_title ?? source.paper_id}
+      来源：{source.paper_title ?? source.paper_id}
     </span>
   );
 }

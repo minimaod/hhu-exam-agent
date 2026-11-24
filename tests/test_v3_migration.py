@@ -9,6 +9,7 @@ import pytest
 from app.conversations import schema
 from app.conversations.errors import ConversationStorageError
 from app.conversations.repository import ConversationRepository
+from tests.f012_support import TEST_MIGRATION_OWNER
 
 
 def file_hash(path: Path) -> str:
@@ -62,7 +63,7 @@ def build_v2(path: Path, *, version: int = 2) -> None:
 def test_empty_database_initializes_to_current(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
     repo = ConversationRepository(path)
-    repo.initialize()
+    repo.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
@@ -84,7 +85,7 @@ def test_v2_database_migrates_to_current(tmp_path: Path) -> None:
     build_v2(path)
 
     repo = ConversationRepository(path)
-    repo.initialize()
+    repo.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
@@ -114,7 +115,7 @@ def test_v3_migration_failure_rolls_back(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(schema, "_v3_migration_statements", broken_statements)
 
     with pytest.raises(ConversationStorageError):
-        ConversationRepository(path).initialize()
+        ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     assert file_hash(path) == before
     with sqlite3.connect(path) as connection:

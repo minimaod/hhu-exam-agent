@@ -136,6 +136,18 @@ class QuestionRepository:
         rows = self.conn.execute("SELECT * FROM papers").fetchall()
         return {str(row["paper_id"]): dict(row) for row in rows}
 
+    def papers_by_course(self, course: str) -> dict[str, dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM papers WHERE course = ?", (course,)).fetchall()
+        return {str(row["paper_id"]): dict(row) for row in rows}
+
+    def courses(self) -> set[str]:
+        rows = self.conn.execute("SELECT DISTINCT course FROM questions").fetchall()
+        return {str(row[0]) for row in rows if row[0]}
+
+    def question_courses(self) -> dict[str, str]:
+        rows = self.conn.execute("SELECT question_id, course FROM questions").fetchall()
+        return {str(row["question_id"]): str(row["course"]) for row in rows}
+
     def get_paper(self, paper_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM papers WHERE paper_id = ?", (paper_id,)).fetchone()
         return dict(row) if row else None

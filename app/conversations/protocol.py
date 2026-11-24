@@ -38,6 +38,10 @@ ActionType = Literal[
     "view_question_detail",
     "list_shown_questions",
     "view_learning_summary",
+    # F019 第三阶段：会话内个人资料查询与按需生成。
+    "list_conversation_materials",
+    "generate_material_artifact",
+    "solve_uploaded_exam",
 ]
 
 ActionStatus = Literal["success", "failed", "clarification"]

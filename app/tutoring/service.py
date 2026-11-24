@@ -12,6 +12,7 @@ from pathlib import Path
 from app.conversations.errors import AttachmentNotFoundError, InvalidImageError
 from app.conversations.repository import AttachmentRecord, ProblemRecord
 from app.images import resolve_attachment
+from app.text_excerpt import math_safe_excerpt
 from app.tutoring.models import (
     AttachmentView,
     Explanation,
@@ -22,6 +23,7 @@ from app.tutoring.models import (
 )
 
 _RECORD_TITLE_MAX = 40
+_RECORD_TITLE_STORAGE_MAX = 80
 
 
 def build_problem_view(
@@ -115,9 +117,7 @@ def build_needs_clarification(problem: ProblemRecord) -> NeedsClarificationResul
 
 
 def record_title(statement: str) -> str:
-    text = " ".join(statement.split())
-    if not text:
+    title = math_safe_excerpt(statement, _RECORD_TITLE_MAX)
+    if not title or title == "…" or len(title) > _RECORD_TITLE_STORAGE_MAX:
         return "未命名错题"
-    if len(text) <= _RECORD_TITLE_MAX:
-        return text
-    return text[: _RECORD_TITLE_MAX - 1] + "…"
+    return title

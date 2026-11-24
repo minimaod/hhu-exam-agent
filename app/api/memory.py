@@ -19,6 +19,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 
+from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.conversations.errors import ConversationStorageError
 from app.memory.models import (
     LearningMemoryView,
@@ -47,17 +49,20 @@ class MemoryServiceState:
 def get_memory_service_state(
     request: Request,
     papers: Annotated[PaperService, Depends(get_paper_service)],
+    user: Annotated[User, Depends(require_user)],
 ) -> MemoryServiceState:
     """数据库不可用时先返回状态，参数校验通过后再决定是否 503。"""
 
     state = request.app.state.conversation_store
-    if state.repository is None:
+    if state.db_path is None or state.error is not None:
         return MemoryServiceState(
             service=None,
             error=state.error or _STORAGE_MESSAGE,
         )
     return MemoryServiceState(
-        service=LearningMemoryService(state.repository.db_path, papers=papers),
+        service=LearningMemoryService(
+            state.db_path, papers=papers, owner_id=user.id
+        ),
         error=None,
     )
 

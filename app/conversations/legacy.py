@@ -31,6 +31,7 @@ from app.conversations.repository import (
     ProblemRecord,
     UpdatedProblem,
 )
+from app.quota.errors import quota_of
 from app.conversations.turn_types import (
     ExecuteTurn,
     TurnInput,
@@ -349,9 +350,11 @@ class LegacyFlowMixin:
         card = self._resolve_question_card(
             conversation_id, data.question_source_turn, data.question_id
         )
-        if data.student_answer_text and (
-            card.question_type != "choice"
-            or data.student_answer_text not in {option.label for option in card.options}
+        if (
+            data.student_answer_text
+            and card.question_type == "choice"
+            and card.options
+            and data.student_answer_text not in {option.label for option in card.options}
         ):
             raise TurnInvalidError("请选择这道选择题实际提供的选项。")
         turn = self._repository.start_turn(
@@ -451,7 +454,7 @@ class LegacyFlowMixin:
             )
             return
         except QueryError as exc:
-            yield self._failure_event(prepared, exc.code, exc.message, state)
+            yield self._failure_event(prepared, exc.code, exc.message, state, quota=quota_of(exc))
             return
         except Exception:
             logger.exception("会话意图判断失败")
@@ -635,6 +638,7 @@ class LegacyFlowMixin:
                 request_id=prepared.request_id,
                 code=event.code,
                 message=event.message,
+                quota=event.quota,
             )
             return
 
@@ -865,7 +869,7 @@ class LegacyFlowMixin:
             await finish(holder["payload"])
         except QueryError as exc:
             queue.put_nowait(
-                self._failure_event(prepared, exc.code, exc.message, state)
+                self._failure_event(prepared, exc.code, exc.message, state, quota=quota_of(exc))
             )
         except ConversationStorageError:
             queue.put_nowait(_storage_error_event(prepared))
@@ -935,7 +939,7 @@ class LegacyFlowMixin:
                 tutoring=payload,
             )
         except QueryError as exc:
-            yield self._failure_event(prepared, exc.code, exc.message, state)
+            yield self._failure_event(prepared, exc.code, exc.message, state, quota=quota_of(exc))
         except ConversationStorageError:
             yield _storage_error_event(prepared)
         except Exception:

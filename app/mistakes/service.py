@@ -9,7 +9,7 @@ import asyncio
 import logging
 import json
 from collections.abc import AsyncIterator
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,7 +56,9 @@ from app.mistakes.models import (
 from app.papers.errors import CatalogUnavailableError
 from app.papers.service import PaperService
 from app.querying.errors import QueryError
+from app.quota.errors import quota_of
 from app.streaming import SENTINEL, stream_events
+from app.text_excerpt import math_safe_excerpt
 from app.tutoring.llm import DeepSeekTutor
 from app.tutoring.models import (
     AttachmentView,
@@ -91,23 +93,39 @@ class CorrectionInput:
     solution_text: str | None
 
 
-class _CorrectionGate:
-    """同一记录同时只允许一个纠正；本地单进程足够。"""
+_STANDALONE_TITLE_PREFIX = "【自主练习主题】"
+_PLACEHOLDER_FINAL_ANSWER = "（请先独立作答，完成后再查看参考解答）"
+_PLACEHOLDER_STEP_TITLE = "独立作答提示"
 
-    def __init__(self) -> None:
-        self._locked: set[str] = set()
-        self._guard = asyncio.Lock()
 
-    async def acquire(self, record_id: str) -> bool:
-        async with self._guard:
-            if record_id in self._locked:
-                return False
-            self._locked.add(record_id)
-            return True
+def _is_placeholder_explanation(explanation: Any) -> bool:
+    if explanation is None:
+        return False
+    final_answer = str(getattr(explanation, "final_answer", "") or "").strip()
+    if final_answer == _PLACEHOLDER_FINAL_ANSWER:
+        return True
+    steps = list(getattr(explanation, "steps", None) or [])
+    if len(steps) == 1 and str(getattr(steps[0], "title", "") or "").strip() == _PLACEHOLDER_STEP_TITLE:
+        return True
+    return False
 
-    async def release(self, record_id: str) -> None:
-        async with self._guard:
-            self._locked.discard(record_id)
+
+def _is_standalone_anchor(statement_text: str | None, explanation: Any) -> bool:
+    text = str(statement_text or "").strip()
+    if text.startswith(_STANDALONE_TITLE_PREFIX):
+        return True
+    return _is_placeholder_explanation(explanation)
+
+
+def _clean_standalone_title(raw_title: str, knowledge_point: str | None) -> str:
+    title = str(raw_title or "").strip()
+    if title.startswith(_STANDALONE_TITLE_PREFIX):
+        cleaned = title[len(_STANDALONE_TITLE_PREFIX) :].strip()
+        if cleaned:
+            return cleaned[:80]
+        kp = str(knowledge_point or "").strip()
+        return kp[:80] if kp else "自主练习"
+    return title or (str(knowledge_point or "").strip()[:80] or "自主练习")
 
 
 class MistakeRecordService:
@@ -125,7 +143,6 @@ class MistakeRecordService:
         self._make_tutor = make_tutor
         self._tutoring_error = tutoring_error
         self._attachments_root = attachments_root
-        self._gate = _CorrectionGate()
 
     def tutoring_available(self) -> bool:
         return self._make_tutor is not None
@@ -253,81 +270,61 @@ class MistakeRecordService:
             ),
         )
         exercises_rows = self._repository.list_exercises_by_root_problem(row.root_problem_id)
-        exercise_views = []
-        for ex in exercises_rows:
-            eval_view = None
-            if ex.evaluation_json:
-                with suppress(Exception):
-                    eval_view = ExerciseEvaluation.model_validate(json.loads(ex.evaluation_json))
-            ref_sol = (
-                ex.reference_solution_text
-                if (ex.status in ("submitted", "revealed") or ex.revealed_solution_at)
-                else None
+        exercise_views = [
+            self._repository.view_from_exercise(ex) for ex in exercises_rows
+        ]
+        is_standalone = _is_standalone_anchor(row.statement_text, row.explanation)
+        primary_exercise: ExerciseView | None = None
+        if is_standalone and exercise_views:
+            # 自主练习锚点以真实生成的练习题为主体，不把当前题再列进关联类似练习。
+            primary_exercise = next(
+                (ex for ex in exercise_views if ex.problem_id == row.problem_id),
+                exercise_views[0],
             )
-            attempt_views = []
-            for attempt in ex.attempts:
-                attempt_eval = None
-                if attempt.evaluation_json:
-                    with suppress(Exception):
-                        attempt_eval = ExerciseEvaluation.model_validate(
-                            json.loads(attempt.evaluation_json)
-                        )
-                attempt_views.append(
-                    ExerciseAttemptView(
-                        id=attempt.id,
-                        attempt_no=attempt.attempt_no,
-                        kind=attempt.kind,  # type: ignore[arg-type]
-                        student_answer_text=attempt.student_answer_text,
-                        student_solution_text=attempt.student_solution_text,
-                        answered_after_revealed=attempt.answered_after_revealed,
-                        evaluation=attempt_eval,
-                        request_id=attempt.request_id,
-                        attachments=[],
-                        created_at=attempt.created_at,
-                        updated_at=attempt.updated_at,
-                    )
-                )
-            exercise_views.append(
-                ExerciseView(
-                    id=ex.id,
-                    conversation_id=ex.conversation_id,
-                    problem_id=ex.problem_id,
-                    root_problem_id=ex.root_problem_id,
-                    statement_text=ex.statement_text,
-                    knowledge_point=ex.knowledge_point,
-                    status=ex.status,  # type: ignore[arg-type]
-                    student_answer_text=ex.student_answer_text,
-                    student_solution_text=ex.student_solution_text,
-                    revealed_solution_at=ex.revealed_solution_at,
-                    answered_after_revealed=ex.answered_after_revealed,
-                    evaluation=eval_view,
-                    reference_solution_text=ref_sol,
-                    attachments=[],
-                    attempts=attempt_views,
-                    created_at=ex.created_at,
-                    updated_at=ex.updated_at,
-                )
-            )
+            exercise_views = [ex for ex in exercise_views if ex.id != primary_exercise.id]
+
+        title = _clean_standalone_title(
+            row.title, primary_exercise.knowledge_point if primary_exercise else None
+        ) if is_standalone else row.title
+        statement_text = (
+            primary_exercise.statement_text
+            if (is_standalone and primary_exercise is not None)
+            else row.statement_text
+        )
+        explanation = (
+            None
+            if (is_standalone and _is_placeholder_explanation(row.explanation))
+            else row.explanation
+        )
+        student_answer_text = row.student_answer_text
+        solution_text = row.solution_text
+        if primary_exercise is not None:
+            if not student_answer_text:
+                student_answer_text = primary_exercise.student_answer_text
+            if not solution_text:
+                solution_text = primary_exercise.student_solution_text
 
         return MistakeRecordDetail(
             id=row.id,
-            title=row.title,
+            title=title,
             conversation_id=row.conversation_id,
             problem_id=row.problem_id,
             root_problem_id=row.root_problem_id,
             problem_version=row.problem_version,
-            statement_text=row.statement_text,
-            student_answer_text=row.student_answer_text,
-            solution_text=row.solution_text,
+            statement_text=statement_text,
+            student_answer_text=student_answer_text,
+            solution_text=solution_text,
             source=row.source,
+            is_model_generated=is_standalone,
             attachments=attachments,
-            explanation=row.explanation,
+            explanation=explanation,
             followups=[FollowupView(**item) for item in row.followups],
             feedback=feedback,
             self_reported_understood=row.self_reported_understood,
             revisions=revisions,
             conversation_has_newer_version=has_newer,
             newer_problem=newer,
+            primary_exercise=primary_exercise,
             exercises=exercise_views,
             created_at=row.created_at,
             updated_at=row.updated_at,
@@ -463,12 +460,6 @@ class MistakeRecordService:
             revision_created=False,
         )
 
-    async def begin_correction(self, record_id: str) -> bool:
-        return await self._gate.acquire(record_id)
-
-    async def release_correction(self, record_id: str) -> None:
-        await self._gate.release(record_id)
-
     async def corrections(
         self,
         record_id: str,
@@ -480,30 +471,28 @@ class MistakeRecordService:
 
         row = self._repository.get_record(record_id)
         if row is None:
-            await self._gate.release(record_id)
             raise MistakeRecordNotFoundError("错题记录不存在。")
 
         request_input = self.correction_input(payload)
-        try:
-            async for event in stream_events(
-                lambda queue: self._produce_correction(
-                    row, request_id, payload, request_input, queue
-                ),
-                request,
-                timeout=CORRECTION_TIMEOUT_SECONDS,
-                timeout_event=RecordCorrectionErrorEvent(
-                    record_id=record_id,
-                    request_id=request_id,
-                    code="TUTORING_FAILED",
-                    message=_TIMEOUT_MESSAGE,
-                ),
-                is_terminal=lambda item: isinstance(
-                    item, (RecordCorrectionResultEvent, RecordCorrectionErrorEvent)
-                ),
-            ):
+        events = stream_events(
+            lambda queue: self._produce_correction(
+                row, request_id, payload, request_input, queue
+            ),
+            request,
+            timeout=CORRECTION_TIMEOUT_SECONDS,
+            timeout_event=RecordCorrectionErrorEvent(
+                record_id=record_id,
+                request_id=request_id,
+                code="TUTORING_FAILED",
+                message=_TIMEOUT_MESSAGE,
+            ),
+            is_terminal=lambda item: isinstance(
+                item, (RecordCorrectionResultEvent, RecordCorrectionErrorEvent)
+            ),
+        )
+        async with aclosing(events):
+            async for event in events:
                 yield event
-        finally:
-            await self._gate.release(record_id)
 
     async def _produce_correction(
         self,
@@ -644,6 +633,7 @@ class MistakeRecordService:
                 reason="correction" if changed else "retutor",
                 new_snapshot=snapshot,
                 request_input=request_input,
+                expected_updated_at=record.updated_at,
             )
             queue.put_nowait(
                 RecordCorrectionResultEvent(
@@ -662,6 +652,7 @@ class MistakeRecordService:
                     request_id=request_id,
                     code=exc.code,
                     message=exc.message,
+                    quota=quota_of(exc),  # type: ignore[arg-type]
                 )
             )
         except TutoringUnavailableError as exc:
@@ -680,6 +671,15 @@ class MistakeRecordService:
             InvalidImageError,
             SourceInvalidError,
         ) as exc:
+            queue.put_nowait(
+                RecordCorrectionErrorEvent(
+                    record_id=record.id,
+                    request_id=request_id,
+                    code="TUTORING_FAILED",
+                    message=str(exc),
+                )
+            )
+        except (MistakeRecordConflictError, MistakeRecordNotFoundError) as exc:
             queue.put_nowait(
                 RecordCorrectionErrorEvent(
                     record_id=record.id,
@@ -755,7 +755,7 @@ class MistakeRecordService:
             root_problem_id=problem.root_problem_id,
             problem_version=problem.version,
             request_id=request_id,
-            title=(title or record_title(problem.statement_text))[:80],
+            title=title[:80] if title else record_title(problem.statement_text),
             statement_text=problem.statement_text,
             student_answer_text=problem.student_answer_text,
             solution_text=problem.solution_text,
@@ -812,13 +812,32 @@ class MistakeRecordService:
         )
 
     def _summary(self, row: RecordRow) -> RecordSummary:
-        compact = " ".join(row.statement_text.split())
-        excerpt = compact if len(compact) <= 90 else compact[:89] + "…"
+        is_standalone = _is_standalone_anchor(row.statement_text, row.explanation)
+        title = row.title
+        statement_text = row.statement_text
+        if is_standalone:
+            exercises_rows = self._repository.list_exercises_by_root_problem(
+                row.root_problem_id
+            )
+            primary_ex = next(
+                (ex for ex in exercises_rows if ex.problem_id == row.problem_id),
+                exercises_rows[0] if exercises_rows else None,
+            )
+            title = _clean_standalone_title(
+                row.title,
+                primary_ex.knowledge_point if primary_ex is not None else None,
+            )
+            if primary_ex is not None and primary_ex.statement_text.strip():
+                statement_text = primary_ex.statement_text
+
+        # 截断时不切断公式，避免列表摘要出现半截 LaTeX 源码。
+        excerpt = math_safe_excerpt(statement_text, 90)
         return RecordSummary(
             id=row.id,
-            title=row.title,
+            title=title,
             statement_excerpt=excerpt,
             source=row.source,
+            is_model_generated=is_standalone,
             problem_version=row.problem_version,
             self_reported_understood=row.self_reported_understood,
             created_at=row.created_at,

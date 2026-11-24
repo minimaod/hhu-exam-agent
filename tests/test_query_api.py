@@ -323,7 +323,7 @@ def test_response_has_no_key_or_disk_path(
     assert "file_path" not in text
 
 
-def test_without_key_existing_features_still_work(real_client: TestClient) -> None:
-    assert post_query(real_client).status_code == 503
-    assert real_client.get("/api/health").status_code == 200
-    assert real_client.get("/api/papers").status_code == 200
+def test_without_key_existing_features_still_work(legacy_client: TestClient) -> None:
+    assert post_query(legacy_client).status_code == 503
+    assert legacy_client.get("/api/health").status_code == 200
+    assert legacy_client.get("/api/papers").status_code == 200

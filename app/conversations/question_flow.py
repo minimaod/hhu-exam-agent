@@ -21,12 +21,14 @@ from app.conversations.models import (
     ActionResultItem,
     SuggestionItem,
     Turn,
+    TurnErrorEvent,
     TurnEvent,
     TurnMessageDeltaEvent,
     TurnProgressEvent,
     TurnResultEvent,
     reply_state as _reply_state,
 )
+from app.quota.errors import QuotaError, quota_of
 from app.conversations.reply import (
     build_material,
     material_to_payload,
@@ -52,6 +54,7 @@ from app.questions.models import (
     QuestionCard,
     QuestionSelection,
 )
+from app.questions.runtime import QuestionRuntime
 
 logger = logging.getLogger("app.conversations.service")
 
@@ -69,6 +72,7 @@ class QuestionFlowMixin:
     def question_asset(
         self, conversation_id: str, question_id: str, asset_id: str, build_id: str
     ):
+        self._require_owned_conversation(conversation_id)
         try:
             selection = self._require_question_selection(
                 conversation_id, question_id, build_id
@@ -88,6 +92,7 @@ class QuestionFlowMixin:
         self, conversation_id: str, question_id: str, build_id: str, kind: str, page: int
     ):
         """用户主动打开来源：验证原卷后才记查看事实，不改变当前选题。"""
+        self._require_owned_conversation(conversation_id)
         card = self._find_candidate_card(conversation_id, question_id, build_id)
         if card is None:
             raise QuestionNotFoundError("该来源不属于当前会话的题目。")
@@ -114,6 +119,7 @@ class QuestionFlowMixin:
     def question_answer(
         self, conversation_id: str, question_id: str, build_id: str
     ) -> QuestionCard:
+        self._require_owned_conversation(conversation_id)
         selection = self._require_question_selection(
             conversation_id, question_id, build_id
         )
@@ -177,14 +183,16 @@ class QuestionFlowMixin:
         """详情页只从快照重建卡片；仅为已开放对象补答案正文。"""
 
         updates: dict[str, Any] = {}
+        source_availability: dict[tuple[str, str], tuple[bool, bool]] = {}
         if turn.question_results:
             results = []
             for card in turn.question_results:
                 selection = self._repository.find_question_selection_for_card(
                     conversation_id, card.question_id, card.build_id, card.content_sha256
                 )
+                if isinstance(self.questions, QuestionRuntime):
+                    card = self.questions.with_source_links(card, conversation_id, source_availability)
                 results.append(QuestionCard.model_validate({**card.model_dump(),
-                    "source_url": answer_url_for(conversation_id, card.question_id, card.build_id).replace("/answer?", "/source?"),
                     "source_views": (selection.snapshot.get("source_views", []) if selection else []),
                     "answer_url": answer_url_for(conversation_id, card.question_id, card.build_id) if card.answer.available else None,
                 }))
@@ -215,9 +223,10 @@ class QuestionFlowMixin:
                     or card.build_id != turn.question.build_id
                 ):
                     card = turn.question
+            if isinstance(self.questions, QuestionRuntime):
+                card = self.questions.with_source_links(card, conversation_id, source_availability)
             card = card.model_copy(
                 update={
-                    "source_url": answer_url_for(conversation_id, card.question_id, card.build_id).replace("/answer?", "/source?"),
                     "answer_url": (
                         answer_url_for(
                             conversation_id, card.question_id, card.build_id
@@ -281,7 +290,13 @@ class QuestionFlowMixin:
                     lambda stage, message: None,
                 )
             except QueryError as exc:
-                yield self._failure_event(prepared, exc.code, exc.message, state)
+                yield self._failure_event(
+                    prepared,
+                    exc.code,
+                    exc.message,
+                    state,
+                    quota=quota_of(exc),
+                )
                 return
             except Exception:
                 logger.exception("真题变式生成失败")
@@ -457,6 +472,15 @@ class QuestionFlowMixin:
         except QuestionError as exc:
             yield self._failure_event(prepared, exc.code, exc.message, state)
             return
+        except QuotaError as exc:
+            yield self._failure_event(
+                prepared,
+                exc.code,
+                exc.message,
+                state,
+                quota=quota_of(exc),
+            )
+            return
         except Exception:
             logger.exception("真题讲解失败")
             yield self._failure_event(
@@ -550,13 +574,26 @@ class QuestionFlowMixin:
                 message="正在组织讲解",
             )
             meta: dict[str, Any] = {}
-            async for piece in self._reply_pieces(self._make_reply(), material, meta):
-                yield TurnMessageDeltaEvent(
+            try:
+                async for piece in self._reply_pieces(self._make_reply(), material, meta):
+                    yield TurnMessageDeltaEvent(
+                        conversation_id=prepared.conversation_id,
+                        request_id=prepared.request_id,
+                        seq=int(meta["deltas"]),
+                        delta=piece[:400],
+                    )
+            except QuotaError as exc:
+                # 讲解、目标绑定和正文材料都已经落盘；保留 completed，
+                # 通知前端 results 已保存，额度恢复后可 /reply 重生成。
+                yield TurnErrorEvent(
                     conversation_id=prepared.conversation_id,
                     request_id=prepared.request_id,
-                    seq=int(meta["deltas"]),
-                    delta=piece[:400],
+                    code=exc.code,  # type: ignore[arg-type]
+                    message=exc.message,
+                    quota=quota_of(exc),  # type: ignore[arg-type]
+                    saved=True,
                 )
+                return
             text = str(meta.pop("text", "") or "")
             if text:
                 message = text

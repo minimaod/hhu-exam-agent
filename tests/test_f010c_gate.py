@@ -121,10 +121,10 @@ def _exercise(attempts, *, status: str = "submitted", **values):
 def _evaluation(*, needs_supplement: bool) -> str:
     return json.dumps(
         {
-            "is_correct": None,
-            "final_answer_assessment": "依据不足",
-            "step_by_step_analysis": "只写了答案",
-            "guidance": "请补充过程",
+            "is_correct": None if needs_supplement else True,
+            "final_answer_assessment": "依据不足" if needs_supplement else "最终答案正确",
+            "step_by_step_analysis": "只写了答案" if needs_supplement else "步骤完整",
+            "guidance": "请补充过程" if needs_supplement else "继续巩固",
             "needs_supplement": needs_supplement,
         },
         ensure_ascii=False,

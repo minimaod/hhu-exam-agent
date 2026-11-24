@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.conversations.models import ExerciseView
-from app.querying.models import ErrorCode
+from app.querying.models import ErrorCode, QuotaInfo
 from app.tutoring.models import (
     AttachmentView,
     Explanation,
@@ -61,6 +61,7 @@ class MistakeRecordDetail(BaseModel):
     student_answer_text: str | None
     solution_text: str | None
     source: Source
+    is_model_generated: bool = False
     attachments: list[AttachmentView]
     explanation: Explanation | None
     followups: list[FollowupView]
@@ -69,6 +70,7 @@ class MistakeRecordDetail(BaseModel):
     revisions: list[RevisionView]
     conversation_has_newer_version: bool
     newer_problem: ProblemRef | None
+    primary_exercise: ExerciseView | None = None
     exercises: list[ExerciseView] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
@@ -111,6 +113,7 @@ class RecordCorrectionErrorEvent(BaseModel):
     request_id: str
     code: RecordCorrectionErrorCode
     message: str
+    quota: QuotaInfo | None = None
 
 
 RecordCorrectionEvent = (

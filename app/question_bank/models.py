@@ -10,9 +10,20 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.papers.models import ExamType as CatalogExamType
 from app.question_bank.config import MAX_BROWSE_LIMIT
 
-QuestionType = Literal["choice", "fill", "code"]
+QUESTION_TYPES: tuple[str, ...] = ("choice", "fill", "code", "solve", "proof", "judge")
+QUESTION_TYPE_LABELS: dict[str, str] = {
+    "choice": "选择题",
+    "fill": "填空题",
+    "code": "编程题",
+    "solve": "解答题",
+    "proof": "证明题",
+    "judge": "判断题",
+}
+
+QuestionType = Literal["choice", "fill", "code", "solve", "proof", "judge"]
 ExamType = Literal["midterm", "final"]
 SearchStatus = Literal["ok", "no_match", "bank_not_built", "bank_unavailable"]
 SearchMode = Literal["hybrid", "keyword_only", "vector_only", "browse"]
@@ -65,7 +76,7 @@ class PaperRef(BaseModel):
     paper_id: str
     title: str
     course: str
-    exam_type: ExamType | None = None
+    exam_type: CatalogExamType | None = None
     academic_year: str | None = None
 
 

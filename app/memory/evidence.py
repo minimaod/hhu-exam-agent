@@ -25,6 +25,7 @@ from app.memory.models import (
     build_entry_id,
 )
 from app.papers.courses import normalize_course
+from app.text_excerpt import math_safe_excerpt
 
 # (课程, 试卷标题)；目录不可用或试卷未登记时返回 (None, None)。
 PaperLookup = Callable[[str | None], tuple[str | None, str | None]]
@@ -306,6 +307,30 @@ def _apply_correction(
         entry.note = note
 
 
+def _resolve_course(
+    paper_lookup: PaperLookup,
+    *,
+    question_paper_id: str | None = None,
+    problem_paper_id: str | None = None,
+    confirmed_course: str | None = None,
+) -> tuple[str | None, str, str | None]:
+    """按 试卷 > 题目所属试卷 > 会话已确认科目 的优先级解析课程与来源。"""
+
+    paper_id = question_paper_id or problem_paper_id
+    course, paper_title = _course_from_paper(paper_lookup, paper_id)
+    if course:
+        source = "paper" if question_paper_id else "problem"
+        return course, source, paper_title
+    normalized = normalize_course(confirmed_course) if confirmed_course else None
+    if normalized:
+        return normalized, "conversation", paper_title
+    if question_paper_id:
+        return None, "paper", paper_title
+    if problem_paper_id:
+        return None, "problem", paper_title
+    return None, "unknown", paper_title
+
+
 def _course_from_paper(
     paper_lookup: PaperLookup, paper_id: str | None
 ) -> tuple[str | None, str | None]:
@@ -318,9 +343,24 @@ def _course_from_paper(
     return (normalize_course(course) if course else None), title
 
 
+_STANDALONE_ANCHOR_PREFIX = "【自主练习主题】"
+
+
+def _standalone_anchor_course(statement: str, original_topic: str | None) -> str | None:
+    if not original_topic:
+        return None
+    # 锚点题干为「课程 · 考点」或单独考点。用原始考点作后缀，避免把其内部的分隔符当成课程。
+    body = statement.removeprefix(_STANDALONE_ANCHOR_PREFIX)
+    topic_suffix = f" · {original_topic}"
+    if body == original_topic or not body.endswith(topic_suffix):
+        return None
+    return normalize_course(body.removesuffix(topic_suffix))
+
+
 def collect_evidence(
     connection: sqlite3.Connection,
     *,
+    owner_id: str,
     course: str | None,
     paper_lookup: PaperLookup,
     normalizer: KnowledgeNormalizer,
@@ -331,14 +371,11 @@ def collect_evidence(
     days: int = 30,
     limit: int = 50,
 ) -> EvidenceBundle:
-    """投影指定课程在时间窗内的证据；未知归属的条目单独返回。
-
-    ``course`` 为空表示“还没有选定课程”：此时不返回任何课程内容，只返回
-    待确认归属的条目，避免把多门课混成一份摘要。
-    """
+    """投影指定课程在时间窗内的证据；未知归属的条目单独返回。"""
 
     all_entries = collect_all(
         connection,
+        owner_id=owner_id,
         paper_lookup=paper_lookup,
         normalizer=normalizer,
         corrections=corrections,
@@ -358,6 +395,7 @@ def collect_evidence(
 def collect_all(
     connection: sqlite3.Connection,
     *,
+    owner_id: str,
     paper_lookup: PaperLookup,
     normalizer: KnowledgeNormalizer,
     corrections: dict[str, tuple[Any, Any, Any]],
@@ -369,27 +407,41 @@ def collect_all(
     newest_version = {
         str(row["root_problem_id"]): int(row["max_version"])
         for row in connection.execute(
-            "SELECT root_problem_id, MAX(version) AS max_version "
-            "FROM problems GROUP BY root_problem_id"
+            "SELECT p.root_problem_id, MAX(p.version) AS max_version "
+            "FROM problems p JOIN conversations c ON c.id = p.conversation_id "
+            "WHERE c.owner_id = ? GROUP BY p.root_problem_id",
+            (owner_id,),
         ).fetchall()
     }
     record_rows = connection.execute(
-        "SELECT id, problem_id FROM mistake_records WHERE problem_id IS NOT NULL"
+        "SELECT r.id, r.problem_id FROM mistake_records r "
+        "JOIN conversations c ON c.id = r.conversation_id "
+        "WHERE r.problem_id IS NOT NULL AND c.owner_id = ?",
+        (owner_id,),
     ).fetchall()
     record_by_problem = {str(row["problem_id"]): str(row["id"]) for row in record_rows}
 
     exercise_rows = connection.execute(
         "SELECT e.id, e.conversation_id, e.problem_id, e.root_problem_id, "
         "e.knowledge_point, e.statement_text, e.created_at, "
-        "p.version AS problem_version, p.source_type, "
+        "p.version AS problem_version, p.source_type, p.statement_text AS problem_statement, "
+        "CASE WHEN p.statement_text LIKE ? THEN ("
+        "SELECT original.knowledge_point FROM exercises original WHERE original.problem_id = p.id "
+        "ORDER BY original.created_at, original.rowid LIMIT 1"
+        ") END AS anchor_topic, "
         "p.paper_id AS problem_paper_id, p.source_title, "
         "p.self_reported_understood, "
         "q.question_id, q.paper_id AS question_paper_id, "
-        "q.build_id, q.snapshot_json "
+        "q.build_id, q.snapshot_json, "
+        "cc.confirmed_course AS confirmed_course "
         "FROM exercises e "
+        "JOIN conversations c ON c.id = e.conversation_id "
         "LEFT JOIN problems p ON p.id = e.problem_id "
         "LEFT JOIN exercise_question_sources q ON q.exercise_id = e.id "
-        "ORDER BY e.created_at DESC"
+        "LEFT JOIN conversation_contexts cc ON cc.conversation_id = e.conversation_id "
+        "WHERE c.owner_id = ? "
+        "ORDER BY e.created_at DESC",
+        (f"{_STANDALONE_ANCHOR_PREFIX}%", owner_id),
     ).fetchall()
     attempts = _attempt_rows(connection, [str(row["id"]) for row in exercise_rows])
 
@@ -422,10 +474,14 @@ def collect_all(
     selfreport_rows = connection.execute(
         "SELECT p.id, p.conversation_id, p.root_problem_id, p.version, "
         "p.source_type, p.paper_id, p.source_title, p.statement_text, "
-        "p.explanation_json, p.updated_at "
-        "FROM problems p WHERE p.self_reported_understood = 1 "
+        "p.explanation_json, p.updated_at, "
+        "cc.confirmed_course AS confirmed_course "
+        "FROM problems p JOIN conversations c ON c.id = p.conversation_id "
+        "LEFT JOIN conversation_contexts cc ON cc.conversation_id = p.conversation_id "
+        "WHERE p.self_reported_understood = 1 AND c.owner_id = ? "
         "AND NOT EXISTS (SELECT 1 FROM exercises e WHERE e.problem_id = p.id) "
-        "ORDER BY p.updated_at DESC"
+        "ORDER BY p.updated_at DESC",
+        (owner_id,),
     ).fetchall()
     for row in selfreport_rows:
         entry = _selfreport_entry(
@@ -442,8 +498,167 @@ def collect_all(
             continue
         bundle.entries.append(entry)
 
+    bundle.entries.extend(
+        _collect_material_quiz_entries(
+            connection,
+            owner_id=owner_id,
+            normalizer=normalizer,
+            corrections=corrections,
+            exclusions=exclusions,
+        )
+    )
     bundle.entries.sort(key=lambda item: (item.recorded_at, item.entry_id), reverse=True)
     return bundle
+
+
+def _collect_material_quiz_entries(
+    connection: sqlite3.Connection,
+    *,
+    owner_id: str,
+    normalizer: KnowledgeNormalizer,
+    corrections: dict[str, tuple[Any, Any, Any]],
+    exclusions: set[str],
+) -> list[EntryEvidence]:
+    """收集个人资料章节测试的作答证据，严格区分首次独立作答与看答案后订正。"""
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT a.id AS attempt_id, a.question_id, a.artifact_id, a.is_correct,
+                   a.grading_status, a.evaluation_json, a.answered_after_revealed,
+                   a.revealed_solution_at, a.created_at, a.updated_at,
+                   q.kc_id, q.stem, q.source_pages_json,
+                   art.course_hint, art.title AS artifact_title, art.skeleton_json,
+                   m.id AS material_id, m.display_name AS material_name
+            FROM material_quiz_attempts a
+            JOIN material_quiz_questions q ON q.id = a.question_id
+            JOIN material_artifacts art ON art.id = a.artifact_id
+            JOIN personal_materials m ON m.id = art.material_id
+            WHERE a.owner_id = ? AND m.status = 'active' AND a.grading_status != 'unanswered'
+            ORDER BY a.updated_at DESC
+            """,
+            (owner_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    out: list[EntryEvidence] = []
+    for row in rows:
+        qid = str(row["question_id"])
+        entry_id = build_entry_id("material_quiz", qid)
+        if entry_id in exclusions:
+            continue
+
+        course = normalize_course(str(row["course_hint"] or "")) if row["course_hint"] else None
+        course_source = "conversation" if course else "unknown"
+
+        kc_label = str(row["kc_id"] or "")
+        if row["skeleton_json"] and kc_label:
+            try:
+                skel = json.loads(str(row["skeleton_json"]))
+                for ch in skel.get("chapters", []) or []:
+                    for kc in ch.get("kcs", []) or []:
+                        if str(kc.get("id", "")) == kc_label and kc.get("label"):
+                            kc_label = str(kc["label"])
+                            break
+            except ValueError:
+                pass
+        kp_items_raw = [kc_label[:60]] if kc_label else []
+        kp_items: list[str] = []
+        kp_slugs: list[str | None] = []
+        for k in kp_items_raw:
+            display, slug = normalizer.normalize(k)
+            kp_items.append(display)
+            kp_slugs.append(slug)
+        kp_norm = [s is not None for s in kp_slugs]
+
+        eval_obj = json.loads(str(row["evaluation_json"])) if row["evaluation_json"] else {}
+        first_raw = eval_obj.get("first_attempt") if isinstance(eval_obj.get("first_attempt"), dict) else None
+        after_revealed = bool(row["answered_after_revealed"])
+        updated_at = parse_time(row["updated_at"]) or datetime.now(timezone.utc)
+        created_at = parse_time(row["created_at"]) or updated_at
+
+        def _verdict_of(is_corr: Any, g_status: str, revealed: bool) -> str:
+            if revealed:
+                return "after_reveal"
+            if g_status == "pending_review" or is_corr is None:
+                return "insufficient"
+            return "correct_independent" if bool(is_corr) else "wrong_independent"
+
+        first_is_corr = first_raw.get("is_correct") if first_raw else row["is_correct"]
+        first_status = str(first_raw.get("grading_status")) if first_raw else str(row["grading_status"])
+        first_at = parse_time(first_raw.get("submitted_at")) if first_raw else created_at
+        revealed_at = parse_time(row["revealed_solution_at"])
+        if first_raw and "answered_after_revealed" in first_raw:
+            first_revealed = bool(first_raw["answered_after_revealed"])
+        elif first_raw:
+            first_revealed = bool(
+                revealed_at is not None
+                and first_at is not None
+                and revealed_at <= first_at
+            )
+        else:
+            first_revealed = after_revealed
+        first_verdict = _verdict_of(first_is_corr, first_status, first_revealed)
+        current_verdict = _verdict_of(row["is_correct"], str(row["grading_status"]), after_revealed)
+
+        attempts_list: list[AttemptEvidence] = [
+            AttemptEvidence(
+                attempt_id=str(row["attempt_id"]),
+                attempt_no=1,
+                kind="initial",
+                verdict=first_verdict,
+                is_correct=(bool(first_is_corr) if first_is_corr is not None else None),
+                needs_supplement=(first_status == "pending_review"),
+                answered_after_revealed=first_revealed,
+                independence=None,
+                recorded_at=first_at or created_at,
+            )
+        ]
+        if after_revealed:
+            attempts_list.append(
+                AttemptEvidence(
+                    attempt_id=f"{row['attempt_id']}:rev",
+                    attempt_no=2,
+                    kind="correction",
+                    verdict="after_reveal",
+                    is_correct=(bool(row["is_correct"]) if row["is_correct"] is not None else None),
+                    needs_supplement=(str(row["grading_status"]) == "pending_review"),
+                    answered_after_revealed=True,
+                    independence=None,
+                    recorded_at=updated_at,
+                )
+            )
+
+        pages = json.loads(str(row["source_pages_json"])) if row["source_pages_json"] else []
+        entry = EntryEvidence(
+            entry_id=entry_id,
+            kind="material_quiz",
+            course=course,
+            course_source=course_source,
+            knowledge_points=kp_items,
+            knowledge_point_slugs=kp_slugs,
+            knowledge_points_normalized=kp_norm,
+            knowledge_point_status=["unreviewed" for _ in kp_items],
+            statement_excerpt=math_safe_excerpt(str(row["stem"]), _STATEMENT_EXCERPT),
+            verdict=current_verdict,
+            first_verdict=first_verdict,
+            recorded_at=updated_at,
+            first_at=first_at or created_at,
+            wrong_at=(first_at or created_at) if first_verdict == "wrong_independent" else None,
+            after_reveal_at=updated_at if after_revealed else None,
+            source={
+                "material_id": str(row["material_id"]),
+                "material_name": str(row["material_name"]),
+                "artifact_id": str(row["artifact_id"]),
+                "artifact_title": str(row["artifact_title"]),
+                "pages": pages,
+            },
+            attempts=attempts_list,
+        )
+        _apply_correction(entry, corrections.get(entry.entry_id))
+        out.append(entry)
+    return out
 
 
 def select_window(
@@ -580,12 +795,17 @@ def _exercise_entry(
         statuses = ["verified" if flag else "raw" for flag in normalized_flags]
 
     paper_id = row["question_paper_id"] or row["problem_paper_id"]
-    course, paper_title = _course_from_paper(paper_lookup, paper_id)
-    course_source = (
-        "paper"
-        if row["question_paper_id"]
-        else ("problem" if row["problem_paper_id"] else "unknown")
+    problem_statement = row["problem_statement"] or ""
+    is_standalone = not paper_id and problem_statement.startswith(_STANDALONE_ANCHOR_PREFIX)
+    course, course_source, paper_title = _resolve_course(
+        paper_lookup,
+        question_paper_id=row["question_paper_id"],
+        problem_paper_id=row["problem_paper_id"],
+        confirmed_course=None if is_standalone else row["confirmed_course"],
     )
+    if is_standalone:
+        course = _standalone_anchor_course(problem_statement, row["anchor_topic"])
+        course_source = "problem" if course else "unknown"
 
     problem_version = row["problem_version"]
     root = str(row["root_problem_id"])
@@ -684,7 +904,11 @@ def _selfreport_entry(
         flags.append(slug is not None)
 
     paper_id = row["paper_id"]
-    course, paper_title = _course_from_paper(paper_lookup, paper_id)
+    course, course_source, paper_title = _resolve_course(
+        paper_lookup,
+        problem_paper_id=paper_id,
+        confirmed_course=row["confirmed_course"],
+    )
     root = str(row["root_problem_id"])
     version = row["version"]
     validity, validity_note = "ok", None
@@ -695,7 +919,7 @@ def _selfreport_entry(
         entry_id=build_entry_id("selfreport", str(row["id"])),
         kind="selfreport",
         course=course,
-        course_source="problem" if row["paper_id"] else "unknown",
+        course_source=course_source,
         knowledge_points=names,
         knowledge_point_slugs=slugs,
         knowledge_points_normalized=flags,
@@ -730,7 +954,8 @@ def _excerpt(text: Any) -> str | None:
     value = " ".join(str(text or "").split())
     if not value:
         return None
-    return value[:_STATEMENT_EXCERPT]
+    # 截断时不切断公式，并补省略号，避免前端暴露半截 LaTeX 源码。
+    return math_safe_excerpt(value, _STATEMENT_EXCERPT)
 
 
 def count_questions(entries: list[EntryEvidence]) -> int:

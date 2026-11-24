@@ -1,10 +1,14 @@
 import { useId, useState } from "react";
 import type { QuestionCard, QuestionCodeBlock } from "../lib/conversationsApi";
+import MathText from "./MathText";
 
 const TYPE_LABELS: Record<QuestionCard["question_type"], string> = {
   choice: "选择题",
   fill: "填空题",
   code: "编程题",
+  solve: "解答题",
+  proof: "证明题",
+  judge: "判断题",
 };
 
 const STATE_LABELS: Record<QuestionCard["answer"]["state"], string> = {
@@ -12,12 +16,6 @@ const STATE_LABELS: Record<QuestionCard["answer"]["state"], string> = {
   missing: "原卷未提供答案",
   pending_review: "答案待核对",
   conflict: "答案存在冲突",
-};
-
-const KNOWLEDGE_STATUS_LABELS: Record<string, string> = {
-  candidate: "候选",
-  verified: "已确认",
-  rejected: "已拒绝",
 };
 
 export type QuestionAction = "select" | "explain" | "view" | "exercise" | "record" | "answer";
@@ -88,10 +86,10 @@ function CodeBlocks({
     <div className="mt-2 space-y-3">
       {Array.from(groups.entries()).map(([label, items]) => (
         <section key={label} className="space-y-2">
-          <h5 className="text-[11px] font-medium text-emerald-800">{label}</h5>
+          <h5 className="text-xs font-medium text-emerald-800">{label}</h5>
           {items.map((block) => (
             <div key={block.block_id ?? block.text.slice(0, 40)}>
-              <div className="mb-1 flex flex-wrap gap-2 text-[11px] text-emerald-700">
+              <div className="mb-1 flex flex-wrap gap-2 text-xs text-emerald-700">
                 {block.name ? <span>{block.name}</span> : null}
                 {block.kind && block.kind !== "main" ? <span>类型：{({ helper: "辅助函数", function: "函数", example: "示例" } as Record<string, string>)[block.kind] ?? "参考代码"}</span> : null}
                 {block.pages?.length || block.page != null ? (
@@ -109,7 +107,7 @@ function CodeBlocks({
         </section>
       ))}
       {annotations?.length ? (
-        <ul className="space-y-1 text-[11px] leading-5 text-emerald-800">
+        <ul className="space-y-1 text-xs leading-5 text-emerald-800">
           {annotations.map((item, index) => (
             <li key={`${item.role ?? "annotation"}-${index}`}>
               {item.role ? `${item.role}：` : ""}
@@ -127,105 +125,78 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
   const groupId = useId();
   const identity = `${card.question_id}:${card.build_id}:${card.content_sha256}`;
   const [choiceDraft, setChoiceDraft] = useState({ identity, answer: "" });
+  const [textDraft, setTextDraft] = useState({ identity, answer: "" });
   const picked = choiceDraft.identity === identity ? choiceDraft.answer : "";
-  const canAnswer = card.question_type === "choice" && Boolean(onAction) && !card.review.stale;
+  const draftAnswer = textDraft.identity === identity ? textDraft.answer : "";
+  const setDraftAnswer = (value: string) => setTextDraft({ identity, answer: value });
+  const hasChoiceOptions = card.question_type === "choice" && card.options.length > 0;
+  const canAnswer = hasChoiceOptions && Boolean(onAction) && !card.review.stale;
   const statementAssets = card.assets.filter(
     (asset) => asset.page == null || card.pages.statement.includes(asset.page),
   );
   const revealed = Boolean(!compact && card.answer_revealed && card.answer_detail);
+  const canTextAnswer = !compact && card.selected && Boolean(onAction) && !hasChoiceOptions && !revealed;
   const answerText = card.answer_detail?.text ?? "";
   const blocks = card.code_blocks ?? [];
   const examples = card.code_examples ?? [];
   const solutions = card.independent_solutions ?? [];
+  const statementPage = card.source_url ? card.pages.statement[0] : undefined;
+  const hasPageLinks = Boolean(card.source_url && (statementPage !== undefined || card.pages.answer.length));
+  const showSourceDetails = hasPageLinks || card.source.may_show_answer;
+  const paperFallback = statementPage === undefined && card.source.download_url ? (
+    <a className="text-river underline-offset-2 hover:underline"
+      href={card.source.download_url} target="_blank" rel="noreferrer">
+      查看原卷
+    </a>
+  ) : null;
   return (
-    <article id={`question-${identity}`} className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <header className="mb-2 flex flex-wrap items-center gap-2">
-        <span className="rounded-full border border-river/30 bg-river/10 px-2 py-0.5 text-[11px] text-river">
+    <article id={`question-${identity}`} className="lesson-sheet">
+      <header className="sheet-meta mb-2">
+        <span className="sheet-badge">
           第 {card.number_label} 题 · {TYPE_LABELS[card.question_type]}
         </span>
-        <span className="text-[11px] text-slate-500">
+        <span className="text-xs text-slate-500">
           {sourceTitle(card)}
           {card.source.academic_year ? ` · ${card.source.academic_year}` : ""}
         </span>
-        {card.source.download_url ? (
-          <a
-            className="text-[11px] text-river underline-offset-2 hover:underline"
-            href={card.source_url && card.pages.statement.length
-              ? `${card.source_url}&kind=statement&page=${card.pages.statement[0]}#page=${card.pages.statement[0]}`
-              : card.source.download_url}
-            target="_blank"
-            rel="noreferrer"
-          >
-            查看原卷
-          </a>
-        ) : null}
-        {pageLabel(card.pages.statement) ? (
-          <span className="text-[11px] text-slate-400">
-            题面{pageLabel(card.pages.statement)}
-          </span>
-        ) : null}
-        {pageLabel(card.pages.answer) ? (
-          <span className="text-[11px] text-slate-400">
-            答案{pageLabel(card.pages.answer)}
-          </span>
+        {card.knowledge_points?.length ? (
+          <ul className="flex flex-wrap gap-1.5">
+            {card.knowledge_points.map((point) => (
+              <li
+                key={point.slug}
+                className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs text-slate-600"
+              >
+                <MathText text={point.name} />
+              </li>
+            ))}
+          </ul>
         ) : null}
       </header>
 
-      {card.source_url ? (
-        <nav className="mb-2 flex flex-wrap gap-3 text-xs text-river" aria-label="原始来源页">
-          {card.pages.statement.length ? (
-            <a href={`${card.source_url}&kind=statement&page=${card.pages.statement[0]}&download=true`}
-              className="underline underline-offset-2">下载原卷</a>
-          ) : null}
-          {(["statement", "answer"] as const).flatMap((kind) =>
-            card.pages[kind].map((page) => (
-              <a key={`${kind}-${page}`} target="_blank" rel="noreferrer"
-                className="underline underline-offset-2"
-                href={`${card.source_url}&kind=${kind}&page=${page}#page=${page}`}>
-                查看{kind === "statement" ? "题面" : "答案"}原页 · 第 {page} 页
-              </a>
-            )),
-          )}
-        </nav>
-      ) : null}
-      {card.source_views?.length ? (
-        <p className="mb-2 text-[11px] text-slate-500">
-          已查看原卷来源：{card.source_views.map((view) =>
-            `${view.kind === "statement" ? "题面" : "答案"}第 ${view.page} 页（${new Date(view.viewed_at).toLocaleString("zh-CN")}）`,
-          ).join("；")}
-        </p>
-      ) : null}
-
-      {card.source.may_show_answer ? (
-        <p className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
-          原卷可能包含答案页；打开原页会记录本题已查看含答案原卷。建议先自己作答。
-        </p>
-      ) : null}
-
-      {card.knowledge_points?.length ? (
-        <ul className="mb-2 flex flex-wrap gap-1.5">
-          {card.knowledge_points.map((point) => (
-            <li
-              key={point.slug}
-              className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-600"
-            >
-              {point.name}
-              {point.status && point.status !== "approved" ? `（${KNOWLEDGE_STATUS_LABELS[point.status] ?? point.status}）` : ""}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-
-      <p className="whitespace-pre-wrap text-sm leading-7 text-slate-800">{card.statement}</p>
+      <p className="lesson-statement"><MathText text={card.statement} /></p>
 
       {card.formulas.length ? (
-        <ul className="mt-2 space-y-1 text-sm text-slate-700">
+        <ul className="formula-stage">
           {card.formulas.map((formula, index) => (
-            <li key={`${formula.text}-${index}`} className="rounded bg-slate-50 px-2 py-1 font-mono text-xs">
-              {formula.text}
+            <li key={`${formula.text}-${index}`} className="font-mono text-sm">
+              <MathText text={formula.text} forceMath display />
             </li>
           ))}
         </ul>
+      ) : null}
+
+      {card.code_lines.length ? (
+        <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900 px-3 py-2 text-xs leading-6 text-slate-100">
+          {card.code_lines.join("\n")}
+        </pre>
+      ) : null}
+
+      {statementAssets.length ? (
+        <div className="mt-3 space-y-2">
+          {statementAssets.map((asset) => (
+            <AssetImage key={asset.asset_id} card={card} asset={asset} />
+          ))}
+        </div>
       ) : null}
 
       {card.options.length ? (
@@ -241,7 +212,7 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
                     onChange={() => setChoiceDraft({ identity, answer: option.label })} />
                 ) : null}
                 <span className="font-medium text-slate-500">{option.label}.</span>
-                <span className="whitespace-pre-wrap">{option.text}</span>
+                <span className="whitespace-pre-wrap"><MathText text={option.text} /></span>
               </label>
             </li>
           ))}
@@ -251,7 +222,7 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
       {canAnswer ? (
         <div className="mt-3 flex items-center gap-3">
           <button type="button" disabled={busy || !picked}
-            className="rounded-lg bg-river px-3 py-1.5 text-xs text-white disabled:opacity-50"
+            className="primary-button"
             onClick={() => { if (picked) onAction?.("answer", card, picked); }}>
             提交并讲解
           </button>
@@ -259,37 +230,77 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
         </div>
       ) : null}
 
-      {statementAssets.length ? (
-        <div className="mt-3 space-y-2">
-          {statementAssets.map((asset) => (
-            <AssetImage key={asset.asset_id} card={card} asset={asset} />
-          ))}
-        </div>
-      ) : null}
-
-      {card.code_lines.length ? (
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-slate-900 px-3 py-2 text-xs leading-6 text-slate-100">
-          {card.code_lines.join("\n")}
-        </pre>
-      ) : null}
-
-      <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
-        <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5">
-          {STATE_LABELS[card.answer.state]}
-        </span>
-        {card.review.stale ? (
-          <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700">
-            题目内容已变化
+      <div className="mt-3 space-y-1.5 border-t border-slate-100 pt-2.5 text-xs text-slate-500">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5">
+            {STATE_LABELS[card.answer.state]}
           </span>
+          {card.review.stale ? (
+            <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700">
+              题目内容已变化
+            </span>
+          ) : null}
+          {pageLabel(card.pages.statement) ? (
+            <span className="text-slate-400">
+              题面{pageLabel(card.pages.statement)}
+            </span>
+          ) : null}
+          {pageLabel(card.pages.answer) ? (
+            <span className="text-slate-400">
+              答案{pageLabel(card.pages.answer)}
+            </span>
+          ) : null}
+          {!showSourceDetails && paperFallback}
+        </div>
+
+        {showSourceDetails ? (
+          <details className="pt-0.5">
+            <summary className="cursor-pointer select-none text-xs text-slate-500 hover:text-slate-700">
+              原卷与答案页（点击展开）
+            </summary>
+            <div className="mt-1.5 space-y-1.5">
+              {hasPageLinks || paperFallback ? (
+                <nav className="flex flex-wrap gap-3 text-river" aria-label="原始来源页">
+                  {paperFallback}
+                  {statementPage !== undefined ? (
+                    <a href={`${card.source_url}&kind=statement&page=${statementPage}&download=true`}
+                      className="underline underline-offset-2">下载原卷</a>
+                  ) : null}
+                  {card.source_url && (["statement", "answer"] as const).flatMap((kind) =>
+                    card.pages[kind].map((page) => (
+                      <a key={`${kind}-${page}`} target="_blank" rel="noreferrer"
+                        className="underline underline-offset-2"
+                        href={`${card.source_url}&kind=${kind}&page=${page}#page=${page}`}>
+                        查看{kind === "statement" ? "题面" : "答案"}原页 · 第 {page} 页
+                      </a>
+                    )),
+                  )}
+                </nav>
+              ) : null}
+              {card.source.may_show_answer ? (
+                <p className="text-amber-700">
+                  原卷可能包含答案页。{hasPageLinks && "打开题目原页会记录本题已查看含答案原卷。"}建议先自己作答。
+                </p>
+              ) : null}
+            </div>
+          </details>
+        ) : null}
+
+        {card.source_views?.length ? (
+          <p>
+            已查看原卷来源：{card.source_views.map((view) =>
+              `${view.kind === "statement" ? "题面" : "答案"}第 ${view.page} 页（${new Date(view.viewed_at).toLocaleString("zh-CN")}）`,
+            ).join("；")}
+          </p>
         ) : null}
       </div>
 
       {revealed ? (
-        <details data-question-answer className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+        <details data-question-answer className="lesson-disclosure">
           <summary className="cursor-pointer text-xs font-medium text-emerald-800">参考答案（已查看，点击展开）</summary>
           <div className="flex flex-wrap items-center justify-between gap-2">
             {card.answer_revealed ? (
-              <span className="text-[11px] text-emerald-700">本题答案已在本会话开放
+              <span className="text-xs text-emerald-700">本题答案已在本会话开放
               {card.answer_revealed_at
                 ? ` · ${new Date(card.answer_revealed_at).toLocaleString("zh-CN")}`
                 : ""}</span>
@@ -297,7 +308,7 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
           </div>
           {!isCodePlaceholder(answerText) ? (
             <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-emerald-900">
-              {answerText}
+              <MathText text={answerText} />
             </p>
           ) : null}
           {card.reference_code?.trim() && !blocks.length ? (
@@ -316,7 +327,7 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
           ) : null}
           {examples.length ? (
             <div className="mt-2 space-y-2">
-              <h5 className="text-[11px] font-medium text-emerald-800">示例</h5>
+              <h5 className="text-xs font-medium text-emerald-800">示例</h5>
               {examples.map((example, index) => (
                 <pre
                   key={`${example.slice(0, 30)}-${index}`}
@@ -329,18 +340,18 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
           ) : null}
           {solutions.length ? (
             <div className="mt-2 space-y-2">
-              <h5 className="text-[11px] font-medium text-emerald-800">其他解法</h5>
+              <h5 className="text-xs font-medium text-emerald-800">其他解法</h5>
               {solutions.map((solution, index) => (
                 <div key={`${solution.author ?? "solution"}-${index}`} className="text-xs text-emerald-900">
                   {solution.author ? <p className="font-medium">{solution.author}</p> : null}
-                  <p className="whitespace-pre-wrap leading-6">{solution.text}</p>
+                  <p className="whitespace-pre-wrap leading-6"><MathText text={solution.text} /></p>
                   {solution.note ? <p className="text-emerald-700">{solution.note}</p> : null}
                 </div>
               ))}
             </div>
           ) : null}
           {card.answer_detail?.note ? (
-            <p className="mt-2 text-[11px] text-emerald-700">{card.answer_detail.note}</p>
+            <p className="mt-2 text-xs text-emerald-700">{card.answer_detail.note}</p>
           ) : null}
         </details>
       ) : card.answer.state === "missing" ? (
@@ -349,12 +360,53 @@ export function QuestionCardView({ card, busy, compact, onAction }: QuestionCard
         </p>
       ) : null}
 
+      {card.question_type === "choice" && card.options.length === 0 ? (
+        <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          本题结构化选项暂缺，请点击下方“查看题面原页”或“查看原卷”核对选项后，在下方输入你选择的答案提交核对。
+        </p>
+      ) : null}
+
+      {canTextAnswer ? (
+        <form
+          className="mt-3 space-y-1.5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const trimmed = draftAnswer.trim();
+            if (!trimmed || busy) return;
+            onAction?.("answer", card, trimmed);
+            setDraftAnswer("");
+          }}
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="text"
+              value={draftAnswer}
+              onChange={(event) => setDraftAnswer(event.target.value)}
+              disabled={busy}
+              placeholder="输入你的答案，提交后帮你核对"
+              aria-label="输入你的答案"
+              className="min-w-[200px] flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-ink placeholder:text-slate-400 focus:border-river focus:outline-none"
+            />
+            <button
+              type="submit"
+              disabled={busy || !draftAnswer.trim()}
+              className="primary-button disabled:opacity-50"
+            >
+              提交核对
+            </button>
+          </div>
+          <p className="text-xs text-slate-400">
+            也可以直接在下方输入框发送文字或点 + 上传手写照片作答。
+          </p>
+        </form>
+      ) : null}
+
       {!compact && onAction ? (
         <div className="mt-3 flex flex-wrap gap-2">
           {!card.selected ? (
             <button
               type="button"
-              className="rounded-lg bg-river px-3 py-1.5 text-xs text-white disabled:opacity-50"
+              className="primary-button"
               disabled={busy}
               onClick={() => onAction("select", card)}
             >
@@ -421,22 +473,27 @@ export function QuestionResultList({
       </p>
     ) : null;
   }
+  const single = cards.length === 1;
   return (
     <section className="space-y-2">
-      <h4 className="text-xs font-medium text-slate-500">
-        找到 {cards.length} 道已审核真题{status === "ok" ? "" : `（${message ?? "部分结果"}）`}
-      </h4>
+      {!single ? (
+        <h4 className="text-xs font-medium text-slate-500">
+          相关真题（共 {cards.length} 道）{status === "ok" ? "" : `（${message ?? "部分结果"}）`}
+        </h4>
+      ) : null}
       {cards.map((card, index) => (
         <div key={`${card.question_id}:${card.build_id}:${card.content_sha256}`} className="flex items-start gap-2">
-          <span className="mt-2 w-10 shrink-0 text-center text-xs text-slate-400">
-            第 {index + 1} 道
-          </span>
+          {!single ? (
+            <span className="mt-2 w-10 shrink-0 text-center text-xs text-slate-400">
+              第 {index + 1} 道
+            </span>
+          ) : null}
           <div className="min-w-0 flex-1">
             <QuestionCardView card={card} compact={!card.selected} busy={busy} onAction={onAction} />
             {!card.selected ? <div className="mt-1 flex flex-wrap gap-2">
               <button
                 type="button"
-                className="rounded-lg bg-river px-3 py-1.5 text-xs text-white disabled:opacity-50"
+                className="primary-button"
                 disabled={busy}
                 onClick={() => onAction?.("select", card)}
               >

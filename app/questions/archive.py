@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from pathlib import Path
 
 from app.question_bank.models import (
@@ -16,13 +17,13 @@ from app.question_bank.models import (
     CodeBlock,
     IndependentSolution,
 )
+from app.question_bank.errors import QuestionBankUnavailableError
 from app.question_bank.paths import BUILD_ID_RE, BankPaths
 from app.question_bank.config import DEFAULT_PAPERS_ROOT
 from app.question_bank.repository import QuestionRepository
 from app.questions.errors import (
     QuestionAssetChangedError,
     QuestionAssetMissingError,
-    QuestionBankUnavailableError,
     QuestionError,
     QuestionNotFoundError,
     QuestionSourceChangedError,
@@ -217,6 +218,29 @@ class BuildArchive:
             description=asset.get("description"),
         )
 
+    def has_paper_source(self, build_id: str, paper_id: str) -> bool:
+        """检查书签所需的归档文件是否在公开原卷目录中。"""
+        try:
+            repository = self._open(build_id)
+            try:
+                paper = repository.get_paper(paper_id) or {}
+                return bool(paper.get("pdf_sha256") and self._paper_source_path(paper))
+            finally:
+                repository.close()
+        except (QuestionError, sqlite3.Error, OSError, ValueError, RuntimeError):
+            return False
+
+    def _paper_source_path(self, paper: dict) -> Path:
+        relative = paper.get("pdf_rel_path")
+        if not relative:
+            raise QuestionAssetMissingError("原卷来源路径缺失，暂时无法预览。")
+        path = (self._papers_root / relative).resolve()
+        if not path.is_relative_to(self._papers_root):
+            raise QuestionAssetMissingError("原卷来源路径无效。")
+        if not path.is_file():
+            raise QuestionAssetMissingError("原卷文件不在本机，暂时无法预览。")
+        return path
+
     def source(self, reference, kind: str, page: int) -> AssetPayload:
         """只允许该版本题目引用的物理页；原卷必须仍与建库哈希一致。"""
         record = self._detail(
@@ -226,14 +250,7 @@ class BuildArchive:
         if kind not in ("statement", "answer") or page not in allowed:
             raise QuestionAssetMissingError("该页不是这道题的题面或答案来源页。")
         paper = record.get("_paper") or {}
-        relative = paper.get("pdf_rel_path")
-        if not relative:
-            raise QuestionAssetMissingError("原卷来源路径缺失，暂时无法预览。")
-        path = (self._papers_root / relative).resolve()
-        if not path.is_relative_to(self._papers_root):
-            raise QuestionAssetMissingError("原卷来源路径无效。")
-        if not path.is_file():
-            raise QuestionAssetMissingError("原卷文件不在本机，暂时无法预览。")
+        path = self._paper_source_path(paper)
         if not paper.get("pdf_sha256") or _sha256(path) != paper["pdf_sha256"]:
             raise QuestionSourceChangedError("原卷文件已变化，已停止展示旧来源；请重新核对资料。")
         if not 1 <= page <= int(paper.get("physical_pages") or 0):

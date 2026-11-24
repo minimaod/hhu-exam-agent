@@ -16,7 +16,9 @@ from fastapi import Request
 
 from app.conversations import answer_gate, final_reply, tool_projection
 from app.conversations.authorization import (
+    DeepSeekAuthVerifier,
     authorize_action,
+    is_save_affirmative,
     needs_user_for_denial,
 )
 from app.conversations.basis import validate_basis
@@ -38,6 +40,7 @@ from app.conversations.graph import (
     _action_label,
 )
 from app.conversations.inputs import canonical_json
+from app.materials.exam_solver import explicit_question_refs
 from app.conversations.history import project_step
 from app.conversations.models import (
     ActionResultItem,
@@ -51,6 +54,7 @@ from app.conversations.models import (
 )
 from app.conversations.reply import ReplyTruncated, material_to_payload
 from app.conversations.read_tools import READ_ONLY_ACTIONS
+from app.conversations.repository import NewProblem
 from app.conversations.tools import (
     ACTION_TO_TOOL,
     TOOLS_BY_NAME,
@@ -68,11 +72,13 @@ from app.conversations.turn_types import (
 )
 from app.memory.models import parse_entry_id
 from app.querying.errors import QueryError
+from app.quota.errors import QuotaError, quota_of
 from app.questions.errors import QuestionError
 from app.streaming import (
     SENTINEL,
     stream_events,
 )
+from app.text_excerpt import math_safe_excerpt
 from app.tutoring.models import FeedbackResult
 
 logger = logging.getLogger("app.conversations.service")
@@ -225,6 +231,7 @@ class ReviewLoopMixin:
             )
 
         try:
+            ctx: _DynamicContext | None = None
             emit("scheduling", "正在根据上下文分析复习需求")
             assert self._make_scheduler is not None
             if prepared.recovery:
@@ -255,18 +262,23 @@ class ReviewLoopMixin:
                                 "dispatch": "tools", "reply": None}
                 ctx.transcript = []
                 max_rounds = MAX_SCHEDULER_ROUNDS
+            if prepared.input.workbench_source:
+                ctx.recovery["workbench_source"] = prepared.input.workbench_source.model_dump()
             ctx.request_id = prepared.request_id
             ctx.input_text = prepared.input.text
             carried = [ActionResultItem.model_validate(entry["outcome"]) for entry in ctx.recovery["actions"]]
             self._repository.save_recovery(prepared.conversation_id, prepared.request_id, ctx.recovery)
-            last_sugs: list[str] = []
+            last_sugs: list[Any] = []
             ctx_record = self._repository.get_context(prepared.conversation_id)
             if ctx_record and ctx_record.last_suggestions_json:
                 with suppress(Exception):
-                    last_sugs = [
-                        it["label"]
-                        for it in json.loads(ctx_record.last_suggestions_json)
-                    ]
+                    parsed_sugs = json.loads(ctx_record.last_suggestions_json)
+                    if isinstance(parsed_sugs, list):
+                        last_sugs = [
+                            item
+                            for item in parsed_sugs
+                            if isinstance(item, (dict, str))
+                        ]
             recent_summary = self._recent_turns_summary(prepared.conversation_id)
             # F010 B：跨轮历史与工作区都在这里一次性读时派生；正文模型不读它们。
             ctx.history = self._history_for(
@@ -277,10 +289,22 @@ class ReviewLoopMixin:
             ctx.workspace_text = workspace_text(self._workspace(ctx))
             memory_context = self._prepare_memory_context(prepared, ctx)
 
-            capability = self.questions.capability(
-                ctx.confirmed_course or "Python语言程序设计"
-            )
-            question_context = f"【真题库】{capability.message}"[:200]
+            if ctx.confirmed_course:
+                capability = self.questions.capability(ctx.confirmed_course)
+                has_bank = capability.status == "ready"
+                paper_count_note = ""
+                papers_svc = getattr(self, "_papers", None)
+                if papers_svc is not None:
+                    with suppress(Exception):
+                        papers_res = papers_svc.list_papers(course=ctx.confirmed_course)
+                        paper_count_note = f" 可下载历年试卷共 {len(papers_res.items)} 份。"
+                question_context = (
+                    f"【真题库】{capability.message}"
+                    + ("" if has_bank else "（可查原卷或按考点自主出题，非真题）")
+                    + paper_count_note
+                )[:200]
+            else:
+                question_context = "【真题库】尚未确认复习课程；真题题库仅覆盖部分已录入科目，确认课程后可知是否支持按考点检索真题。"
             if ctx.question_selection is not None:
                 question_context = (
                     question_context
@@ -297,6 +321,204 @@ class ReviewLoopMixin:
             if prepared.recovery and not plans:
                 scheduler = self._make_scheduler()
                 graph = DynamicReviewGraph(scheduler, execute)
+            material_context: str | None = None
+            if (
+                prepared.input.material_guide_id
+                and prepared.input.material_item_id
+                and self._repository.owner_id
+            ):
+                from app.materials.errors import GuideNotFoundError
+                from app.materials.repository import MaterialRepository
+
+                mat_repo = MaterialRepository(
+                    self._repository.db_path, owner_id=self._repository.owner_id
+                )
+                guide, item, display_name = mat_repo.get_guide_item_context(
+                    prepared.input.material_guide_id,
+                    prepared.input.material_item_id,
+                )
+                if guide.conversation_id != prepared.conversation_id:
+                    raise GuideNotFoundError("复习清单条目不属于当前会话。")
+                pages_label = (
+                    "、".join(f"第{c.page_no}页" for c in item.verified_citations)
+                    if item.verified_citations
+                    else f"第{guide.start_page}-{guide.end_page}页"
+                )
+                material_context = (
+                    f"资料名称：《{display_name}》（{pages_label}）\n"
+                    f"知识点：{item.title}\n"
+                    f"已核验资料原文：{item.source_excerpt or '（暂无通过核验的原文摘录）'}\n"
+                    f"AI 补充说明：{item.ai_explanation}\n"
+                    f"建议练习方向：{item.practice_prompt}"
+                )
+            elif (
+                prepared.input.material_artifact_id
+                and prepared.input.material_question_id
+                and self._repository.owner_id
+            ):
+                from app.materials.errors import GuideNotFoundError
+                from app.materials.repository import MaterialRepository
+                from app.tutoring.models import Explanation, KnowledgePoint, Source, Step
+
+                mat_repo = MaterialRepository(
+                    self._repository.db_path, owner_id=self._repository.owner_id
+                )
+                art = mat_repo.get_artifact_detail(prepared.input.material_artifact_id)
+                if not mat_repo.is_artifact_accessible_in_conversation(
+                    conversation_id=prepared.conversation_id, artifact_id=art.id
+                ):
+                    raise GuideNotFoundError("测试题目不属于当前会话或尚未就绪。")
+                if art.quiz_status != "ready":
+                    raise GuideNotFoundError("章节测试尚未生成完成。")
+                q_item = next(
+                    (q for q in art.questions if q.id == prepared.input.material_question_id),
+                    None,
+                )
+                if q_item is None:
+                    raise GuideNotFoundError("测试题目不存在。")
+                pages_str = (
+                    "、".join(f"第{p}页" for p in q_item.source_pages)
+                    if q_item.source_pages
+                    else "来源页码待核对"
+                )
+                opts_str = (
+                    "\n选项："
+                    + " | ".join(f"{chr(65 + i)}. {o}" for i, o in enumerate(q_item.options))
+                    if q_item.options
+                    else ""
+                )
+                source_label = f"个人资料《{art.title}》（{pages_str}）· 题目 {q_item.id}"
+                # 将该章节测试题稳定绑定为当前会话活跃题，确保后续连续追问与存错题不串题
+                already_bound = (
+                    ctx.active_problem is not None
+                    and ctx.active_problem.source.text == source_label
+                )
+                if not already_bound:
+                    ans_text = (
+                        json.dumps(q_item.attempt.user_answer, ensure_ascii=False)
+                        if q_item.attempt and q_item.attempt.user_answer is not None and not isinstance(q_item.attempt.user_answer, str)
+                        else (q_item.attempt.user_answer if q_item.attempt else None)
+                    )
+                    explanation_obj = None
+                    if q_item.revealed_answer is not None and str(q_item.revealed_answer).strip():
+                        final_answer = math_safe_excerpt(str(q_item.revealed_answer), 1600)
+                        reference = q_item.revealed_explanation or str(q_item.revealed_answer)
+                        explanation_obj = Explanation(
+                            knowledge_points=[KnowledgePoint(name=q_item.kc_id or "章节知识点", explanation=q_item.pitfall or "详见原讲义")],
+                            steps=[Step(index=1, title="参考解析", content=math_safe_excerpt(reference, 2000) or "完整解析可在章节测试中查看。")],
+                            final_answer=final_answer or "完整答案可在章节测试中查看。",
+                        )
+                    with self._repository.action_write():
+                        bound_problem = self._repository.create_problem_version(
+                            conversation_id=prepared.conversation_id,
+                            problem=NewProblem(
+                                statement_text=f"{q_item.stem}{opts_str}",
+                                status="explained" if explanation_obj is not None else "awaiting_supplement",
+                                clarity="clear",
+                                unclear_points=[],
+                                uncertainties=[],
+                                source=Source(type="student_text", text=source_label),
+                                student_answer_text=ans_text,
+                                solution_text=None,
+                                explanation=explanation_obj,
+                            ),
+                        )
+                        self._repository.upsert_context(
+                            prepared.conversation_id, active_problem_id=bound_problem.id
+                        )
+                        self._repository.clear_active_exercise(prepared.conversation_id)
+                        ctx.active_problem = bound_problem
+                        ctx.problem_id = bound_problem.id
+                        ctx.active_exercise = None
+                        ctx.exercise_id = None
+                        ctx.recovery["context"] = self._context_snapshot(ctx)
+                        self._repository.save_recovery(
+                            prepared.conversation_id, prepared.request_id, ctx.recovery
+                        )
+                    ctx.workspace = {}
+                    ctx.ref_table = None
+                    ctx.workspace_text = workspace_text(self._workspace(ctx))
+
+                ctx_lines = [
+                    f"资料复习产物：《{art.title}》（{pages_str}）",
+                    f"绑定题目 ID：{q_item.id}（请严格围绕该原题讲解/评价，不要擅自换题）",
+                    f"题型：{q_item.q_type}（{q_item.points} 分）",
+                    f"题干：{q_item.stem}{opts_str}",
+                ]
+                if q_item.attempt and q_item.attempt.user_answer is not None:
+                    ctx_lines.append(f"学生当前作答：{q_item.attempt.user_answer}")
+                if q_item.revealed_answer is not None:
+                    ctx_lines.append(f"参考答案（已解锁）：{q_item.revealed_answer}")
+                    if q_item.revealed_explanation:
+                        ctx_lines.append(f"参考解析：{q_item.revealed_explanation}")
+                else:
+                    ctx_lines.append("参考答案：尚未作答或尚未主动查看，讲解时请先引导思路，勿直接泄露答案。")
+                material_context = "\n".join(ctx_lines)
+            elif (
+                prepared.input.material_artifact_id
+                and prepared.input.material_kc_id
+                and self._repository.owner_id
+            ):
+                from app.materials.errors import GuideNotFoundError
+                from app.materials.repository import MaterialRepository
+
+                mat_repo = MaterialRepository(
+                    self._repository.db_path, owner_id=self._repository.owner_id
+                )
+                art = mat_repo.get_artifact_detail(prepared.input.material_artifact_id)
+                if not mat_repo.is_artifact_accessible_in_conversation(
+                    conversation_id=prepared.conversation_id, artifact_id=art.id
+                ):
+                    raise GuideNotFoundError("复习资料不属于当前会话或尚未就绪。")
+                if art.skeleton is None and art.status != "ready":
+                    raise GuideNotFoundError("复习资料尚未生成完成。")
+                kc_obj = None
+                for ch in (art.skeleton or {}).get("chapters", []) or []:
+                    for kc in ch.get("kcs", []) or []:
+                        if str(kc.get("id", "")) == prepared.input.material_kc_id:
+                            kc_obj = kc
+                            break
+                    if kc_obj is not None:
+                        break
+                if kc_obj is None:
+                    raise GuideNotFoundError("指定的知识点不存在。")
+                refs = ", ".join(str(r) for r in (kc_obj.get("source_refs") or [])) or "来源页码待核对"
+                material_context = (
+                    f"资料复习产物：《{art.title}》（页码：{refs}）\n"
+                    f"选中知识点：{kc_obj.get('label', '')}\n"
+                    f"请围绕该知识点为学生提供讲解、直观例子或针对性自测。"
+                )
+            elif prepared.input.workbench_source:
+                material_context = prepared.input.workbench_source.describe()
+            elif self._repository.owner_id:
+                with suppress(Exception):
+                    from app.materials.repository import MaterialRepository
+
+                    mat_repo = MaterialRepository(
+                        self._repository.db_path, owner_id=self._repository.owner_id
+                    )
+                    attached = mat_repo.list_conversation_materials(prepared.conversation_id)
+                    if attached:
+                        mat_lines = [f"当前会话已关联 {len(attached)} 份个人 PDF 资料："]
+                        for item in attached:
+                            m = item.material
+                            ov = item.readability
+                            read_str = ov.summary if ov else f"共 {m.page_count} 页"
+                            arts = [
+                                f"[第{a.start_page}-{a.end_page}页: 笔记={a.notes_status}/测试={a.quiz_status}/图谱={a.graph_status}]"
+                                for a in item.artifacts[:4]
+                            ]
+                            art_str = " 已有成果：" + " ".join(arts) if arts else "（尚未生成成果）"
+                            mat_lines.append(
+                                f"- material_id={m.id} 《{m.display_name}》（共 {m.page_count} 页；{read_str}）{art_str}"
+                            )
+                        material_context = "\n".join(mat_lines)
+
+            if prepared.input.workbench_source:
+                source_context = prepared.input.workbench_source.describe()
+                if material_context != source_context:
+                    material_context = "\n".join(filter(None, [material_context, source_context]))
+
             final_state = await graph.run(
                 {
                     "query": prepared.input.text,
@@ -326,6 +548,7 @@ class ReviewLoopMixin:
                     ),
                     "question_context": question_context,
                     "memory_context": memory_context,
+                    "material_context": material_context,
                     "last_suggestions": last_sugs,
                     "recent_turns_summary": recent_summary,
                     "history": ctx.history,
@@ -346,7 +569,7 @@ class ReviewLoopMixin:
             if ctx.answer_scope is None:
                 ctx.answer_scope = answer_gate.scope_of(prepared.input.text)
             composite_results = carried + self._dynamic_composite_results(final_state)
-            suggestions = self._dynamic_suggestions(final_state, composite_results)
+            suggestions = self._dynamic_suggestions(final_state, composite_results, ctx)
             reason = final_reply.terminal_reason(final_state)
             fallback_text = self._dynamic_reply(final_state, composite_results, ctx)
             # 澄清轮的问题原文就是要说的话，不再调模型改写；其余轮次在同一份
@@ -355,8 +578,23 @@ class ReviewLoopMixin:
             material = self._build_reply_material(
                 prepared, ctx, composite_results, suggestions, recent_summary
             )
+            exam_result = next((item for item in composite_results if item.action == "solve_uploaded_exam"), None)
+            artifact_results = [item for item in composite_results if item.action == "generate_material_artifact"]
+            artifact_receipt = artifact_results[0] if len(artifact_results) == 1 and all(
+                item.action in ("generate_material_artifact", "list_conversation_materials")
+                and (item.action == "generate_material_artifact" or item.status == "success")
+                for item in composite_results
+            ) else None
+            paper_lookup = self._paper_lookup_reply(ctx.result, prepared.input.text, composite_results)
+            lesson_reply = self._standalone_explanation_reply(ctx.tutoring, composite_results, ctx.answer_scope)
             direct_clarification = material is None
-            if direct_clarification:
+            if exam_result is not None:
+                provisional_text = str(exam_result.details.get("solution_markdown") or exam_result.message)
+            elif artifact_receipt is not None:
+                provisional_text = artifact_receipt.message
+            elif paper_lookup is not None or lesson_reply is not None:
+                provisional_text = paper_lookup or lesson_reply
+            elif direct_clarification:
                 provisional_text = fallback_text or clarification or ""
                 if clarification and clarification not in provisional_text:
                     provisional_text = (
@@ -435,7 +673,19 @@ class ReviewLoopMixin:
             state.saved = True
             # 工具决策阶段不转发正文；业务结果确定后才在同一份循环消息上
             # 终局流式生成最终回复（F010 C）。
-            if direct_clarification:
+            if exam_result is not None:
+                reply_text = provisional_text
+                reply_meta = {"mode": None, "reason": "uploaded_exam", "deltas": 0}
+            elif artifact_receipt is not None:
+                reply_text = provisional_text
+                reply_meta = {"mode": None, "reason": "material_artifact", "deltas": 0}
+            elif paper_lookup is not None:
+                reply_text = paper_lookup
+                reply_meta = {"mode": "clarification", "reason": "paper_lookup", "deltas": 0}
+            elif lesson_reply is not None:
+                reply_text = lesson_reply
+                reply_meta = {"mode": "clarification", "reason": "structured_explanation", "deltas": 0}
+            elif direct_clarification:
                 reply_text = provisional_text
                 reply_meta = {"mode": "clarification", "reason": "needs_user", "deltas": 0}
             else:
@@ -465,10 +715,69 @@ class ReviewLoopMixin:
                 {"reply": reply_meta, "reply_context": reply_context}
             )
         except ConversationStorageError:
-            queue.put_nowait(_storage_error_event(prepared))
+            saved = bool(
+                (getattr(ctx, "recovery", None) or {}).get("business_saved")
+            )
+            if saved:
+                message = "业务结果已保存，但执行记录暂时无法保存，请稍后刷新。"
+                try:
+                    self._repository.fail_turn(
+                        prepared.conversation_id,
+                        prepared.request_id,
+                        "STORAGE_UNAVAILABLE",
+                        message,
+                    )
+                    state.saved = True
+                except ConversationStorageError:
+                    logger.warning("执行记录保存失败，轮次留给启动恢复", exc_info=True)
+                queue.put_nowait(
+                    TurnErrorEvent(
+                        conversation_id=prepared.conversation_id,
+                        request_id=prepared.request_id,
+                        code="STORAGE_UNAVAILABLE",
+                        message=message,
+                        saved=True,
+                    )
+                )
+            else:
+                queue.put_nowait(_storage_error_event(prepared))
+            return
+        except QuotaError as exc:
+            saved = bool((getattr(ctx, "recovery", None) or {}).get("business_saved"))
+            if state.saved:
+                # 业务轮次已经完成，只差正文；保留 completed，通知前端可重生成。
+                queue.put_nowait(
+                    TurnErrorEvent(
+                        conversation_id=prepared.conversation_id,
+                        request_id=prepared.request_id,
+                        code=exc.code,  # type: ignore[arg-type]
+                        message=exc.message,
+                        quota=quota_of(exc),  # type: ignore[arg-type]
+                        saved=True,
+                    )
+                )
+            else:
+                queue.put_nowait(
+                    self._failure_event(
+                        prepared,
+                        exc.code,
+                        exc.message,
+                        state,
+                        quota=quota_of(exc),
+                        saved=saved,
+                    )
+                )
             return
         except QueryError as exc:
-            queue.put_nowait(self._failure_event(prepared, exc.code, exc.message, state))
+            queue.put_nowait(
+                self._failure_event(
+                    prepared,
+                    exc.code,
+                    exc.message,
+                    state,
+                    quota=quota_of(exc),
+                )
+            )
             return
         except Exception:
             logger.exception("动态复习调度执行失败")
@@ -519,6 +828,59 @@ class ReviewLoopMixin:
                 ctx.recovery["pending"] = []
             self._repository.save_recovery(prepared.conversation_id, prepared.request_id, ctx.recovery)
         return outcome
+
+    def _memory_checkpoint(
+        self,
+        prepared: ExecuteTurn,
+        ctx: _DynamicContext,
+        action_name: str,
+    ):
+        """记忆写入的同一个 SQLite 事务里保存动作检查点。
+
+        检查点同时写入“动作成功”的恢复结果：即使记忆提交后再保存最终
+        展示结果失败，重试也不会把已执行的记忆动作当成未完成。
+        检查点失败时抛出，记忆服务回滚整笔写入。
+        """
+
+        def checkpoint(connection) -> None:
+            previous = None
+            had_business_saved = bool(
+                ctx.recovery.get("business_saved")
+            )
+            if ctx.action_index >= 0:
+                entry = ctx.recovery["actions"][ctx.action_index]
+                previous = entry.get("outcome")
+                entry["outcome"] = ActionOutcome(
+                    action_name,
+                    "success",
+                    "学习记忆操作已保存",
+                    {},
+                ).to_dict()
+            ctx.recovery["business_saved"] = True
+            try:
+                self._repository.save_recovery_on(
+                    connection,
+                    prepared.conversation_id,
+                    prepared.request_id,
+                    ctx.recovery,
+                    merge=True,
+                )
+            except Exception:
+                # 只回滚本次新增的标记；同一轮前面已经成功保存的业务结果
+                # 不能被后一项检查点失败抹掉。
+                if had_business_saved:
+                    ctx.recovery["business_saved"] = True
+                else:
+                    ctx.recovery.pop("business_saved", None)
+                if ctx.action_index >= 0:
+                    entry = ctx.recovery["actions"][ctx.action_index]
+                    if previous is None:
+                        entry.pop("outcome", None)
+                    else:
+                        entry["outcome"] = previous
+                raise
+
+        return checkpoint
 
     # ------------------------------------------------------------------
     # F010 C：终局回复
@@ -592,6 +954,11 @@ class ReviewLoopMixin:
         reason = final_reply.terminal_reason(final_state)
         failure_reason: str | None = None
         note = self._finalize_note(ctx)
+        if getattr(ctx.tutoring, "kind", None) == "explanation":
+            note = "\n".join(part for part in (
+                note,
+                "结构化讲解已经在本轮正文完整呈现。只回答独立追问或报告其他操作，不复述本题步骤、错因和最终答案。",
+            ) if part)
         # 同一循环的消息里没有单独的“材料区”，学习记忆等跨轮文字上下文
         # 由材料补齐；工具结果与讲解仍只来自本轮真实消息。
         if material is not None:
@@ -612,6 +979,8 @@ class ReviewLoopMixin:
             mode = "truncated"
             reason = "length"
         except QueryError as exc:
+            if isinstance(exc, QuotaError):
+                raise
             logger.warning("终局回复不可用：%s", exc.code)
             mode = "fallback" if not pieces else "incomplete"
             failure_reason = (
@@ -716,6 +1085,15 @@ class ReviewLoopMixin:
                 # 协议层拒绝确实“没有执行”，不能因为消息不适合原样展示就删掉，
                 # 否则全部调用被拒时会变成“已完成”。这里改成一条可读的失败记录。
                 tool = str(details.get("tool") or "")
+                if tool in {"solve_uploaded_exam", "generate_material_artifact"}:
+                    if any(later.get("action") == "solve_uploaded_exam" for later in observations[index + 1:]):
+                        continue
+                    items.append(ActionResultItem(
+                        action=tool, status="failed",
+                        message="刚才没能读取试卷范围，请重试。",
+                        details={"retryable": True},
+                    ))
+                    continue
                 action = str(observation.get("action") or "")
                 if action:
                     label = _action_label(action)
@@ -858,8 +1236,23 @@ class ReviewLoopMixin:
 
         try:
             guarded = self._guard_dynamic_action(
-                action, ctx, review_state, prepared.input.text
+                action,
+                ctx,
+                review_state,
+                prepared.input.text,
+                allow_semantic_fallback=True,
             )
+            if (
+                guarded is not None
+                and guarded.error_code == "SEMANTIC_VERIFICATION_NEEDED"
+            ):
+                guarded = await self._resolve_semantic_authorization(
+                    action,
+                    ctx,
+                    review_state,
+                    prepared.input.text,
+                    guarded,
+                )
             outcome = (
                 guarded
                 if guarded is not None
@@ -874,6 +1267,8 @@ class ReviewLoopMixin:
         except (ConversationConflictError, ProblemNotFoundError, ProblemNotReadyError) as exc:
             outcome = ActionOutcome(action.action, "failed", str(exc), error_code="BUSINESS_REJECTED", needs_user=True)
         except QueryError as exc:
+            if isinstance(exc, QuotaError):
+                raise
             outcome = ActionOutcome(action.action, "failed", exc.message, error_code=exc.code, retryable=exc.code in RECOVERABLE_CODES)
         except QuestionError as exc:
             outcome = ActionOutcome(
@@ -1052,12 +1447,286 @@ class ReviewLoopMixin:
             "workspace_text": ctx.workspace_text,
         }
 
+    _SAVE_PROMPT_HINT_RE = re.compile(
+        r"(?:是否|要不?要|需要|帮你|帮您|把这[道个]?题).*?(?:保存|加入|添加|收进|记入|记到).*?错题"
+        r"|(?:保存|加入|收进).*?错题本.*?[吗呢？?]"
+    )
+    _AMBIGUOUS_PROMPT_RE = re.compile(r"(?:第\s*[12]\s*题|要保存哪|哪一道)")
+
+    _VIEW_SUGGESTION_RE = re.compile(r"(?:查看|打开|浏览|看看|回看|看下|列表|回顾)")
+    _SAVE_SUGGESTION_RE = re.compile(
+        r"(?:保存|存到|存进|存入|加入|添加|收进|记入|记到|收录).*?错题"
+        r"|(?:保存|存)这[道个]?题"
+    )
+
+    @classmethod
+    def _is_record_suggestion(cls, item: Any) -> bool:
+        if isinstance(item, dict):
+            kind = item.get("kind")
+            if kind == "record":
+                return True
+            if kind not in (None, ""):
+                return False
+            label = str(item.get("label") or "").strip()
+            action = str(item.get("action") or "").strip()
+            combined = f"{label} {action}".strip()
+        else:
+            combined = str(item or "").strip()
+        if not combined or cls._VIEW_SUGGESTION_RE.search(combined):
+            return False
+        return bool(cls._SAVE_SUGGESTION_RE.search(combined))
+
+    def _is_multi_question_ambiguous(self, ctx: _DynamicContext) -> bool:
+        question_results = getattr(ctx, "question_results", None) or []
+        if (
+            len(question_results) >= 2
+            and getattr(ctx, "problem_id", None) is None
+            and getattr(ctx, "exercise_id", None) is None
+            and getattr(ctx, "exercise_view", None) is None
+            and ctx.question_selection is None
+        ):
+            return True
+        if (
+            self._question_operation_problem(ctx) is not None
+            or getattr(ctx, "exercise_id", None) is not None
+            or getattr(ctx, "exercise_view", None) is not None
+        ):
+            return False
+        turns = self._repository.list_turns(ctx.conversation_id)
+        for turn in reversed(turns):
+            if turn.status == "completed":
+                return len(turn.question_results) >= 2
+        return False
+
+    def _problem_for_suggestion_target(
+        self, ctx: _DynamicContext, target_id: str
+    ) -> str | None:
+        """把建议携带的 target_id 解析成当前会话内的 problem_id；不合法返回 None。"""
+
+        prob = self._repository.get_problem(target_id)
+        if prob is not None and prob.conversation_id == ctx.conversation_id:
+            return prob.id
+        sel = self._repository.get_question_selection(ctx.conversation_id, target_id)
+        if sel is not None and sel.problem_id:
+            sel_prob = self._repository.get_problem(sel.problem_id)
+            if sel_prob is not None and sel_prob.conversation_id == ctx.conversation_id:
+                return sel_prob.id
+        ex = self._repository.get_exercise(target_id)
+        if ex is not None and ex.conversation_id == ctx.conversation_id and ex.problem_id:
+            ex_prob = self._repository.get_problem(ex.problem_id)
+            if ex_prob is not None and ex_prob.conversation_id == ctx.conversation_id:
+                return ex_prob.id
+        return None
+
+    def _resolve_mistake_save_target(
+        self,
+        ctx: _DynamicContext,
+        suggestions: list[Any],
+        *,
+        prefer_suggestion_target: bool = False,
+    ) -> tuple[str | None, bool]:
+        """解析 record_mistake 门禁绑定的唯一目标 problem_id；返回 (problem_id, invalid_target)。"""
+
+        problem = self._question_operation_problem(ctx)
+        if problem is None and ctx.question_selection is None:
+            problem = self._repository.get_active_problem(ctx.conversation_id)
+        exercise = getattr(ctx, "active_exercise", None)
+        if exercise is None and ctx.question_selection is None:
+            exercise = self._repository.get_active_exercise(ctx.conversation_id)
+        ex_problem_id: str | None = None
+        if exercise is not None and exercise.problem_id:
+            ex_prob = self._repository.get_problem(exercise.problem_id)
+            if ex_prob is not None and ex_prob.conversation_id == ctx.conversation_id:
+                ex_problem_id = ex_prob.id
+
+        if len(suggestions) == 1 and isinstance(suggestions[0], dict):
+            item = suggestions[0]
+            target_id = str(item.get("target_id") or "").strip()
+            if target_id and self._is_record_suggestion(item):
+                resolved = self._problem_for_suggestion_target(ctx, target_id)
+                if resolved is None:
+                    return None, True
+                if prefer_suggestion_target or (
+                    problem is None and ex_problem_id is None
+                ):
+                    return resolved, False
+                if resolved == getattr(problem, "id", None) or resolved == ex_problem_id:
+                    return resolved, False
+                if prefer_suggestion_target is False:
+                    # 原建议明确指向旧题，但当前有活跃新题：仅由调用方判断是否确认旧建议；
+                    # 对单纯“好/可以”确认，caller 会传 prefer_suggestion_target=True 命中原旧题。
+                    return getattr(problem, "id", None) or ex_problem_id, False
+
+        return getattr(problem, "id", None) or ex_problem_id, False
+
+    def _has_clear_save_prompt(
+        self, ctx: _DynamicContext, suggestions: list[Any]
+    ) -> bool:
+        if len(suggestions) >= 2 or self._is_multi_question_ambiguous(ctx):
+            return False
+        if len(suggestions) == 1:
+            item = suggestions[0]
+            if not self._is_record_suggestion(item):
+                return False
+            resolved_id, invalid = self._resolve_mistake_save_target(
+                ctx, suggestions, prefer_suggestion_target=True
+            )
+            return bool(resolved_id) and not invalid
+        problem = self._question_operation_problem(ctx)
+        if problem is None and ctx.question_selection is None:
+            problem = self._repository.get_active_problem(ctx.conversation_id)
+        if problem is None:
+            return False
+        turns = self._repository.list_turns(ctx.conversation_id)
+        for turn in reversed(turns):
+            if turn.status != "completed":
+                continue
+            reply = str(turn.assistant_message or "").strip()
+            if not reply or self._AMBIGUOUS_PROMPT_RE.search(reply):
+                return False
+            return bool(self._SAVE_PROMPT_HINT_RE.search(reply))
+        return False
+
+    def _auth_verifier(self) -> Any | None:
+        factory = getattr(self, "_make_auth_verifier", None)
+        if callable(factory):
+            return factory()
+        make_reply = getattr(self, "_make_reply", None)
+        if callable(make_reply):
+            with suppress(Exception):
+                reply = make_reply()
+                settings = getattr(reply, "_settings", None)
+                if settings is not None and getattr(settings, "api_key", None):
+                    return DeepSeekAuthVerifier(
+                        settings,
+                        http_async_client=getattr(reply, "_http_async_client", None),
+                    )
+        return None
+
+    async def _resolve_semantic_authorization(
+        self,
+        action: ActionPlan,
+        ctx: _DynamicContext,
+        review_state: dict[str, Any],
+        text: str,
+        pending_guard: ActionOutcome,
+    ) -> ActionOutcome | None:
+        """在快速词表未命中时，用独立轻量语义复核判断自然语言授权意图。"""
+
+        name = action.action
+        fallback_code = (
+            "ANSWER_NOT_REQUESTED"
+            if name in {"view_question_answer", "reveal_solution"}
+            else "AUTHORIZATION_REQUIRED"
+        )
+        verifier = self._auth_verifier()
+        if verifier is None:
+            needs_user = needs_user_for_denial(name, text, False)
+            return ActionOutcome(
+                name,
+                "clarification" if needs_user else "failed",
+                pending_guard.message,
+                details={
+                    "remedies": list((pending_guard.details or {}).get("remedies") or ["ask_user"]),
+                    "facts": {"action": name},
+                    "needs_user": needs_user,
+                    **({"rejected": True} if not needs_user else {}),
+                },
+                needs_user=needs_user,
+                error_code=fallback_code,
+                executed=False,
+            )
+
+        suggestions = [
+            str(item.get("label") if isinstance(item, dict) else item)
+            for item in (review_state.get("last_suggestions") or [])
+        ]
+        basis = action.parameters.get("basis")
+        quote = (
+            str(basis.get("quote") or basis.get("suggestion_id") or "").strip()
+            if isinstance(basis, dict)
+            else None
+        )
+        last_reply: str | None = None
+        turns = self._repository.list_turns(ctx.conversation_id)
+        for turn in reversed(turns):
+            if turn.status == "completed" and (turn.assistant_message or "").strip():
+                last_reply = turn.assistant_message
+                break
+        verdict = await verifier.verify(
+            action=name,
+            user_text=(text or "").strip(),
+            quote=quote or None,
+            suggestions=suggestions,
+            last_assistant_reply=last_reply,
+        )
+        if verdict == "explicit_request":
+            if name == "record_mistake":
+                target_id, invalid = self._resolve_mistake_save_target(
+                    ctx,
+                    list(review_state.get("last_suggestions") or []),
+                    prefer_suggestion_target=bool(
+                        is_save_affirmative(text)
+                        or (
+                            isinstance(basis, dict)
+                            and basis.get("kind") == "confirmed_suggestion"
+                        )
+                    ),
+                )
+                if invalid:
+                    return ActionOutcome(
+                        name,
+                        "clarification",
+                        "那道建议保存的题目已找不到或还没讲解完成，你想保存现在这一题吗？",
+                        details={
+                            "remedies": ["ask_user"],
+                            "facts": {"action": name, "reason": "stale_target"},
+                            "needs_user": True,
+                        },
+                        needs_user=True,
+                        error_code="AUTHORIZATION_REQUIRED",
+                        executed=False,
+                    )
+                ctx.authorized_mistake_problem_id = target_id
+            return None
+        if verdict == "clarify_needed":
+            return ActionOutcome(
+                name,
+                "clarification",
+                "你是想让我直接执行这个操作吗？确认一下我就处理。",
+                details={
+                    "remedies": ["ask_user"],
+                    "facts": {"action": name, "semantic_verdict": "clarify_needed"},
+                    "needs_user": True,
+                },
+                needs_user=True,
+                error_code=fallback_code,
+                executed=False,
+            )
+        needs_user = needs_user_for_denial(name, text, False)
+        return ActionOutcome(
+            name,
+            "clarification" if needs_user else "failed",
+            pending_guard.message,
+            details={
+                "remedies": list((pending_guard.details or {}).get("remedies") or ["ask_user"]),
+                "facts": {"action": name, "semantic_verdict": "not_requested"},
+                "needs_user": needs_user,
+                **({"rejected": True} if not needs_user else {}),
+            },
+            needs_user=needs_user,
+            error_code=fallback_code,
+            executed=False,
+        )
+
     def _guard_dynamic_action(
         self,
         action: ActionPlan,
         ctx: _DynamicContext,
         review_state: dict[str, Any],
         text: str,
+        *,
+        allow_semantic_fallback: bool = False,
     ) -> ActionOutcome | None:
         """执行层红线：写操作必须有事前请求，答案动作交给 C 门禁。
 
@@ -1145,8 +1814,32 @@ class ReviewLoopMixin:
                 )
 
             suggestions = list(review_state.get("last_suggestions") or [])
-            if _is_bare_affirmative(stripped) and len(suggestions) >= 2:
-                options = "、".join(str(item) for item in suggestions[:5])
+            if name == "record_mistake" and self._is_multi_question_ambiguous(ctx):
+                return reject(
+                    "AMBIGUOUS_BASIS",
+                    "要保存哪一道？",
+                    needs_user=True,
+                    remedies=["ask_user"],
+                    facts={"action": name, "reason": "multiple_questions"},
+                    rejected=False,
+                )
+
+            if (_is_bare_affirmative(stripped) or (name == "record_mistake" and is_save_affirmative(stripped))) and len(suggestions) >= 2:
+                if name == "record_mistake":
+                    return reject(
+                        "AMBIGUOUS_BASIS",
+                        "要保存哪一道？",
+                        needs_user=True,
+                        remedies=["ask_user"],
+                        facts={"action": name, "suggestions": suggestions[:5]},
+                        rejected=False,
+                    )
+                options = "、".join(
+                    str(item.get("label") or item.get("action") or "")
+                    if isinstance(item, dict)
+                    else str(item)
+                    for item in suggestions[:5]
+                )
                 return reject(
                     "AMBIGUOUS_BASIS",
                     f"上一轮有这些选项：{options}。你要先做哪一条？",
@@ -1156,13 +1849,32 @@ class ReviewLoopMixin:
                     rejected=False,
                 )
 
+            confirmable_save = (
+                name == "record_mistake"
+                and self._has_clear_save_prompt(ctx, suggestions)
+            )
+            has_valid_basis = isinstance(basis, dict) and bool(
+                str(basis.get("quote") or basis.get("suggestion_id") or "").strip()
+            )
             decision = authorize_action(
                 name,
                 stripped,
                 transcript=list(ctx.transcript),
                 entry_id=action.parameters.get("entry_id"),
+                confirmable_save=confirmable_save,
+                allow_semantic_fallback=allow_semantic_fallback,
+                has_valid_basis=has_valid_basis,
             )
             if decision is not None:
+                if decision.code == "SEMANTIC_VERIFICATION_NEEDED":
+                    return reject(
+                        decision.code,
+                        decision.message,
+                        needs_user=False,
+                        remedies=decision.remedies,
+                        facts=decision.facts,
+                        rejected=False,
+                    )
                 needs_user = needs_user_for_denial(
                     name, stripped, decision.needs_user
                 )
@@ -1174,6 +1886,29 @@ class ReviewLoopMixin:
                     facts=decision.facts,
                     rejected=not needs_user,
                 )
+            if name == "record_mistake":
+                via_suggestion = bool(
+                    (confirmable_save and is_save_affirmative(stripped))
+                    or (
+                        isinstance(basis, dict)
+                        and basis.get("kind") == "confirmed_suggestion"
+                    )
+                )
+                target_id, invalid = self._resolve_mistake_save_target(
+                    ctx,
+                    suggestions,
+                    prefer_suggestion_target=via_suggestion,
+                )
+                if invalid:
+                    return reject(
+                        "AUTHORIZATION_REQUIRED",
+                        "那道建议保存的题目已找不到或还没讲解完成，你想保存现在这一题吗？",
+                        needs_user=True,
+                        remedies=["ask_user"],
+                        facts={"action": name, "reason": "stale_target"},
+                        rejected=False,
+                    )
+                ctx.authorized_mistake_problem_id = target_id
 
         # 学习记忆写操作必须落在本轮真实返回过的条目上；这是对象归属校验，
         # 与“学生是否授权”分开。
@@ -1262,6 +1997,30 @@ class ReviewLoopMixin:
                     ))
             ctx.tutoring = None
             selected = ctx.question_card or ctx.question_selection
+            public_parts: list[str] = []
+            if ctx.question_card is not None:
+                card = ctx.question_card
+                if getattr(card, "statement_text", None):
+                    public_parts.append(f"题干：{card.statement_text}")
+                if getattr(card, "options", None):
+                    opts = " ".join(f"{opt.label}. {opt.text}" for opt in card.options)
+                    public_parts.append(f"选项：{opts}")
+                if getattr(card, "knowledge_points", None):
+                    public_parts.append(
+                        "公开考点："
+                        + "、".join(
+                            str(getattr(k, "name", k))
+                            for k in card.knowledge_points
+                        )
+                    )
+            elif ctx.active_exercise is not None:
+                public_parts.append(f"练习题干：{ctx.active_exercise.statement_text}")
+                if ctx.active_exercise.knowledge_point:
+                    public_parts.append(f"考点：{ctx.active_exercise.knowledge_point}")
+            elif ctx.active_problem is not None:
+                public_parts.append(f"题干：{ctx.active_problem.statement_text}")
+            if public_parts:
+                ctx.authorized_text = "\n".join(public_parts)
             ctx.answer_grant = answer_gate.AnswerGrant(
                 kind="question_explain",
                 scope=ctx.answer_scope or "hint",
@@ -1283,7 +2042,7 @@ class ReviewLoopMixin:
                     if ctx.answer_scope == "hint"
                     else "已取得公开题面，只回答这道题考什么，不展开完整解法或公开答案。"
                 ),
-                {"mode": "public_material"},
+                {"mode": "public_material", "scope": ctx.answer_scope},
                 needs_user=False,
             ))
         if name == "introduce":
@@ -1291,11 +2050,27 @@ class ReviewLoopMixin:
             if course:
                 ctx.confirmed_course = course
             course_label = course or "所选课程"
+            details: dict[str, Any] = {"course": course_label}
+            summary_parts = [f"已确认复习科目为【{course_label}】"]
+            if course:
+                with suppress(Exception):
+                    cap = self.questions.capability(course)
+                    has_bank = cap.status == "ready"
+                    details["has_question_bank"] = has_bank
+                    details["bank_status"] = cap.status
+                    if cap.message:
+                        summary_parts.append(cap.message)
+                papers_svc = getattr(self, "_papers", None)
+                if papers_svc is not None:
+                    with suppress(Exception):
+                        papers_res = papers_svc.list_papers(course=course)
+                        details["paper_count"] = len(papers_res.items)
+                        summary_parts.append(f"可下载历年试卷 {len(papers_res.items)} 份")
             return self._action_result(prepared, ctx, ActionOutcome(
                 name,
                 "success",
-                f"已确认复习科目为【{course_label}】",
-                {"course": course_label},
+                "；".join(summary_parts),
+                details,
             ))
 
         if name == "search_questions":
@@ -1317,17 +2092,26 @@ class ReviewLoopMixin:
             return await self._dynamic_explain(prepared, action, ctx, emit)
 
         if name in ("followup_problem", "followup"):
-            return await self._dynamic_followup(prepared, ctx, emit, action.parameters.get("target", "auto"))
+            return await self._dynamic_followup(
+                prepared,
+                ctx,
+                emit,
+                action.parameters.get("target", "auto"),
+                intent=str(action.parameters.get("intent") or "auto"),
+                ref=action.parameters.get("ref"),
+            )
 
         if name == "generate_exercise":
-            return await self._dynamic_generate_exercise(prepared, ctx, emit)
+            return await self._dynamic_generate_exercise(prepared, ctx, emit, action)
 
         if name == "evaluate_exercise":
             return await self._dynamic_evaluate_exercise(prepared, ctx, emit)
 
         if name == "reveal_solution":
             with self._repository.action_write():
-                return self._action_result(prepared, ctx, self._dynamic_reveal(ctx))
+                outcome = self._dynamic_reveal(ctx)
+                ctx.recovery["business_saved"] = True
+                return self._action_result(prepared, ctx, outcome)
 
         if name == "record_mistake":
             with self._repository.action_write():
@@ -1335,7 +2119,30 @@ class ReviewLoopMixin:
 
         if name == "record_feedback":
             active = ctx.active_problem
+            pending_actions = {
+                (item.action if isinstance(item, ActionPlan) else str(item.get("action") or ""))
+                for item in (review_state.get("pending") or [])[1:]
+                if isinstance(item, (ActionPlan, dict))
+            }
+            wants_next_question = bool(
+                pending_actions
+                & {"search_questions", "list_paper_questions", "select_question", "generate_exercise"}
+            ) or any(
+                token in (prepared.input.text or "")
+                for token in ("下一题", "下道", "下一道", "换题", "换一题", "换一道", "继续")
+            )
             if active is None or active.status != "explained":
+                if wants_next_question:
+                    return self._action_result(
+                        prepared,
+                        ctx,
+                        ActionOutcome(
+                            name,
+                            "success",
+                            "已收到，直接继续处理下一题。",
+                            {"recorded": False, "skipped_reason": "no_explained_problem"},
+                        ),
+                    )
                 return self._action_result(prepared, ctx, ActionOutcome(
                     name,
                     "clarification",
@@ -1349,6 +2156,7 @@ class ReviewLoopMixin:
                     problem_id=active.id,
                     message="已为您记录“我懂了”反馈。随时可以继续追问、练题或保存题目。",
                 )
+                ctx.recovery["business_saved"] = True
                 return self._action_result(prepared, ctx, ActionOutcome(
                     name,
                     "success",
@@ -1370,15 +2178,28 @@ class ReviewLoopMixin:
             )
 
         if name == "correct_memory":
-            # 记忆写入走独立连接，不占用会话库的写事务，避免与恢复记录互锁。
-            return self._action_result(
-                prepared, ctx, self._memory_correct_outcome(prepared, action, ctx)
+            # 记忆写入走独立连接，但检查点使用同一连接/事务：检查点失败时
+            # 记忆写入回滚，避免数据库与恢复记录不一致。
+            outcome = self._memory_correct_outcome(
+                prepared,
+                action,
+                ctx,
+                checkpoint=self._memory_checkpoint(prepared, ctx, name),
             )
+            if outcome.status == "success":
+                ctx.recovery["business_saved"] = True
+            return self._action_result(prepared, ctx, outcome)
 
         if name == "delete_memory":
-            return self._action_result(
-                prepared, ctx, self._memory_delete_outcome(prepared, action, ctx)
+            outcome = self._memory_delete_outcome(
+                prepared,
+                action,
+                ctx,
+                checkpoint=self._memory_checkpoint(prepared, ctx, name),
             )
+            if outcome.status == "success":
+                ctx.recovery["business_saved"] = True
+            return self._action_result(prepared, ctx, outcome)
 
         if name == "view_workspace":
             return self._view_workspace_outcome(prepared, action, ctx)
@@ -1392,6 +2213,19 @@ class ReviewLoopMixin:
         if name == "view_learning_summary":
             return self._view_learning_summary_outcome(prepared, action, ctx)
 
+        if name == "list_conversation_materials":
+            return self._list_conversation_materials_outcome(prepared, ctx)
+
+        if name == "solve_uploaded_exam" or (
+            name == "generate_material_artifact" and action.parameters.get("exam_scope")
+        ):
+            return await self._solve_uploaded_exam_outcome(prepared, action, emit)
+
+        if name == "generate_material_artifact":
+            return await self._generate_material_artifact_outcome(
+                prepared, action, ctx, emit
+            )
+
         if name == "clarify_or_reply":
             # 原生工具把澄清问题放在 ask_user 的 question 参数里；旧动作记录
             # 仍从 assistant_reply 读取，两种来源都兼容。
@@ -1404,3 +2238,360 @@ class ReviewLoopMixin:
             return self._action_result(prepared, ctx, ActionOutcome(name, "clarification", message, needs_user=True))
 
         return self._action_result(prepared, ctx, ActionOutcome(name, "failed", "暂不支持这个操作。"))
+
+    def _list_conversation_materials_outcome(
+        self, prepared: ExecuteTurn, ctx: _DynamicContext
+    ) -> ActionOutcome:
+        mat_svc = self._material_service_instance()
+        if mat_svc is None:
+            return ActionOutcome(
+                "list_conversation_materials",
+                "failed",
+                "个人资料服务暂时不可用。",
+                error_code="STORAGE_UNAVAILABLE",
+            )
+        items = mat_svc.list_conversation_materials(prepared.conversation_id)
+        if not items:
+            return ActionOutcome(
+                "list_conversation_materials",
+                "success",
+                "当前会话尚未上传或关联任何个人 PDF 资料。可以点击输入框「+」上传 PDF，或从「资料与成果」中选择。",
+                details={"materials": [], "count": 0},
+            )
+        summary_rows = []
+        labels = []
+        for it in items:
+            ov = it.readability
+            summary_rows.append(
+                {
+                    "material_id": it.material.id,
+                    "display_name": it.material.display_name,
+                    "page_count": it.material.page_count,
+                    "sufficient": bool(ov.sufficient) if ov is not None else True,
+                    "scanned_pages": list(ov.scanned_pages) if ov is not None else [],
+                }
+            )
+            labels.append(f"《{it.material.display_name}》（{it.material.page_count} 页）")
+        return ActionOutcome(
+            "list_conversation_materials",
+            "success",
+            f"当前会话共关联 {len(items)} 份资料：" + "、".join(labels),
+            details={"materials": summary_rows, "count": len(items)},
+        )
+
+    async def _solve_uploaded_exam_outcome(
+        self,
+        prepared: ExecuteTurn,
+        action: ActionPlan,
+        emit: Callable[[str, str], None],
+    ) -> ActionOutcome:
+        from app.materials.errors import MaterialError, MaterialPageLimitError
+
+        name = "solve_uploaded_exam"
+        mat_svc = self._material_service_instance()
+        if mat_svc is None:
+            return ActionOutcome(name, "failed", "试卷服务暂时不可用。")
+        items = mat_svc.list_conversation_materials(prepared.conversation_id)
+        material_id = action.parameters.get("material_id")
+        if material_id:
+            candidates = [item for item in items if item.material.id == material_id]
+            if not candidates:
+                candidates = [item for item in items if item.material.display_name == material_id]
+        else:
+            candidates = [item for item in items if item.material.is_exam] or items
+        if len(candidates) != 1:
+            question = "你想讲解哪一份试卷？请告诉我文件名。" if items else "请先上传要讲解的试卷。"
+            return ActionOutcome(name, "clarification", question, needs_user=True)
+
+        query = prepared.input.text
+        refs = explicit_question_refs(query)
+        focus = action.parameters.get("focus")
+        answer_only = action.parameters.get("answer_only") is True
+        mat = candidates[0].material
+        emit("generating_material", f"正在核对并解答《{mat.display_name}》的原题…")
+        try:
+            result = await mat_svc.solve_uploaded_exam(
+                conversation_id=prepared.conversation_id,
+                material_id=mat.id,
+                query=query,
+                focus=focus,
+                answer_only=answer_only,
+                question_refs=refs,
+                start_page=action.parameters.get("start_page"),
+                end_page=action.parameters.get("end_page"),
+            )
+        except MaterialPageLimitError as exc:
+            return ActionOutcome(name, "clarification", str(exc), needs_user=True)
+        except MaterialError as exc:
+            return ActionOutcome(name, "failed", str(exc), retryable=True)
+        except QuotaError:
+            raise
+        except QueryError as exc:
+            return ActionOutcome(name, "failed", exc.message, error_code=exc.code, retryable=True)
+
+        sections: list[str] = []
+        for answer in result.answers:
+            pages = "、".join(map(str, answer.source_pages))
+            heading = f"### {answer.reference}（PDF 第 {pages} 页）"
+            if answer_only:
+                sections.append(f"{heading}\n\n{answer.solution}")
+                continue
+            statement = f"**原题**  {answer.statement}\n\n" if answer.statement else ""
+            sections.append(f"{heading}\n\n{statement}{answer.solution}")
+        shown_pages = sorted({page for answer in result.answers for page in answer.source_pages})
+        if result.no_match:
+            checked = "、".join(map(str, result.checked_pages))
+            if result.next_page or len(result.checked_pages) < mat.page_count:
+                sections.append(f"已查看 PDF 第 {checked} 页，这些页没有符合要求的题目。")
+            else:
+                sections.append(result.no_match)
+            shown_pages = result.checked_pages
+        if result.unresolved:
+            sections.append("**尚未解答**\n\n" + "\n".join(f"- {item}" for item in result.unresolved))
+            if not shown_pages:
+                shown_pages = result.checked_pages
+        if result.next_page is not None:
+            sections.append(f"还有原页未查看。回复「继续看第 {result.next_page} 页起」可按同样要求继续。")
+        needs_user = bool(result.unresolved and not result.answers and result.next_page is None)
+        return ActionOutcome(
+            name, "clarification" if needs_user else "success",
+            (result.no_match or f"已给出 {len(result.answers)} 道原题的回答。") if not needs_user else "有原题需要核对。",
+            details={
+                "material_id": mat.id,
+                "material_title": mat.display_name,
+                "source_pages": shown_pages,
+                "solution_markdown": "\n\n".join(sections),
+                "next_page": result.next_page,
+            },
+            needs_user=needs_user,
+        )
+
+    async def _generate_material_artifact_outcome(
+        self,
+        prepared: ExecuteTurn,
+        action: ActionPlan,
+        ctx: _DynamicContext,
+        emit: Callable[[str, str], None],
+    ) -> ActionOutcome:
+        from app.materials.models import describe_artifact_input
+        from app.materials.errors import (
+            GuideInsufficientError,
+            MaterialConflictError,
+            MaterialCoverageRequiredError,
+            MaterialError,
+            MaterialNotFoundError,
+            MaterialPageLimitError,
+        )
+
+        mat_svc = self._material_service_instance()
+        if mat_svc is None:
+            return ActionOutcome(
+                "generate_material_artifact",
+                "failed",
+                "个人资料服务暂时不可用。",
+                error_code="STORAGE_UNAVAILABLE",
+            )
+        items = mat_svc.list_conversation_materials(prepared.conversation_id)
+        if not items:
+            return ActionOutcome(
+                "generate_material_artifact",
+                "clarification",
+                "当前会话还没有上传或关联个人 PDF 资料，请先点击输入框左下角「＋」上传 PDF。",
+                details={"remedies": ["ask_user"]},
+                needs_user=True,
+            )
+
+        requested_mid = str(action.parameters.get("material_id") or "").strip()
+        target_item = None
+        if requested_mid:
+            target_item = next((it for it in items if it.material.id == requested_mid), None)
+            if target_item is None:
+                matches = [it for it in items if it.material.display_name == requested_mid]
+                if len(matches) > 1:
+                    return ActionOutcome(
+                        "generate_material_artifact",
+                        "clarification",
+                        f"当前会话有多份同名资料《{requested_mid}》，请从对应的资料卡选择。",
+                        details={
+                            "materials": [
+                                {
+                                    "material_id": it.material.id,
+                                    "display_name": it.material.display_name,
+                                    "page_count": it.material.page_count,
+                                }
+                                for it in matches
+                            ],
+                            "remedies": ["ask_user"],
+                        },
+                        needs_user=True,
+                    )
+                if matches:
+                    target_item = matches[0]
+            if target_item is None:
+                names = "、".join(f"《{it.material.display_name}》" for it in items)
+                return ActionOutcome(
+                    "generate_material_artifact",
+                    "clarification",
+                    f"未在当前会话找到指定资料，当前会话已关联：{names}。请告诉我要用哪一份？",
+                    details={"remedies": ["ask_user"]},
+                    needs_user=True,
+                )
+        elif len(items) == 1:
+            target_item = items[0]
+        else:
+            names = "、".join(f"《{it.material.display_name}》" for it in items)
+            return ActionOutcome(
+                "generate_material_artifact",
+                "clarification",
+                f"当前会话有多份资料（{names}），你想基于哪一份来生成？",
+                details={"remedies": ["ask_user"]},
+                needs_user=True,
+            )
+
+        raw_outputs = action.parameters.get("outputs") or ["notes", "quiz", "graph"]
+        outputs = [str(o) for o in raw_outputs if o in ("notes", "quiz", "graph")]
+        if not outputs:
+            outputs = ["notes", "quiz", "graph"]
+
+        max_range = getattr(getattr(mat_svc, "_config", None), "max_range_pages", 40)
+        start_page = action.parameters.get("start_page")
+        end_page = action.parameters.get("end_page")
+        if start_page is None and end_page is None:
+            start_page = 1
+            end_page = min(target_item.material.page_count, max_range)
+        elif start_page is not None and end_page is None:
+            end_page = int(start_page)
+        elif start_page is None and end_page is not None:
+            start_page = 1
+
+        course_hint = action.parameters.get("course_hint") or ctx.confirmed_course
+        output_labels = {"notes": "章节笔记", "quiz": "章节测试", "graph": "知识图谱"}
+        selected_str = "、".join(output_labels.get(o, o) for o in outputs)
+        emit("generating_material", f"正在生成《{target_item.material.display_name}》的{selected_str}…")
+
+        try:
+            artifact = await mat_svc.generate_or_get_artifact(
+                target_item.material.id,
+                start_page=int(start_page),
+                end_page=int(end_page),
+                course_hint=str(course_hint) if course_hint else None,
+                outputs=outputs,
+                conversation_id=prepared.conversation_id,
+                progress_callback=lambda _stage, label: emit(
+                    "generating_material",
+                    f"正在{label}：《{target_item.material.display_name}》…",
+                ),
+            )
+        except MaterialCoverageRequiredError as exc:
+            return ActionOutcome(
+                "generate_material_artifact",
+                "clarification",
+                f"《{target_item.material.display_name}》所选范围还有 {len(exc.missing_pages)} 页待识别。"
+                f"点「识别并生成」即可补齐后再生成{selected_str}。",
+                details={
+                    **exc.detail(),
+                    "material_id": target_item.material.id,
+                    "material_title": target_item.material.display_name,
+                    "start_page": int(start_page),
+                    "end_page": int(end_page),
+                    "outputs": outputs,
+                    "course_hint": str(course_hint) if course_hint else None,
+                },
+                needs_user=True,
+            )
+        except (GuideInsufficientError, MaterialPageLimitError) as exc:
+            return ActionOutcome(
+                "generate_material_artifact",
+                "failed",
+                str(exc),
+                details={
+                    "material_id": target_item.material.id,
+                    "material_title": target_item.material.display_name,
+                },
+                error_code=getattr(exc, "code", "MATERIAL_GENERATION_ERROR"),
+                retryable=False,
+                needs_user=True,
+            )
+        except (MaterialConflictError, MaterialNotFoundError) as exc:
+            return ActionOutcome(
+                "generate_material_artifact",
+                "failed",
+                str(exc),
+                details={"material_id": target_item.material.id},
+                error_code=getattr(exc, "code", "MATERIAL_GENERATION_ERROR"),
+                retryable=False,
+            )
+        except MaterialError as exc:
+            return ActionOutcome(
+                "generate_material_artifact",
+                "failed",
+                str(exc),
+                details={"material_id": target_item.material.id},
+                error_code=getattr(exc, "code", "MATERIAL_GENERATION_ERROR"),
+                retryable=True,
+            )
+
+        ctx.recovery["business_saved"] = True
+        ready_parts = []
+        failed_parts = []
+        if "notes" in outputs:
+            (ready_parts if artifact.notes_status == "ready" else failed_parts).append("章节笔记")
+        if "quiz" in outputs:
+            (ready_parts if artifact.quiz_status == "ready" else failed_parts).append("章节测试")
+        if "graph" in outputs:
+            (ready_parts if artifact.graph_status == "ready" else failed_parts).append("知识图谱")
+
+        page_label = (
+            f"第 {artifact.start_page}–{artifact.end_page} 页"
+            if artifact.start_page != artifact.end_page
+            else f"第 {artifact.start_page} 页"
+        )
+        input_coverage = getattr(artifact, "coverage", None)
+        output_coverage = getattr(artifact, "output_coverage", {})
+        partial = bool(input_coverage and input_coverage.partial) or any(
+            output_coverage[key].partial for key in outputs if key in output_coverage
+        )
+        details = {
+            "artifact_id": artifact.id,
+            "material_id": artifact.material_id,
+            "material_title": artifact.title,
+            "start_page": artifact.start_page,
+            "end_page": artifact.end_page,
+            "outputs": outputs,
+            "notes_status": artifact.notes_status,
+            "quiz_status": artifact.quiz_status,
+            "graph_status": artifact.graph_status,
+            "question_count": len(artifact.questions),
+            "reused": bool(artifact.reused),
+            "coverage_warnings": list(artifact.coverage_warnings),
+            "partial_coverage": partial,
+        }
+        workbench_hint = "可在复习工作台查看。" if ready_parts else ""
+        if failed_parts:
+            msg = (
+                f"《{artifact.title}》（{page_label}）"
+                + (f"已完成{'、'.join(ready_parts)}；" if ready_parts else "")
+                + f"{'、'.join(failed_parts)}生成未完成：{artifact.error_message or '可重试未完成部分。'}"
+                + (" 资料仍有缺页。" if input_coverage and input_coverage.missing_pages and ready_parts else "")
+                + workbench_hint
+            )
+            return ActionOutcome(
+                "generate_material_artifact",
+                "failed",
+                msg,
+                details={**details, "retryable": True},
+                error_code=artifact.error_code or "GENERATE_FAILED",
+                retryable=True,
+            )
+        reuse_hint = "（已复用既有成果）" if artifact.reused else ""
+        msg = f"已为你生成《{artifact.title}》（{page_label}）的{'、'.join(ready_parts)}{reuse_hint}。"
+        msg += describe_artifact_input(
+            input_coverage, quiz_question_count=len(artifact.questions) if "quiz" in outputs else None
+        )
+        msg += workbench_hint
+        return ActionOutcome(
+            "generate_material_artifact",
+            "success",
+            msg,
+            details=details,
+        )

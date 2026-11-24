@@ -230,5 +230,16 @@ class FakeQuestionRuntime:
             path=Path(__file__), mime="image/png", page=1, description="测试题图"
         )
 
+    def source_for_card(self, card: QuestionCard, kind: str, page: int):
+        from app.questions.models import AssetPayload
+        from pathlib import Path
+
+        return AssetPayload(
+            path=Path(__file__),
+            mime="application/pdf",
+            page=page,
+            description=f"测试来源 {kind}",
+        )
+
     def close(self) -> None:
         self.closed = True

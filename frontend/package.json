@@ -8,16 +8,18 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node --test src/lib/queryApi.test.ts src/lib/conversationsApi.test.ts src/lib/attachmentsApi.test.ts src/lib/mistakesApi.test.ts src/lib/memoryApi.test.ts src/lib/display.test.ts && vitest run",
+    "test": "node --test src/lib/queryApi.test.ts src/lib/conversationsApi.test.ts src/lib/attachmentsApi.test.ts src/lib/mistakesApi.test.ts src/lib/memoryApi.test.ts src/lib/display.test.ts src/lib/usageApi.test.ts && vitest run",
     "test:dom": "vitest run"
   },
   "dependencies": {
+    "katex": "^0.19.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
+    "@types/katex": "^0.16.8",
     "@types/node": "^24.0.0",
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",

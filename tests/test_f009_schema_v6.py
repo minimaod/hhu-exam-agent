@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.conversations import schema
 from app.conversations.errors import ConversationStorageError
+from tests.f012_support import TEST_MIGRATION_OWNER
 
 
 def build_v5(path: Path) -> None:
@@ -48,17 +49,18 @@ def _tables(path: Path) -> set[str]:
 
 def test_fresh_database_creates_v6_memory_tables(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
-    schema.initialize_database(path)
+    schema.initialize_database(path, migration_owner=TEST_MIGRATION_OWNER)
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert {"memory_corrections", "memory_exclusions"} <= _tables(path)
         columns = [
             row[1]
             for row in connection.execute("PRAGMA table_info(memory_corrections)")
         ]
         assert columns == [
+            "owner_id",
             "entry_key",
             "course",
             "knowledge_point",
@@ -75,23 +77,23 @@ def test_fresh_database_creates_v6_memory_tables(tmp_path: Path) -> None:
 def test_v5_migrates_to_v6_without_touching_old_rows(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
     build_v5(path)
-    schema.initialize_database(path)
+    schema.initialize_database(path, migration_owner=TEST_MIGRATION_OWNER)
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert connection.execute("SELECT title FROM conversations").fetchone()[0] == "升级前的会话"
         # 只建表、不回填：旧练习不会凭空出现在记忆覆盖表里。
         assert connection.execute("SELECT COUNT(*) FROM memory_corrections").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM memory_exclusions").fetchone()[0] == 0
         connection.execute(
-            "INSERT INTO memory_corrections VALUES (?, ?, ?, ?, ?, ?)",
-            ("exercise:x", None, None, "备注", "2026-11-01T00:00:00+00:00", "2026-11-01T00:00:00+00:00"),
+            "INSERT INTO memory_corrections VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (TEST_MIGRATION_OWNER.id, "exercise:x", None, None, "备注", "2026-11-01T00:00:00+00:00", "2026-11-01T00:00:00+00:00"),
         )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
-                "INSERT INTO memory_corrections VALUES (?, ?, ?, ?, ?, ?)",
-                ("exercise:x", None, None, "重复", "2026-11-01T00:00:00+00:00", "2026-11-01T00:00:00+00:00"),
+                "INSERT INTO memory_corrections VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (TEST_MIGRATION_OWNER.id, "exercise:x", None, None, "重复", "2026-11-01T00:00:00+00:00", "2026-11-01T00:00:00+00:00"),
             )
     finally:
         connection.close()
@@ -108,7 +110,7 @@ def test_v6_migration_failure_rolls_back(
         lambda: ("CREATE TABLE broken (",),
     )
     with pytest.raises(ConversationStorageError):
-        schema.initialize_database(path)
+        schema.initialize_database(path, migration_owner=TEST_MIGRATION_OWNER)
 
     connection = sqlite3.connect(path)
     try:
@@ -123,14 +125,14 @@ def test_v6_migration_failure_rolls_back(
 
 def test_unknown_v6_structure_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
-    schema.initialize_database(path)
+    schema.initialize_database(path, migration_owner=TEST_MIGRATION_OWNER)
     connection = sqlite3.connect(path)
     connection.execute("DROP TABLE memory_exclusions")
     connection.commit()
     connection.close()
 
     with pytest.raises(ConversationStorageError) as error:
-        schema.initialize_database(path)
+        schema.initialize_database(path, migration_owner=TEST_MIGRATION_OWNER)
     assert "版本" in str(error.value) or "结构" in str(error.value)
     assert "memory_exclusions" not in _tables(path)
 

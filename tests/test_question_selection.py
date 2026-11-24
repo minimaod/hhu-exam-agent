@@ -28,11 +28,12 @@ from evals.f010_d.legacy_intent import candidate_number, extract_intent
 from app.questions.models import QuestionFormula, QuestionOption
 from app.questions.runtime import QuestionRuntime
 from tests.question_fakes import BUILD_ID, SOURCE_VERSION, sample_card
+from tests.f012_support import TEST_MIGRATION_OWNER
 
 
 def _repo(tmp_path: Path) -> ConversationRepository:
     repository = ConversationRepository(tmp_path / "study.sqlite3")
-    repository.initialize()
+    repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
     return repository
 
 
@@ -40,7 +41,7 @@ def test_v5_schema_creates_selection_tables_and_partial_index(
     study_db_path: Path,
 ) -> None:
     repository = ConversationRepository(study_db_path)
-    repository.initialize()
+    repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(study_db_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
@@ -62,37 +63,37 @@ def test_v5_schema_creates_selection_tables_and_partial_index(
 
 
 def test_v4_database_migrates_to_v5_without_touching_old_rows(
-    study_db_path: Path,
+    tmp_path: Path,
 ) -> None:
-    repository = ConversationRepository(study_db_path)
-    repository.initialize()
-    conversation = repository.create_conversation()
-
-    with sqlite3.connect(study_db_path) as connection:
-        connection.execute("DROP INDEX question_selections_one_active")
-        connection.execute("DROP INDEX question_selections_conversation")
-        connection.execute("DROP TABLE question_selections")
-        connection.execute("DROP TABLE exercise_question_sources")
-        connection.execute("DROP TABLE record_question_sources")
-        connection.execute("DROP TABLE memory_corrections")
-        connection.execute("DROP TABLE memory_exclusions")
+    path = tmp_path / "v4.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in schema._CREATE_V4_STATEMENTS:
+            connection.execute(statement)
         connection.execute("PRAGMA user_version = 4")
+        connection.execute(
+            "INSERT INTO conversations VALUES (?,?,?,?)",
+            ("conv-v4", "旧会话", "2026-01-01", "2026-01-01"),
+        )
         connection.commit()
+    finally:
+        connection.close()
+    repository = ConversationRepository(path)
+    repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
-    repository.initialize()
-
-    with sqlite3.connect(study_db_path) as connection:
+    with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         assert connection.execute(
-            "SELECT title FROM conversations WHERE id = ?", (conversation.id,)
-        ).fetchone()[0]
+            "SELECT title FROM conversations WHERE id = 'conv-v4'"
+        ).fetchone()[0] == "旧会话"
 
 
 def test_v5_migration_failure_rolls_back(
     study_db_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repository = ConversationRepository(study_db_path)
-    repository.initialize()
+    repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
     with sqlite3.connect(study_db_path) as connection:
         connection.execute("DROP INDEX question_selections_one_active")
         connection.execute("DROP INDEX question_selections_conversation")
@@ -110,7 +111,7 @@ def test_v5_migration_failure_rolls_back(
         lambda: ("CREATE TABLE broken (",),
     )
     with pytest.raises(Exception):
-        repository.initialize()
+        repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(study_db_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 4

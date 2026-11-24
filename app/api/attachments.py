@@ -10,14 +10,17 @@ from typing import Annotated
 from uuid import UUID
 
 import anyio
-from fastapi import APIRouter, File, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import FileResponse
 
+from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.conversations.errors import (
     AttachmentNotFoundError,
     AttachmentStorageError,
     ConversationNotFoundError,
 )
+from app.quota.errors import QuotaStorageError
 from app.conversations.repository import ConversationRepository
 from app.conversations.service import ConversationStoreState
 from app import images
@@ -33,11 +36,11 @@ from app.tutoring.models import AttachmentMeta
 router = APIRouter(tags=["attachments"])
 
 
-def _repository(request: Request) -> ConversationRepository:
+def _repository(request: Request, user: User) -> ConversationRepository:
     state: ConversationStoreState = request.app.state.conversation_store
-    if state.repository is None:
+    if state.db_path is None or state.error is not None:
         raise AttachmentStorageError("本地学习数据暂时不可用，请稍后再试。")
-    return state.repository
+    return ConversationRepository(state.db_path).scoped(user.id)
 
 
 def _root() -> Path:
@@ -54,10 +57,18 @@ async def upload_attachment(
     conversation_id: UUID,
     request: Request,
     file: Annotated[UploadFile, File(...)],
+    user: Annotated[User, Depends(require_user)],
 ) -> AttachmentMeta:
-    repository = _repository(request)
+    repository = _repository(request, user)
     if repository.get_conversation(str(conversation_id)) is None:
         raise ConversationNotFoundError("会话不存在。")
+
+    gate = getattr(request.app.state, "usage_gate", None)
+    usage_config = getattr(request.app.state, "usage_config", None)
+    if gate is None:
+        raise QuotaStorageError()
+    if getattr(usage_config, "error", None):
+        raise AttachmentStorageError("用量限制配置暂时不可用，请稍后再试。")
 
     data = await file.read(MAX_IMAGE_BYTES + 1)
     if len(data) > MAX_IMAGE_BYTES:
@@ -82,6 +93,9 @@ async def upload_attachment(
             height=image.height,
             size_bytes=len(image.data),
             sha256=image.sha256,
+            quota_check=lambda connection: gate.check_and_insert_image(
+                connection, user.id
+            ),
         )
     except Exception:
         delete_attachment(_root(), stored_name)
@@ -105,8 +119,9 @@ def read_attachment(
     conversation_id: UUID,
     attachment_id: UUID,
     request: Request,
+    user: Annotated[User, Depends(require_user)],
 ) -> FileResponse:
-    repository = _repository(request)
+    repository = _repository(request, user)
     attachment = repository.get_attachment(
         str(conversation_id), str(attachment_id)
     )

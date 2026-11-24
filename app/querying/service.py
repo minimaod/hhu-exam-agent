@@ -25,6 +25,7 @@ from app.querying.models import (
     Understander,
 )
 from app.querying.workflow import build_workflow
+from app.quota.errors import quota_of
 from app.sse import encode_sse_event
 from app.streaming import SENTINEL, stream_events
 
@@ -94,7 +95,13 @@ class QueryService:
                 raise QueryError("QUERY_FAILED", _QUERY_FAILED_MESSAGE)
             queue.put_nowait(result)
         except QueryError as exc:
-            queue.put_nowait(ErrorEvent(code=exc.code, message=exc.message))
+            queue.put_nowait(
+                ErrorEvent(
+                    code=exc.code,
+                    message=exc.message,
+                    quota=quota_of(exc),  # type: ignore[arg-type]
+                )
+            )
         except CatalogUnavailableError:
             queue.put_nowait(
                 ErrorEvent(code="CATALOG_UNAVAILABLE", message=_CATALOG_MESSAGE)

@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import UUID
 
 from dotenv import dotenv_values
 
@@ -122,3 +123,167 @@ def load_config_state() -> QueryConfigState:
         return QueryConfigState(settings=load_query_settings(), error=None)
     except QueryConfigError as exc:
         return QueryConfigState(settings=None, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# F012：登录会话与 CSRF 配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_SESSION_TTL_DAYS = 14
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://127.0.0.1:18080",
+    "http://localhost:18080",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+)
+
+
+@dataclass(frozen=True)
+class AuthConfigState:
+    cookie_name: str = "hhu_session"
+    cookie_secure: bool = False
+    session_ttl_days: int = DEFAULT_SESSION_TTL_DAYS
+    allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
+    error: str | None = None
+
+
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("HHU_COOKIE_SECURE 只接受 true/false。")
+
+
+def load_auth_config_state() -> AuthConfigState:
+    """读取登录 Cookie 配置；非法值不阻止健康检查/试卷，但认证返回 503。"""
+
+    source = _SettingsSource(ENV_FILE)
+    try:
+        cookie_secure = _parse_bool(source.get("HHU_COOKIE_SECURE"), False)
+        ttl_raw = source.get("HHU_SESSION_TTL_DAYS")
+        ttl = DEFAULT_SESSION_TTL_DAYS if not ttl_raw else int(ttl_raw)
+        if not 1 <= ttl <= 365:
+            raise ValueError("HHU_SESSION_TTL_DAYS 必须在 1–365 之间。")
+        origins_raw = source.get("HHU_ALLOWED_ORIGINS")
+        origins = (
+            tuple(
+                item.strip().rstrip("/")
+                for item in origins_raw.split(",")
+                if item.strip()
+            )
+            if origins_raw
+            else DEFAULT_ALLOWED_ORIGINS
+        )
+        return AuthConfigState(
+            cookie_secure=cookie_secure,
+            session_ttl_days=ttl,
+            allowed_origins=origins,
+        )
+    except (ValueError, QueryConfigError) as exc:
+        return AuthConfigState(error=f"登录配置无效：{exc}")
+
+
+# ---------------------------------------------------------------------------
+# F013：模型与图片用量配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODEL_DAILY_LIMIT = 30
+DEFAULT_SITE_DAILY_LIMIT = 500
+DEFAULT_IMAGE_DAILY_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class UsageConfigState:
+    model_requests: int = DEFAULT_MODEL_DAILY_LIMIT
+    site_requests: int = DEFAULT_SITE_DAILY_LIMIT
+    images: int = DEFAULT_IMAGE_DAILY_LIMIT
+    unlimited_owner_id: str | None = None
+    error: str | None = None
+
+
+def _parse_limit(raw: str | None, name: str, default: int) -> int:
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是非负整数。") from exc
+    if value < 0:
+        raise ValueError(f"{name} 必须是非负整数。")
+    return value
+
+
+def load_usage_config_state() -> UsageConfigState:
+    """读取额度配置；非法值不阻止健康检查和试卷，但模型入口返回 503。"""
+
+    source = _SettingsSource(ENV_FILE)
+    try:
+        owner_id = (source.get("HHU_UNLIMITED_OWNER_ID") or "").strip()
+        return UsageConfigState(
+            unlimited_owner_id=str(UUID(owner_id)) if owner_id else None,
+            model_requests=_parse_limit(
+                source.get("HHU_MODEL_DAILY_LIMIT"),
+                "HHU_MODEL_DAILY_LIMIT",
+                DEFAULT_MODEL_DAILY_LIMIT,
+            ),
+            site_requests=_parse_limit(
+                source.get("HHU_SITE_DAILY_LIMIT"),
+                "HHU_SITE_DAILY_LIMIT",
+                DEFAULT_SITE_DAILY_LIMIT,
+            ),
+            images=_parse_limit(
+                source.get("HHU_IMAGE_DAILY_LIMIT"),
+                "HHU_IMAGE_DAILY_LIMIT",
+                DEFAULT_IMAGE_DAILY_LIMIT,
+            ),
+        )
+    except (ValueError, QueryConfigError) as exc:
+        return UsageConfigState(error=f"用量配置无效：{exc}")
+
+
+# ---------------------------------------------------------------------------
+# F019 第二阶段：个人资料 PDF 上传与隔离解析配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_MATERIAL_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_MATERIAL_MAX_PAGES = 80
+DEFAULT_MATERIAL_MAX_RANGE_PAGES = 40
+DEFAULT_MATERIAL_PARSE_TIMEOUT_SECONDS = 20.0
+DEFAULT_MATERIAL_MAX_PER_USER = 20
+
+
+@dataclass(frozen=True)
+class MaterialConfigState:
+    max_bytes: int = DEFAULT_MATERIAL_MAX_BYTES
+    max_pages: int = DEFAULT_MATERIAL_MAX_PAGES
+    max_range_pages: int = DEFAULT_MATERIAL_MAX_RANGE_PAGES
+    parse_timeout_seconds: float = DEFAULT_MATERIAL_PARSE_TIMEOUT_SECONDS
+    max_per_user: int = DEFAULT_MATERIAL_MAX_PER_USER
+
+
+# ---------------------------------------------------------------------------
+# F020：资料自愿贡献与公共题库审核配置
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONTRIBUTION_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_CONTRIBUTION_MAX_PAGES = 200
+DEFAULT_CONTRIBUTION_PARSE_TIMEOUT_SECONDS = 20.0
+
+
+@dataclass(frozen=True)
+class ContributionConfigState:
+    max_bytes: int = DEFAULT_CONTRIBUTION_MAX_BYTES
+    max_pages: int = DEFAULT_CONTRIBUTION_MAX_PAGES
+    parse_timeout_seconds: float = DEFAULT_CONTRIBUTION_PARSE_TIMEOUT_SECONDS
+    storage_dir: str | None = None
+
+
+def load_contribution_config_state() -> ContributionConfigState:
+    """读取自愿贡献资料存储配置（支持 CONTRIBUTION_STORAGE_DIR 覆盖）。"""
+
+    storage_dir = os.environ.get("CONTRIBUTION_STORAGE_DIR", "").strip() or None
+    return ContributionConfigState(storage_dir=storage_dir)

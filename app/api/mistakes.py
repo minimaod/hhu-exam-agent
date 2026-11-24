@@ -1,5 +1,6 @@
 """错题记录接口：创建、列表、详情、修改、纠正、采用新版与删除。"""
 
+from contextlib import aclosing
 from typing import Annotated
 from uuid import UUID
 
@@ -13,7 +14,10 @@ from app.api.conversations import (
     get_conversation_service_state,
     require_service,
 )
+from app.auth.dependencies import require_user
+from app.auth.models import User
 from app.conversations.errors import (
+    ConversationQueryUnavailableError,
     ConversationStorageError,
     MistakeRecordConflictError,
     ProblemNotFoundError,
@@ -28,6 +32,7 @@ from app.mistakes.models import (
 from app.mistakes.service import CorrectionInput, MistakeRecordService
 from app.querying.service import SSE_HEADERS
 from app.sse import encode_sse_event
+from app.streaming import ClosingStreamingResponse
 from app.tutoring.models import Source
 
 router = APIRouter(tags=["mistakes"])
@@ -249,10 +254,9 @@ async def correct_record(
     payload: CorrectionRequest,
     request: Request,
     records: RecordsDep,
+    service: ServiceDep,
+    user: Annotated[User, Depends(require_user)],
 ) -> StreamingResponse:
-    if not records.tutoring_available():
-        raise TutoringUnavailableError("辅导模型尚未配置。")
-
     correction = CorrectionInput(
         statement_text=payload.statement_text,
         attachments=(
@@ -265,6 +269,9 @@ async def correct_record(
         solution_text=payload.solution_text,
     )
     records.validate_correction(str(record_id), correction)
+    if not records.tutoring_available():
+        raise TutoringUnavailableError("辅导模型尚未配置。")
+
     request_input = records.correction_input(correction)
 
     replay = records.find_correction_replay(
@@ -288,21 +295,28 @@ async def correct_record(
             headers=SSE_HEADERS,
         )
 
-    acquired = await records.begin_correction(str(record_id))
-    if not acquired:
-        raise MistakeRecordConflictError("该记录正在纠正，请稍后再试。")
+    usage_config = getattr(request.app.state, "usage_config", None)
+    usage_error = getattr(usage_config, "error", None)
+    if usage_error:
+        raise ConversationQueryUnavailableError(usage_error)
+    gate = getattr(request.app.state, "usage_gate", None)
+    if gate is None:
+        raise ConversationQueryUnavailableError("用量限制尚未配置。")
+    gate.ensure_available(user.id)
+    lease_token = service.prepare_record_correction(
+        str(record_id), str(payload.request_id)
+    )
 
     async def encode_corrections():
-        async for event in records.corrections(
-            str(record_id),
-            str(payload.request_id),
-            correction,
-            request,
-        ):
-            yield encode_sse_event(event)
+        async with aclosing(service.stream_record_correction(
+            str(record_id), str(payload.request_id), correction, request, lease_token
+        )) as events:
+            async for event in events:
+                yield encode_sse_event(event)
 
-    return StreamingResponse(
+    return ClosingStreamingResponse(
         encode_corrections(),
+        on_close=lambda: service.release_record_correction(lease_token),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

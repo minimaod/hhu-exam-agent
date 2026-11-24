@@ -14,8 +14,8 @@ from app.conversations.turn_types import (
     ExecuteTurn,
     _DynamicContext,
 )
-from app.conversations.workspace import ambiguity
-from app.question_bank.models import SearchRequest
+from app.conversations.workspace import ambiguity, card_identity
+from app.question_bank.models import QUESTION_TYPE_LABELS, SearchRequest
 from app.questions.errors import (
     QuestionError,
     QuestionSelectionInvalidError,
@@ -60,6 +60,15 @@ class SelectionMixin:
         ctx.question_card = card
         ctx.question_result_status = "ok"
         ctx.question_result_message = ""
+        active_ex = getattr(ctx, "active_exercise", None)
+        if active_ex is not None:
+            src = self._repository.get_exercise_question_source(active_ex.id)
+            same_problem = bool(selection.problem_id and active_ex.problem_id == selection.problem_id)
+            same_question = bool(src is not None and card_identity(src) == card_identity(card))
+            if not same_problem and not same_question:
+                self._repository.clear_active_exercise(prepared.conversation_id)
+                ctx.active_exercise = None
+                ctx.exercise_id = None
         if previous.get("paper_id") != card.source.paper_id:
             # 选中一题不代表已经浏览完该卷。新卷的浏览范围尚未知，
             # “继续列题”应从第 0 条真实读取，而不是沿用旧卷游标。
@@ -91,7 +100,7 @@ class SelectionMixin:
     def _target_ambiguity(cards: list[QuestionCard]) -> str:
         if len({card.source.paper_id for card in cards}) > 1:
             return "这个题号对应多份试卷，请说明要哪一份试卷。"
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         labels = list(dict.fromkeys(kinds.get(card.question_type, "题目") for card in cards))
         if len(labels) > 1:
             return "这份试卷的" + "、".join(labels) + "都有这个题号，请说明题型。"
@@ -267,7 +276,7 @@ class SelectionMixin:
             ))
         card = ctx.question_card
         assert card is not None
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         return self._action_result(prepared, ctx, ActionOutcome(
             "select_question", "success",
             f"已选中第 {card.number_label} 题（{kinds.get(card.question_type, '题目')}）。",
@@ -354,7 +363,7 @@ class SelectionMixin:
         # 同轮后续讲解必须命中同一张卡：收敛候选并标记来源轮次。
         ctx.question_results = [card]
         ctx.question_source_turn = prepared.request_id
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         return self._action_result(prepared, ctx, ActionOutcome(
             "select_question", "success",
             f"已选中 {ref}（第 {card.number_label} 题，{kinds.get(card.question_type, '题目')}）。",
@@ -417,7 +426,7 @@ class SelectionMixin:
         if not result.cards:
             return None, f"这份试卷里没有第 {number} 题，请确认题号。"
         if len(result.cards) > 1:
-            kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+            kinds = QUESTION_TYPE_LABELS
             types = "、".join(
                 dict.fromkeys(kinds.get(card.question_type, "题目") for card in result.cards)
             )

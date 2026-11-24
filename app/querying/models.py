@@ -7,7 +7,7 @@ ResultEvent 等事件模型是后端对前端的承诺，页面据此判断业�
 from collections.abc import Awaitable, Callable
 from typing import Literal, TypedDict
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.papers.models import ExamType, PaperItem
 
@@ -29,6 +29,9 @@ ErrorCode = Literal[
     "CATALOG_UNAVAILABLE",
     "QUERY_FAILED",
     "TUTORING_FAILED",
+    "MODEL_QUOTA_EXCEEDED",
+    "IMAGE_QUOTA_EXCEEDED",
+    "QUOTA_STORAGE_UNAVAILABLE",
 ]
 
 ProgressStage = Literal["understanding", "retrieving"]
@@ -122,10 +125,20 @@ class ResultEvent(BaseModel):
         return self
 
 
+class QuotaInfo(BaseModel):
+    """额度错误附带的公开信息；不包含密钥或内部计数细节。"""
+
+    scope: Literal["user", "site", "image"]
+    limit: int = Field(ge=0)
+    used: int = Field(ge=0)
+    reset_at: str
+
+
 class ErrorEvent(BaseModel):
     type: Literal["error"] = "error"
     code: ErrorCode
     message: str
+    quota: QuotaInfo | None = None
 
 
 QueryEvent = ProgressEvent | ResultEvent | ErrorEvent

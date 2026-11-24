@@ -1,0 +1,715 @@
+"""F012：实际路由清单、隐藏路由检查、公开接口与 A/B 隔离。"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+from fastapi import APIRouter, FastAPI
+from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app.conversations.repository import ConversationRepository
+from tests.f012_support import (
+    TEST_CSRF_HEADERS,
+    create_conversation,
+    create_invite,
+    owner_snapshot,
+    register,
+)
+
+PUBLIC_ROUTES = {
+    ("GET", "/api/health"),
+    ("GET", "/api/papers"),
+    ("GET", "/api/papers/{paper_id}/download"),
+    ("POST", "/api/auth/register"),
+    ("POST", "/api/auth/login"),
+}
+
+PRIVATE_ROUTES = {
+    ("GET", "/api/me"),
+    ("POST", "/api/auth/logout"),
+    ("POST", "/api/query"),
+    ("GET", "/api/conversations"),
+    ("POST", "/api/conversations"),
+    ("GET", "/api/conversations/{conversation_id}"),
+    ("POST", "/api/conversations/{conversation_id}/turns"),
+    ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/reply"),
+    ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/stop-material"),
+    ("POST", "/api/conversations/{conversation_id}/exercises/{exercise_id}/reveal"),
+    ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/source"),
+    (
+        "GET",
+        "/api/conversations/{conversation_id}/questions/{question_id}/assets/{asset_id}",
+    ),
+    ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/answer"),
+    ("POST", "/api/conversations/{conversation_id}/attachments"),
+    ("GET", "/api/conversations/{conversation_id}/attachments/{attachment_id}"),
+    ("GET", "/api/mistake-records"),
+    ("POST", "/api/mistake-records"),
+    ("GET", "/api/mistake-records/{record_id}"),
+    ("PATCH", "/api/mistake-records/{record_id}"),
+    ("DELETE", "/api/mistake-records/{record_id}"),
+    ("POST", "/api/mistake-records/{record_id}/corrections"),
+    ("POST", "/api/mistake-records/{record_id}/adopt-problem"),
+    ("GET", "/api/learning-memory"),
+    ("GET", "/api/learning-memory/courses"),
+    ("PATCH", "/api/learning-memory/{kind}/{source_id}"),
+    ("DELETE", "/api/learning-memory/{kind}/{source_id}"),
+    ("GET", "/api/usage/today"),
+    ("GET", "/api/materials/pdfs"),
+    ("POST", "/api/materials/pdfs"),
+    ("GET", "/api/materials/pdfs/{material_id}"),
+    ("DELETE", "/api/materials/pdfs/{material_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/file"),
+    ("POST", "/api/materials/pdfs/{material_id}/readability"),
+    ("POST", "/api/materials/pdfs/{material_id}/ocr"),
+    ("POST", "/api/materials/pdfs/{material_id}/guides"),
+    ("GET", "/api/materials/guides/{guide_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}"),
+    ("POST", "/api/materials/guides/{guide_id}/items/{item_id}/study"),
+    ("GET", "/api/materials/pdfs/{material_id}/delete-impact"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}/image"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts/import-sample"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts"),
+    ("GET", "/api/materials/artifacts/{artifact_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/attempt"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/reveal"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/graph-notes/{node_id}"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/kc-notes/{kc_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/study"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/evaluate"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/kcs/{kc_id}/study"),
+    ("GET", "/api/materials/library"),
+    ("GET", "/api/conversations/{conversation_id}/materials"),
+    ("POST", "/api/conversations/{conversation_id}/materials/upload"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/attach"),
+    ("DELETE", "/api/conversations/{conversation_id}/materials/{material_id}"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/generate"),
+    ("GET", "/api/conversations/{conversation_id}/materials/progress"),
+    ("GET", "/api/conversations/{conversation_id}/delete-impact"),
+    ("DELETE", "/api/conversations/{conversation_id}"),
+    ("POST", "/api/contributions"),
+}
+
+ALL_ROUTES = PUBLIC_ROUTES | PRIVATE_ROUTES
+
+# 每条私有路由必须在下面三类用例之一中真正执行；仅登记不算。
+OWNED_ROUTES = {
+    ("GET", "/api/conversations/{conversation_id}"),
+    ("POST", "/api/conversations/{conversation_id}/turns"),
+    ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/reply"),
+    ("POST", "/api/conversations/{conversation_id}/turns/{request_id}/stop-material"),
+    ("POST", "/api/conversations/{conversation_id}/exercises/{exercise_id}/reveal"),
+    ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/source"),
+    ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/assets/{asset_id}"),
+    ("GET", "/api/conversations/{conversation_id}/questions/{question_id}/answer"),
+    ("POST", "/api/conversations/{conversation_id}/attachments"),
+    ("GET", "/api/conversations/{conversation_id}/attachments/{attachment_id}"),
+    ("GET", "/api/mistake-records/{record_id}"),
+    ("PATCH", "/api/mistake-records/{record_id}"),
+    ("DELETE", "/api/mistake-records/{record_id}"),
+    ("POST", "/api/mistake-records/{record_id}/corrections"),
+    ("POST", "/api/mistake-records/{record_id}/adopt-problem"),
+    ("PATCH", "/api/learning-memory/{kind}/{source_id}"),
+    ("DELETE", "/api/learning-memory/{kind}/{source_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}"),
+    ("DELETE", "/api/materials/pdfs/{material_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/file"),
+    ("POST", "/api/materials/pdfs/{material_id}/readability"),
+    ("POST", "/api/materials/pdfs/{material_id}/ocr"),
+    ("POST", "/api/materials/pdfs/{material_id}/guides"),
+    ("GET", "/api/materials/guides/{guide_id}"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}"),
+    ("POST", "/api/materials/guides/{guide_id}/items/{item_id}/study"),
+    ("GET", "/api/materials/pdfs/{material_id}/delete-impact"),
+    ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}/image"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts/import-sample"),
+    ("POST", "/api/materials/pdfs/{material_id}/artifacts"),
+    ("GET", "/api/materials/artifacts/{artifact_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/attempt"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/reveal"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/graph-notes/{node_id}"),
+    ("PUT", "/api/materials/artifacts/{artifact_id}/kc-notes/{kc_id}"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/study"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/evaluate"),
+    ("POST", "/api/materials/artifacts/{artifact_id}/kcs/{kc_id}/study"),
+    ("GET", "/api/conversations/{conversation_id}/materials"),
+    ("POST", "/api/conversations/{conversation_id}/materials/upload"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/attach"),
+    ("DELETE", "/api/conversations/{conversation_id}/materials/{material_id}"),
+    ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/generate"),
+    ("GET", "/api/conversations/{conversation_id}/materials/progress"),
+    ("GET", "/api/conversations/{conversation_id}/delete-impact"),
+    ("DELETE", "/api/conversations/{conversation_id}"),
+}
+
+COLLECTION_ROUTES = {
+    ("GET", "/api/conversations"),
+    ("POST", "/api/conversations"),
+    ("GET", "/api/mistake-records"),
+    ("POST", "/api/mistake-records"),
+    ("GET", "/api/learning-memory"),
+    ("GET", "/api/learning-memory/courses"),
+    ("GET", "/api/materials/pdfs"),
+    ("POST", "/api/materials/pdfs"),
+    ("GET", "/api/materials/library"),
+}
+
+SESSION_ROUTES = {
+    ("POST", "/api/query"),
+    ("POST", "/api/auth/logout"),
+    ("GET", "/api/me"),
+    ("GET", "/api/usage/today"),
+    ("POST", "/api/contributions"),
+}
+
+
+def test_private_routes_are_bound_to_cases() -> None:
+    assert set(PRIVATE_ROUTES) == OWNED_ROUTES | COLLECTION_ROUTES | SESSION_ROUTES
+    assert not (OWNED_ROUTES & COLLECTION_ROUTES)
+    assert not (OWNED_ROUTES & SESSION_ROUTES)
+    assert not (COLLECTION_ROUTES & SESSION_ROUTES)
+
+
+def collect_api_operations(application: FastAPI) -> set[tuple[str, str]]:
+    def walk(routes, prefix: str = ""):
+        for route in routes:
+            if isinstance(route, APIRoute):
+                for method in route.methods:
+                    yield prefix + route.path, method.upper()
+                continue
+            router = getattr(route, "original_router", None)
+            if router is not None:
+                context = getattr(route, "include_context", None)
+                yield from walk(
+                    router.routes,
+                    prefix + (getattr(context, "prefix", "") if context else ""),
+                )
+
+    return {
+        (method, path)
+        for path, method in walk(application.routes)
+        if path.startswith("/api/")
+    }
+
+
+def test_actual_route_matrix_matches_plan() -> None:
+    actual = collect_api_operations(app)
+    assert len(actual) == 65
+    assert actual == ALL_ROUTES
+
+
+def test_hidden_route_is_seen_and_reported_missing() -> None:
+    probe = FastAPI()
+    router = APIRouter(prefix="/api")
+
+    @router.get("/_hidden_probe", include_in_schema=False)
+    def hidden_probe() -> dict[str, bool]:
+        return {"ok": True}
+
+    probe.include_router(router)
+    found = collect_api_operations(probe)
+    assert ("GET", "/api/_hidden_probe") in found
+    assert found - (PUBLIC_ROUTES | PRIVATE_ROUTES)
+
+
+def test_private_routes_require_login(anon_client: TestClient) -> None:
+    for method, path in sorted(PRIVATE_ROUTES):
+        if "/{request_id}" in path:
+            path = path.replace("{request_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{conversation_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{exercise_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{attachment_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{record_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{source_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{material_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{guide_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{item_id}", "11111111-1111-4111-8111-111111111111")
+        path = path.replace("{page_no}", "1")
+        path = path.replace("{question_id}", "q-1")
+        path = path.replace("{asset_id}", "a-1")
+        path = path.replace("{kind}", "exercise")
+        body = {} if method in {"POST", "PATCH"} else None
+        response = anon_client.request(method, path, json=body)
+        assert response.status_code == 401, (method, path, response.text)
+
+
+def test_public_papers_are_downloadable_without_login(
+    sample_root: Path,
+) -> None:
+    from app.papers.repository import PaperRepository
+    from app.papers.service import PaperService, get_paper_service
+
+    app.dependency_overrides[get_paper_service] = lambda: PaperService(
+        PaperRepository(sample_root)
+    )
+    try:
+        with TestClient(app) as public:
+            listing = public.get("/api/papers")
+            assert listing.status_code == 200
+            items = listing.json()["items"]
+            assert items
+            for item in items:
+                download = public.get(f"/api/papers/{item['id']}/download")
+                if download.status_code == 200:
+                    assert download.headers["content-type"].startswith(
+                        "application/pdf"
+                    )
+                    assert download.content.startswith(b"%PDF")
+                    return
+            pytest.fail("样例目录里的试卷都无法下载")
+    finally:
+        app.dependency_overrides.pop(get_paper_service, None)
+
+
+def _seed_a_world(db: Path, owner_id: str) -> dict[str, str]:
+    now = "2026-11-01T00:00:00+00:00"
+    ids = {
+        "conversation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "problem": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "exercise": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "attempt": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "record": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    }
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO conversations (id,title,created_at,updated_at,owner_id) VALUES (?,?,?,?,?)",
+            (ids["conversation"], "A 的会话", now, now, owner_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO problems (
+                id, conversation_id, root_problem_id, version, statement_text,
+                status, clarity, source_type, active, created_at, updated_at
+            ) VALUES (?,?,?,?,?, 'awaiting_supplement','unclear','none',1,?,?)
+            """,
+            (
+                ids["problem"],
+                ids["conversation"],
+                ids["problem"],
+                1,
+                "A 的题目",
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO exercises (
+                id, conversation_id, problem_id, root_problem_id, statement_text,
+                reference_solution_text, knowledge_point, status, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?, 'submitted',?,?)
+            """,
+            (
+                ids["exercise"],
+                ids["conversation"],
+                ids["problem"],
+                ids["problem"],
+                "A 的练习",
+                "参考解答",
+                "循环",
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO exercise_attempts (
+                id, exercise_id, attempt_no, kind, student_answer_text,
+                answered_after_revealed, created_at, updated_at
+            ) VALUES (?,?,1,'initial','A 的答案',0,?,?)
+            """,
+            (ids["attempt"], ids["exercise"], now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO mistake_records (
+                id, conversation_id, problem_id, root_problem_id, problem_version,
+                request_id, title, statement_text, source_json, created_at, updated_at
+            ) VALUES (?,?,?,?,1,?,?,?, '{}',?,?)
+            """,
+            (
+                ids["record"],
+                ids["conversation"],
+                ids["problem"],
+                ids["problem"],
+                "req-a",
+                "A 的错题",
+                "A 的题目",
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return ids
+
+
+def test_a_b_isolation_on_owned_routes(
+    anon_client: TestClient, sample_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.api import materials
+    from app.materials.errors import MaterialInvalidError
+
+    sample_lookups: list[str] = []
+
+    def missing_sample(name: str) -> Path:
+        sample_lookups.append(name)
+        raise MaterialInvalidError("未找到本地 ExamPass 样例目录。")
+
+    monkeypatch.setattr(materials, "_resolve_sample_dir", missing_sample)
+    db = anon_client.app.state.conversation_store.db_path
+    assert db is not None
+    with TestClient(app) as a, TestClient(app) as b:
+        a_user = register(a, "alice", invite_code=create_invite(db))
+        b_user = register(b, "bob", invite_code=create_invite(db))
+        a_conversation = create_conversation(a)
+        b_conversation = create_conversation(b)
+        world = _seed_a_world(db, a_user["id"])
+        a_req = "11111111-1111-4111-8111-111111111111"
+        a_repo = ConversationRepository(db, owner_id=a_user["id"])
+        a_repo.start_turn(a_conversation, a_req, "A 的轮次", kind="query")
+        from tests.test_conversation_store import build_result
+
+        a_repo.complete_turn(a_conversation, a_req, build_result())
+        connection = sqlite3.connect(db)
+        try:
+            connection.execute(
+                """
+                INSERT INTO question_selections (
+                    id, conversation_id, request_id, source_request_id, question_id,
+                    paper_id, build_id, source_version, content_sha256, question_type,
+                    number_label, snapshot_json, active, created_at, updated_at
+                ) VALUES ('sel-a', ?, 'req-a', 'req-a', 'q-1', 'p-1', 'b',
+                          'sv', ?, 'choice', '1', '{}', 0, ?, ?)
+                """,
+                (
+                    a_conversation,
+                    "0" * 64,
+                    "2026-11-01T00:00:00+00:00",
+                    "2026-11-01T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        # A 上传一张真实 PNG，供跨用户读取测试。
+        png = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00"
+            b"\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        upload = a.post(
+            f"/api/conversations/{a_conversation}/attachments",
+            files={"file": ("a.png", png, "image/png")},
+            headers=TEST_CSRF_HEADERS,
+        )
+        assert upload.status_code == 201, upload.text
+        attachment = upload.json()["id"]
+
+        snapshot = owner_snapshot(db, a_user["id"])
+        probes = [
+            (("GET", "/api/conversations/{conversation_id}"), "GET", f"/api/conversations/{a_conversation}", None),
+            (("POST", "/api/conversations/{conversation_id}/turns"), "POST", f"/api/conversations/{a_conversation}/turns", {"request_id": a_req, "query": "hi"}),
+            (("POST", "/api/conversations/{conversation_id}/turns/{request_id}/reply"), "POST", f"/api/conversations/{a_conversation}/turns/{a_req}/reply", None),
+            (("POST", "/api/conversations/{conversation_id}/turns/{request_id}/stop-material"), "POST", f"/api/conversations/{a_conversation}/turns/{a_req}/stop-material", None),
+            (("POST", "/api/conversations/{conversation_id}/exercises/{exercise_id}/reveal"), "POST", f"/api/conversations/{a_conversation}/exercises/{world['exercise']}/reveal", None),
+            (("GET", "/api/conversations/{conversation_id}/questions/{question_id}/source"), "GET", f"/api/conversations/{a_conversation}/questions/q-1/source?build=b&kind=statement&page=1", None),
+            (("GET", "/api/conversations/{conversation_id}/questions/{question_id}/assets/{asset_id}"), "GET", f"/api/conversations/{a_conversation}/questions/q-1/assets/a-1?build=b", None),
+            (("GET", "/api/conversations/{conversation_id}/questions/{question_id}/answer"), "GET", f"/api/conversations/{a_conversation}/questions/q-1/answer?build=b", None),
+            (("GET", "/api/conversations/{conversation_id}/attachments/{attachment_id}"), "GET", f"/api/conversations/{a_conversation}/attachments/{attachment}", None),
+            (("GET", "/api/mistake-records/{record_id}"), "GET", f"/api/mistake-records/{world['record']}", None),
+            (("PATCH", "/api/mistake-records/{record_id}"), "PATCH", f"/api/mistake-records/{world['record']}", {}),
+            (("DELETE", "/api/mistake-records/{record_id}"), "DELETE", f"/api/mistake-records/{world['record']}", None),
+            (("POST", "/api/mistake-records/{record_id}/corrections"), "POST", f"/api/mistake-records/{world['record']}/corrections", {"request_id": a_req, "statement_text": "x"}),
+            (("POST", "/api/mistake-records/{record_id}/adopt-problem"), "POST", f"/api/mistake-records/{world['record']}/adopt-problem", {"request_id": a_req, "problem_id": world["problem"]}),
+            (("PATCH", "/api/learning-memory/{kind}/{source_id}"), "PATCH", f"/api/learning-memory/exercise/{world['exercise']}", {"note": "x"}),
+            (("DELETE", "/api/learning-memory/{kind}/{source_id}"), "DELETE", f"/api/learning-memory/exercise/{world['exercise']}", None),
+        ]
+        executed: set[tuple[str, str]] = set()
+        for route_key, method, path, body in probes:
+            executed.add(route_key)
+            response = b.request(
+                method, path, json=body, headers=TEST_CSRF_HEADERS
+            )
+            assert response.status_code == 404, (method, path, response.status_code, response.text)
+        # 单独覆盖 multipart 上传：B 不能向 A 的会话写附件。
+        executed.add(("POST", "/api/conversations/{conversation_id}/attachments"))
+        assert b.post(
+            f"/api/conversations/{a_conversation}/attachments",
+            files={"file": ("b.png", png, "image/png")},
+            headers=TEST_CSRF_HEADERS,
+        ).status_code == 404
+        # B 自己的会话里引用 A 的附件/练习/题目
+        assert b.post(
+            f"/api/conversations/{b_conversation}/turns",
+            json={
+                "request_id": a_req,
+                "query": "带图",
+                "attachments": [{"id": attachment, "role": "statement"}],
+            },
+            headers=TEST_CSRF_HEADERS,
+        ).status_code == 404
+        assert b.post(
+            f"/api/conversations/{b_conversation}/turns",
+            json={"request_id": "22222222-2222-4222-8222-222222222222", "kind": "exercise_answer", "exercise_id": world["exercise"], "student_answer": "B 的答案"},
+            headers=TEST_CSRF_HEADERS,
+        ).status_code == 404
+        collection_executed: set[tuple[str, str]] = {
+            ("POST", "/api/conversations"),
+        }
+        collection_executed.add(("GET", "/api/conversations"))
+        assert b.get("/api/conversations").json()["total"] == 1
+        collection_executed.add(("GET", "/api/mistake-records"))
+        assert b.get("/api/mistake-records").status_code == 200
+        collection_executed.add(("POST", "/api/mistake-records"))
+        assert b.post(
+            "/api/mistake-records",
+            json={"request_id": "33333333-3333-4333-8333-333333333333", "conversation_id": a_conversation},
+            headers=TEST_CSRF_HEADERS,
+        ).status_code == 404
+        collection_executed.add(("GET", "/api/learning-memory"))
+        assert b.get("/api/learning-memory").status_code == 200
+        collection_executed.add(("GET", "/api/learning-memory/courses"))
+        assert b.get("/api/learning-memory/courses").status_code == 200
+
+        # F019 第二阶段：个人资料 11 项路由 A/B 隔离与集合登记
+        from tests.test_materials_pdf_parser import _make_simple_pdf
+        from app.materials import storage as mat_storage
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as mat_tmp:
+            old_mat_root = mat_storage.MATERIALS_ROOT
+            mat_storage.MATERIALS_ROOT = Path(mat_tmp)
+            try:
+                import app.materials.service as mat_svc_mod
+
+                old_svc_root = mat_svc_mod.MATERIALS_ROOT
+                mat_svc_mod.MATERIALS_ROOT = Path(mat_tmp)
+                try:
+                    collection_executed.add(("POST", "/api/materials/pdfs"))
+                    a_mat_res = a.post(
+                        "/api/materials/pdfs",
+                        files={
+                            "file": (
+                                "a.pdf",
+                                _make_simple_pdf(["Chapter 1 Limit squeeze theorem holds cleanly."]),
+                                "application/pdf",
+                            )
+                        },
+                        headers=TEST_CSRF_HEADERS,
+                    )
+                    assert a_mat_res.status_code == 201
+                    a_mid = a_mat_res.json()["id"]
+
+                    collection_executed.add(("GET", "/api/materials/pdfs"))
+                    assert b.get("/api/materials/pdfs").json()["items"] == []
+                    collection_executed.add(("GET", "/api/materials/library"))
+                    assert b.get("/api/materials/library").json()["items"] == []
+
+                    fake_gid = "11111111-1111-4111-8111-111111111111"
+                    fake_iid = "22222222-2222-4222-8222-222222222222"
+                    for method, path, body in (
+                        ("GET", f"/api/materials/pdfs/{a_mid}", None),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/file", None),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/readability", {"start_page": 1, "end_page": 1}),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/ocr", {"pages": [1]}),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/guides", {"start_page": 1, "end_page": 1}),
+                        ("GET", f"/api/materials/guides/{fake_gid}", None),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/pages/1", None),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/pages/1/image", None),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/artifacts/import-sample", {"sample_name": "exampass-physics"}),
+                        ("POST", f"/api/materials/pdfs/{a_mid}/artifacts", {"start_page": 1, "end_page": 1}),
+                        ("GET", f"/api/materials/artifacts/{fake_gid}", None),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/attempt", {"user_answer": 0}),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/reveal", None),
+                        ("PUT", f"/api/materials/artifacts/{fake_gid}/graph-notes/n1", {"note_text": "test"}),
+                        ("PUT", f"/api/materials/artifacts/{fake_gid}/kc-notes/kc1.1", {"note_text": "test"}),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/study", {"mode": "explain"}),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/questions/{fake_iid}/evaluate", None),
+                        ("POST", f"/api/materials/artifacts/{fake_gid}/kcs/kc1.1/study", {"mode": "explain"}),
+                        ("POST", f"/api/materials/guides/{fake_gid}/items/{fake_iid}/study", {"mode": "explain"}),
+                        ("GET", f"/api/materials/pdfs/{a_mid}/delete-impact", None),
+                        ("DELETE", f"/api/materials/pdfs/{a_mid}", None),
+                    ):
+                        assert (
+                            b.request(
+                                method,
+                                path,
+                                json=body,
+                                headers=TEST_CSRF_HEADERS if method in {"POST", "PUT", "DELETE"} else None,
+                            ).status_code
+                            == 404
+                        )
+                    executed.update(
+                        {
+                            ("GET", "/api/materials/pdfs/{material_id}"),
+                            ("DELETE", "/api/materials/pdfs/{material_id}"),
+                            ("GET", "/api/materials/pdfs/{material_id}/file"),
+                            ("POST", "/api/materials/pdfs/{material_id}/readability"),
+                            ("POST", "/api/materials/pdfs/{material_id}/ocr"),
+                            ("POST", "/api/materials/pdfs/{material_id}/guides"),
+                            ("GET", "/api/materials/guides/{guide_id}"),
+                            ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}"),
+                            ("GET", "/api/materials/pdfs/{material_id}/pages/{page_no}/image"),
+                            ("POST", "/api/materials/pdfs/{material_id}/artifacts/import-sample"),
+                            ("POST", "/api/materials/pdfs/{material_id}/artifacts"),
+                            ("GET", "/api/materials/artifacts/{artifact_id}"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/attempt"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/reveal"),
+                            ("PUT", "/api/materials/artifacts/{artifact_id}/graph-notes/{node_id}"),
+                            ("PUT", "/api/materials/artifacts/{artifact_id}/kc-notes/{kc_id}"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/study"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/questions/{question_id}/evaluate"),
+                            ("POST", "/api/materials/artifacts/{artifact_id}/kcs/{kc_id}/study"),
+                            ("POST", "/api/materials/guides/{guide_id}/items/{item_id}/study"),
+                            ("GET", "/api/materials/pdfs/{material_id}/delete-impact"),
+                        }
+                    )
+                    # F019 第三阶段：会话内资料与会话删除路由 A/B 隔离
+                    for method, path, body in (
+                        ("GET", f"/api/conversations/{a_conversation}/materials", None),
+                        ("POST", f"/api/conversations/{a_conversation}/materials/{a_mid}/attach", None),
+                        ("DELETE", f"/api/conversations/{a_conversation}/materials/{a_mid}", None),
+                        ("POST", f"/api/conversations/{a_conversation}/materials/{a_mid}/generate", {"outputs": ["graph"]}),
+                        ("GET", f"/api/conversations/{a_conversation}/materials/progress", None),
+                        ("GET", f"/api/conversations/{a_conversation}/delete-impact", None),
+                        ("DELETE", f"/api/conversations/{a_conversation}", None),
+                    ):
+                        assert (
+                            b.request(
+                                method,
+                                path,
+                                json=body,
+                                headers=TEST_CSRF_HEADERS if method in {"POST", "PUT", "DELETE"} else None,
+                            ).status_code
+                            == 404
+                        )
+                    assert (
+                        b.post(
+                            f"/api/conversations/{a_conversation}/materials/upload",
+                            files={
+                                "file": (
+                                    "b.pdf",
+                                    _make_simple_pdf(["Other text"]),
+                                    "application/pdf",
+                                )
+                            },
+                            headers=TEST_CSRF_HEADERS,
+                        ).status_code
+                        == 404
+                    )
+                    executed.update(
+                        {
+                            ("GET", "/api/conversations/{conversation_id}/materials"),
+                            ("POST", "/api/conversations/{conversation_id}/materials/upload"),
+                            ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/attach"),
+                            ("DELETE", "/api/conversations/{conversation_id}/materials/{material_id}"),
+                            ("POST", "/api/conversations/{conversation_id}/materials/{material_id}/generate"),
+                            ("GET", "/api/conversations/{conversation_id}/materials/progress"),
+                            ("GET", "/api/conversations/{conversation_id}/delete-impact"),
+                            ("DELETE", "/api/conversations/{conversation_id}"),
+                        }
+                    )
+                    assert a.delete(
+                        f"/api/materials/pdfs/{a_mid}", headers=TEST_CSRF_HEADERS
+                    ).status_code == 200
+                finally:
+                    mat_svc_mod.MATERIALS_ROOT = old_svc_root
+            finally:
+                mat_storage.MATERIALS_ROOT = old_mat_root
+
+        assert collection_executed == COLLECTION_ROUTES
+
+        session_executed: set[tuple[str, str]] = set()
+        session_executed.add(("GET", "/api/me"))
+        assert a.get("/api/me").json()["username"] == "alice"
+        session_executed.add(("GET", "/api/usage/today"))
+        usage = a.get("/api/usage/today")
+        assert usage.status_code == 200, usage.text
+        assert usage.json()["requests"]["remaining"] >= 0
+        assert a_repo.find_turn(a_conversation, a_req) is not None
+        assert a_repo.get_active_problem(world["conversation"]) is not None
+        session_executed.add(("POST", "/api/query"))
+        assert a.post(
+            "/api/query", json={"query": "高数"}, headers=TEST_CSRF_HEADERS
+        ).status_code == 503
+        session_executed.add(("POST", "/api/contributions"))
+        assert a.post(
+            "/api/contributions",
+            headers=TEST_CSRF_HEADERS,
+            data={"course": "   ", "year": "2024"},
+            files={"file": ("exam.pdf", b"%PDF-1.4\n", "application/pdf")},
+        ).status_code == 422
+        session_executed.add(("POST", "/api/auth/logout"))
+        assert a.post("/api/auth/logout", headers=TEST_CSRF_HEADERS).status_code == 204
+        assert a.get("/api/me").status_code == 401
+        assert session_executed == SESSION_ROUTES
+        assert executed == OWNED_ROUTES
+        assert sample_lookups == []
+        assert owner_snapshot(db, a_user["id"])["digest"] == snapshot["digest"]
+        # A 仍然可读自己的数据
+        assert b.get(f"/api/conversations/{a_conversation}").status_code == 404
+
+
+def test_same_public_question_selection_is_independent(anon_client: TestClient) -> None:
+    from app.conversations.repository import ConversationRepository
+
+    db = anon_client.app.state.conversation_store.db_path
+    assert db is not None
+    with TestClient(app) as a, TestClient(app) as b:
+        a_user = register(a, "alice", invite_code=create_invite(db))
+        b_user = register(b, "bob", invite_code=create_invite(db))
+        a_conv = create_conversation(a)
+        b_conv = create_conversation(b)
+        connection = sqlite3.connect(db)
+        try:
+            for owner, conv, sel, revealed in (
+                (a_user["id"], a_conv, "sel-a", "2026-11-01T00:00:00+00:00"),
+                (b_user["id"], b_conv, "sel-b", None),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO question_selections (
+                        id, conversation_id, request_id, source_request_id, question_id,
+                        paper_id, build_id, source_version, content_sha256, question_type,
+                        number_label, snapshot_json, problem_id, answer_revealed_at,
+                        answer_reveal_source, active, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'shared-q', 'p-1', 'b', 'sv', ?, 'choice',
+                              '1', '{}', NULL, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        sel,
+                        conv,
+                        f"req-{sel}",
+                        "req-source",
+                        "0" * 64,
+                        revealed,
+                        "view" if revealed else None,
+                        "2026-11-01T00:00:00+00:00",
+                        "2026-11-01T00:00:00+00:00",
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        a_repo = ConversationRepository(db, owner_id=a_user["id"])
+        b_repo = ConversationRepository(db, owner_id=b_user["id"])
+        a_sel = a_repo.get_active_question(a_conv)
+        b_sel = b_repo.get_active_question(b_conv)
+        assert a_sel is not None and b_sel is not None
+        assert a_sel.id != b_sel.id
+        assert a_sel.question_id == b_sel.question_id == "shared-q"
+        assert a_sel.answer_revealed_at is not None
+        assert b_sel.answer_revealed_at is None
+        assert b_repo.get_active_question(a_conv) is None
+        assert a_repo.get_active_question(b_conv) is None
+        # 公开 question_id 本身不是用户数据；选中记录和答案开放状态各自独立。

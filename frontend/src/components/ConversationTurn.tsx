@@ -1,25 +1,32 @@
+import type { ReactNode } from "react";
 import type { PaperItem } from "../lib/papersApi";
+import { looksLikeExam, materialPreviewUrl, type ArtifactInputMode, type ArtifactSummary, type OutputKind } from "../lib/materialsApi";
 import type {
+  AttachmentInput,
   ConversationTurn as StoredTurn,
   ExerciseAttemptView,
+  ExerciseView,
   ProblemView,
   QuestionCard,
+  RecordRef,
   SuggestionItem,
 } from "../lib/conversationsApi";
-import ExerciseCard from "./ExerciseCard";
+import AssistantDraft from "./AssistantDraft";
+import AssistantMarkdown, { extractSafeLead } from "./AssistantMarkdown";
+import ExerciseCard, { type ExerciseDraftImage } from "./ExerciseCard";
 import ExerciseAttemptReceipt from "./ExerciseAttemptReceipt";
+import MathText from "./MathText";
 import ProblemCard from "./ProblemCard";
 import QuestionCardView, { QuestionResultList, type QuestionAction } from "./QuestionCard";
 import QueryResult from "./QueryResult";
-import SourceBadge from "./SourceBadge";
 import { turnBusinessStatus } from "../lib/conversationsApi";
 import {
-  actionLabel,
   actionStatusLabel,
   classifySuggestion,
-  dedupeTexts,
   formatDateTime,
+  explanationBody,
   isCoveredText,
+  stripDuplicatePaperList,
   type DownloadStates,
 } from "../lib/display";
 
@@ -27,20 +34,32 @@ export type ExerciseRole = "full" | "attempt" | "reference";
 
 type ConversationTurnProps = {
   turn: StoredTurn;
+  liveProgress?: string;
+  unsavedDraft?: boolean;
   downloads?: DownloadStates;
   onDownload: (paper: PaperItem) => void;
   onRetry: (turn: StoredTurn) => void;
   /** 只重做正文：业务操作已经成功，不能重跑。 */
   onRegenerateReply?: (turn: StoredTurn) => void;
   regeneratingReply?: boolean;
+  replyQuotaBlocked?: boolean;
   exerciseDrafts?: Record<string, { answer: string; solution: string }>;
+  exerciseDraftImages?: Record<string, ExerciseDraftImage[]>;
+  exerciseImageNotices?: Record<string, string | null>;
+  imagesBlocked?: boolean;
   solutionImageNames?: string[];
+  recordsByRoot?: Record<string, RecordRef>;
+  savingMistakeRootId?: string | null;
   onExerciseDraftChange?: (exerciseId: string, draft: { answer: string; solution: string }) => void;
+  onAddExerciseImages?: (exerciseId: string, files: File[]) => void;
+  onRemoveExerciseImage?: (exerciseId: string, localId: string) => void;
+  onRetryExerciseImage?: (exerciseId: string, localId: string) => void;
+  onSaveExerciseMistake?: (exercise: ExerciseView) => void;
   onFeedback: (problem: ProblemView) => void;
   onRecord: (problem: ProblemView) => void;
   onCorrect: (problem: ProblemView) => void;
   onSupplement: (problem: ProblemView) => void;
-  onNew: () => void;
+  onNew: (text: string) => void;
   onIntentChoice: (turn: StoredTurn, option: string) => void;
   onOpenRecord: (recordId: string) => void;
   onSubmitExerciseAnswer?: (
@@ -48,6 +67,7 @@ type ConversationTurnProps = {
     answerText: string,
     solutionText?: string,
     attemptKind?: "supplement" | "correction",
+    attachments?: AttachmentInput[],
   ) => void;
   onRevealExerciseSolution?: (exerciseId: string) => void;
   onSuggestionClick?: (turn: StoredTurn, suggestion: SuggestionItem) => void;
@@ -61,6 +81,17 @@ type ConversationTurnProps = {
   onJumpToQuestion?: (key: string) => void;
   onJumpToExercise?: (exerciseId: string) => void;
   onCorrectExercise?: (exerciseId: string) => void;
+  onGenerateMaterialOutput?: (materialId: string, output: OutputKind) => void;
+  onConfirmMaterialCoverage?: (
+    materialId: string, outputs: OutputKind[], start: number, end: number,
+    mode: ArtifactInputMode, courseHint?: string,
+  ) => void;
+  onRetryMaterialOutput?: (artifactId: string, output: OutputKind) => void;
+  onOpenMaterialArtifact?: (artifactId: string, materialTitle: string, pageCount: number, tab?: OutputKind) => void;
+  materialArtifactsById?: Map<string, ArtifactSummary>;
+  onOpenWorkbenchSource?: (source: NonNullable<StoredTurn["workbench_source"]>) => void;
+  materialResultIds?: string[];
+  materialResultCards?: ReactNode;
   /** 这一轮是否为当前最新一轮；旧轮次的建议已经失效，不再展示。 */
   isLatestTurn?: boolean;
   hasActiveProblem?: boolean;
@@ -120,9 +151,17 @@ function bubbleFallback(turn: StoredTurn): string {
   return "（图片题目）";
 }
 
+const QUESTION_CARD_ACTIONS = new Set([
+  "讲解这道题",
+  "查看参考答案",
+  "生成一道变式",
+  "保存到错题本",
+]);
+
 /**
  * 建议只在“最新一轮 + 当前状态仍有效”时出现：
- * 已评价练习不再提示提交答案，已展开解答不再提示看答案，没有当前题不再提示练习。
+ * 已评价练习不再提示提交答案，已展开解答不再提示看答案，没有当前题不再提示练习，
+ * 且剔除与当前轮已直出的讲解/真题卡按钮重复的建议。
  */
 function usableSuggestions(
   turn: StoredTurn,
@@ -133,8 +172,19 @@ function usableSuggestions(
     return [];
   }
   const exercise = turn.exercise ?? null;
+  const hasExplanation = turn.tutoring?.kind === "explanation";
+  const hasSelectedQuestionCard = Boolean(turn.question?.selected) && !turn.tutoring;
   return (turn.suggestions ?? []).filter((suggestion) => {
-    const intent = classifySuggestion(suggestion.label);
+    const label = suggestion.label.trim();
+    const intent = classifySuggestion(label);
+    if (hasExplanation) {
+      if (/(讲解|解析).{0,6}(这|本|该)?(道)?题/.test(label) || intent === "save") {
+        return false;
+      }
+    }
+    if (hasSelectedQuestionCard && QUESTION_CARD_ACTIONS.has(label)) {
+      return false;
+    }
     if (intent === "answer") {
       return Boolean(exercise) && !exercise!.evaluation && exercise!.status !== "submitted";
     }
@@ -147,7 +197,7 @@ function usableSuggestions(
       );
     }
     if (intent === "save") {
-      return turn.tutoring?.kind === "explanation";
+      return hasExplanation;
     }
     if (intent === "practice") {
       return hasActiveProblem;
@@ -159,11 +209,14 @@ function usableSuggestions(
 /** 一轮历史：学生输入、状态和查询或辅导结果。 */
 export default function ConversationTurn({
   turn,
+  liveProgress,
+  unsavedDraft = false,
   downloads,
   onDownload,
   onRetry,
   onRegenerateReply,
   regeneratingReply = false,
+  replyQuotaBlocked = false,
   onFeedback,
   onRecord,
   onCorrect,
@@ -180,6 +233,14 @@ export default function ConversationTurn({
   onJumpToQuestion,
   onJumpToExercise,
   onCorrectExercise,
+  onGenerateMaterialOutput,
+  onConfirmMaterialCoverage,
+  onRetryMaterialOutput,
+  onOpenMaterialArtifact,
+  onOpenWorkbenchSource,
+  materialResultIds,
+  materialResultCards,
+  materialArtifactsById,
   isLatestTurn = true,
   hasActiveProblem = true,
   exerciseRole = "full",
@@ -190,11 +251,25 @@ export default function ConversationTurn({
   correctionToken = 0,
   busy,
   exerciseDrafts,
+  exerciseDraftImages,
+  exerciseImageNotices,
+  imagesBlocked = false,
   solutionImageNames,
+  recordsByRoot,
+  savingMistakeRootId = null,
   onExerciseDraftChange,
+  onAddExerciseImages,
+  onRemoveExerciseImage,
+  onRetryExerciseImage,
+  onSaveExerciseMistake,
 }: ConversationTurnProps) {
   const tutoring = turn.tutoring;
   const business = turnBusinessStatus(turn);
+  const hasIncompleteReply =
+    turn.reply_status === "truncated" || turn.reply_status === "failed";
+  const isNormalSuccess =
+    !hasIncompleteReply &&
+    (business === "succeeded" || (!business && turn.status === "completed"));
   const hasSavedResults = turn.status === "completed" || business === "partial" || business === "succeeded";
   const labels = { succeeded: "成功", partial: "部分完成", failed: "未完成", needs_input: "待补充" };
   const badgeClass = business === "succeeded" ? statusClass("completed") :
@@ -203,14 +278,36 @@ export default function ConversationTurn({
   const resultMessage =
     turn.result && "message" in turn.result ? turn.result.message : null;
   const compositeItems = turn.composite_results ?? [];
-  const replyNotice =
+  const questionId = turn.question?.question_id;
+  const isBankLesson = turn.question?.review.approved && (
+    turn.kind === "explain_question" || compositeItems.some((item) =>
+      item.status === "success" && (
+        item.action === "explain_question" ||
+        (item.action === "explain_problem" && item.details?.question_id === questionId)
+      ),
+    )
+  );
+  const lesson = hasSavedResults && tutoring?.kind === "explanation" ? explanationBody(tutoring) : "";
+  const standaloneLesson = !!lesson && compositeItems.every((item) =>
+    item.status === "success" &&
+    ["tutoring", "explain_problem", "explain_question", "search_questions", "select_question", "introduce"].includes(item.action),
+  );
+  const replyNotice = standaloneLesson ? null :
     turn.reply_status === "truncated"
       ? "这段回复生成时被截断，不是完整内容；上面的操作已经完成并保存。"
       : turn.reply_status === "failed"
         ? "回复没有生成成功，上面显示的是系统说明；业务操作已经完成并保存。"
         : null;
-  const { shown: narrativeParts } = dedupeTexts([turn.assistant_message]);
-  const assistantText = narrativeParts[0] ?? "";
+  const hasMaterialReceipt = compositeItems.some((item) => item.action === "generate_material_artifact");
+  const trimOldArtifactHint = (message: string) => hasMaterialReceipt
+    ? message.replace(/(?:章节笔记(?:、知识图谱)?|知识图谱)已展示在下方。|点成果卡即可打开。|点「在会话中答题」开始。/gu, "")
+    : message;
+  const rawAssistantText = trimOldArtifactHint(turn.assistant_message ?? "");
+  const narration =
+    turn.result?.kind === "found"
+      ? stripDuplicatePaperList(rawAssistantText, turn.result.items)
+      : rawAssistantText;
+  const assistantText = standaloneLesson ? lesson : [narration, lesson].filter(Boolean).join("\n\n");
   // 优先级：自然语言叙事 → 查询结果消息 → 动作结果消息。
   // 后面的文字只要已被前面的叙事整段包含，就不再单独重复。
   const shownTexts: string[] = [assistantText];
@@ -219,16 +316,70 @@ export default function ConversationTurn({
   if (showResultMessage && resultMessage) {
     shownTexts.push(resultMessage);
   }
-  const compositeRows = compositeItems.map((item) => {
-    const showMessage = !isCoveredText(item.message, shownTexts);
-    if (showMessage) {
-      shownTexts.push(item.message);
-    }
-    return { item, showMessage };
-  });
+  const hasRecordCard =
+    hasSavedResults &&
+    (tutoring?.kind === "record_created" || tutoring?.kind === "record_exists");
+  const hasQuestionCards =
+    hasSavedResults &&
+    (Boolean(turn.question_results?.length) || Boolean(turn.question));
+  const hasExplanationCard =
+    hasSavedResults && tutoring?.kind === "explanation";
+  const hasExerciseCard = hasSavedResults && Boolean(turn.exercise);
+  const hasVisibleContent =
+    Boolean(assistantText) ||
+    Boolean(hasSavedResults && turn.result) ||
+    hasRecordCard ||
+    hasQuestionCards ||
+    hasExplanationCard ||
+    hasExerciseCard;
+  const compositeRows = compositeItems
+    .filter((item) => {
+      if (assistantText && item.details?.rejected &&
+          (item.details.tool === "generate_material_artifact" || item.details.tool === "solve_uploaded_exam")) {
+        return false;
+      }
+      return (
+        item.action === "solve_uploaded_exam" ||
+        item.action === "generate_material_artifact" ||
+        item.status !== "success" ||
+        !hasVisibleContent
+      );
+    })
+    .map((item) => {
+      const message = item.action === "generate_material_artifact" ? trimOldArtifactHint(item.message) : item.message;
+      const showMessage = Boolean(message) && !isCoveredText(message, shownTexts);
+      if (showMessage) {
+        shownTexts.push(message);
+      }
+      return { item, message, showMessage };
+    });
 
-  const suggestions = usableSuggestions(turn, isLatestTurn, hasActiveProblem);
+  const isQuestionRelatedTurn =
+    turn.kind === "select_question" ||
+    turn.kind === "explain_question" ||
+    turn.kind === "view_question_answer" ||
+    compositeItems.some((item) =>
+      [
+        "select_question",
+        "explain_question",
+        "view_question_answer",
+        "generate_exercise",
+        "record_mistake",
+      ].includes(item.action),
+    );
   const exercise = turn.exercise ?? null;
+  const hasEvaluationReceiptCard = Boolean(
+    exercise && exerciseRole === "attempt" && exerciseAttempt?.evaluation,
+  );
+  const collapseEvaluationProse =
+    hasEvaluationReceiptCard && assistantText.length > 140;
+  const evaluationProseLead = collapseEvaluationProse
+    ? extractSafeLead(assistantText, 110) ??
+      "评价结果已生成，请查看下方评价卡片。"
+    : "";
+  const mistakeRecordForExercise = exercise
+    ? recordsByRoot?.[exercise.root_problem_id] ?? null
+    : null;
   // 只有真正提交/重试作答的轮次才需要“去题目卡片查看”的指引；
   // 追问、保存等轮次只是带着练习上下文，不用重复同一块提示。
   const showsExerciseReference =
@@ -258,24 +409,44 @@ export default function ConversationTurn({
   };
   const shownQuestions = Array.from(questionRows.values()).map(presentCard).filter((card): card is QuestionCard => card !== null);
   const standaloneQuestion = turn.question && !selectedInResults ? presentCard(turn.question) : null;
+  const hasQuestionCardButtons = shownQuestions.length > 0 || standaloneQuestion !== null;
+  const suggestions = usableSuggestions(turn, isLatestTurn, hasActiveProblem).filter(
+    (sug) => {
+      const intent = classifySuggestion(sug.label);
+      if (hasQuestionCardButtons && (intent === "save" || intent === "practice")) {
+        return false;
+      }
+      if (hasExplanationCard && intent === "save") {
+        return false;
+      }
+      return true;
+    },
+  );
 
   return (
     <li className="space-y-3">
-      <div className="flex justify-end">
-        <p className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl bg-river px-4 py-2.5 text-sm leading-6 text-white">
-          {userText}
+      <div className="turn-user">
+        {turn.workbench_source && onOpenWorkbenchSource && (
+          <button type="button" className="quiet-button text-xs" onClick={() => onOpenWorkbenchSource(turn.workbench_source!)}>
+            来自复习工作台 · {turn.workbench_source.label}
+          </button>
+        )}
+        <p className="turn-user-note whitespace-pre-wrap break-words">
+          <MathText text={userText} />
         </p>
       </div>
 
-      <div className="rounded-2xl border border-slate-200/90 bg-white/90 p-5 shadow-card backdrop-blur">
+      <div className="turn-assistant">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <span
-              className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${badgeClass}`}
-            >
-              {business ? labels[business] : STATUS_LABELS[turn.status]}
-            </span>
-            <span className="text-[11px] text-slate-400">
+            {!isNormalSuccess && (
+              <span
+                className={`rounded-full border px-2.5 py-0.5 text-xs font-medium ${badgeClass}`}
+              >
+                {business ? labels[business] : STATUS_LABELS[turn.status]}
+              </span>
+            )}
+            <span className="turn-meta">
               第 {turn.seq} 轮 · {formatDateTime(turn.started_at)}
             </span>
           </div>
@@ -284,34 +455,56 @@ export default function ConversationTurn({
               type="button"
               disabled={busy}
               onClick={() => onRetry(turn)}
-              className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+              className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
             >
               {turn.kind === "exercise" ? "重试评价" : "重试未完成步骤"}
             </button>
           )}
         </div>
 
-        <div className="mt-3 space-y-3">
+        <div className="min-w-0 space-y-3">
           {business && business !== "succeeded" && turn.retry_hint && (
             <p className="text-xs leading-6 text-amber-900">{turn.retry_hint}</p>
           )}
           {/* 自然语言助手回复；与结果/动作消息完全相同的段落不重复渲染 */}
-          {assistantText && (
-            <p className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-800">
-              {assistantText}
+          {assistantText &&
+            (collapseEvaluationProse ? (
+              <div className="space-y-1">
+                <div className="assistant-prose">
+                  <AssistantMarkdown text={evaluationProseLead} />
+                </div>
+                <details className="lesson-disclosure">
+                  <summary className="cursor-pointer text-xs font-medium text-slate-600">
+                    查看完整文字回复
+                  </summary>
+                  <div className="assistant-prose mt-1">
+                    <AssistantMarkdown text={assistantText} />
+                  </div>
+                </details>
+              </div>
+            ) : (
+              <AssistantDraft
+                text={assistantText}
+                running={unsavedDraft && turn.status === "running"}
+                interrupted={unsavedDraft && turn.status === "interrupted"}
+              />
+            ))}
+          {!assistantText && unsavedDraft && (
+            <p role="status" className="text-sm text-slate-500">
+              {turn.status === "interrupted" ? "回复已中断。" : liveProgress}
             </p>
           )}
 
           {/* 正文完整性单独提示：业务操作可能已经成功，只是这段话说得不完整 */}
           {replyNotice && (
-            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-6 text-amber-900">
+            <div className="quota-warning">
               <span>{replyNotice}</span>
               {turn.reply_retryable === true && onRegenerateReply && (
                 <button
                   type="button"
-                  disabled={busy || regeneratingReply}
+                  disabled={busy || regeneratingReply || replyQuotaBlocked}
                   onClick={() => onRegenerateReply(turn)}
-                  className="ml-2 rounded-lg border border-amber-300 bg-white px-2 py-0.5 text-[11px] font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                  className="ml-2 rounded-lg border border-amber-300 bg-white px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
                 >
                   {regeneratingReply ? "正在重写…" : "重新生成回复"}
                 </button>
@@ -322,27 +515,179 @@ export default function ConversationTurn({
           {/* 复合操作执行结果反馈：内部动作名转成中文，重复消息折叠为状态 */}
           {compositeRows.length > 0 && (
             <div className="space-y-1.5">
-              {compositeRows.map(({ item, showMessage }, idx) => (
-                <div
-                  key={idx}
-                  className={`flex items-center justify-between rounded-xl px-3 py-2 text-xs ${
-                    item.status === "success"
-                      ? "border border-slate-200 bg-slate-50/80 text-slate-700"
-                      : item.status === "clarification"
-                        ? "border border-amber-200 bg-amber-50 text-amber-800"
-                        : "border border-rose-200 bg-rose-50 text-rose-700"
-                  }`}
-                >
-                  <span className="break-words">
-                    {showMessage ? item.message : actionStatusLabel(item.status)}
-                  </span>
-                  <span className="ml-2 shrink-0 text-[10px] text-slate-400">
-                    {actionLabel(item.action)}
-                  </span>
-                </div>
-              ))}
+              {compositeRows.map(({ item, message, showMessage }, idx) => {
+                const det = item.details ?? {};
+                const isAttachMat = item.action === "attach_material" && typeof det.material_id === "string";
+                const isExamUpload = isAttachMat && (det.material_is_exam === true || looksLikeExam(String(det.material_title ?? "")));
+                const isExamSolution = item.action === "solve_uploaded_exam" && typeof det.material_id === "string";
+                const sourcePages = Array.isArray(det.source_pages)
+                  ? det.source_pages.filter((page): page is number => Number.isInteger(page) && Number(page) > 0)
+                  : [];
+                if (isExamUpload || (isExamSolution && sourcePages.length === 0)) return null;
+                if (isExamSolution) {
+                  return (
+                    <div key={idx} className="flex flex-wrap gap-2">
+                      {sourcePages.map((page) => (
+                        <a
+                          key={page}
+                          href={materialPreviewUrl(String(det.material_id), page)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="quiet-button text-xs"
+                        >
+                          原卷第 {page} 页
+                        </a>
+                      ))}
+                    </div>
+                  );
+                }
+                const isGenMat = item.action === "generate_material_artifact" && typeof det.artifact_id === "string";
+                const liveArtifact = isGenMat ? materialArtifactsById?.get(String(det.artifact_id)) : undefined;
+                const needsInput = det.code === "MATERIAL_COVERAGE_REQUIRED";
+                const previousPartial = Boolean(liveArtifact?.coverage?.missing_pages.length);
+                const pendingOutputs: OutputKind[] = Array.isArray(det.outputs)
+                  ? det.outputs.filter((value): value is OutputKind => value === "notes" || value === "quiz" || value === "graph")
+                  : [];
+                const materialId = det.material_id;
+                const startPage = det.start_page;
+                const endPage = det.end_page;
+                const confirmCoverage = item.action === "generate_material_artifact" &&
+                  (needsInput || previousPartial) && onConfirmMaterialCoverage &&
+                  typeof materialId === "string" && typeof startPage === "number" && typeof endPage === "number" &&
+                  pendingOutputs.length > 0
+                  ? (mode: ArtifactInputMode) => onConfirmMaterialCoverage(
+                    materialId, pendingOutputs, startPage, endPage, mode,
+                    typeof det.course_hint === "string" ? det.course_hint : liveArtifact?.course_hint,
+                  )
+                  : undefined;
+                const hasResultCard = materialResultIds?.includes(String(det.artifact_id));
+                const visibleOutputs = Array.isArray(det.outputs) ? pendingOutputs : (["notes", "quiz", "graph"] as const);
+                const getMaterialStatus = (output: OutputKind) =>
+                  liveArtifact?.[`${output}_status`] ?? det[`${output}_status`];
+                const failedOutput = isGenMat && visibleOutputs.some((output) => getMaterialStatus(output) === "failed");
+                const effectiveStatus = failedOutput ? "failed" : item.status;
+                if (isGenMat && effectiveStatus === "success" && !previousPartial &&
+                    hasResultCard) {
+                  return null;
+                }
+                return (
+                  <div
+                    key={idx}
+                    className={`space-y-2 rounded-xl px-3 py-2 text-xs ${
+                      effectiveStatus === "success"
+                        ? "border border-slate-200 bg-slate-50/80 text-slate-700"
+                        : effectiveStatus === "clarification"
+                          ? "border border-amber-200 bg-amber-50 text-amber-800"
+                          : "border border-rose-200 bg-rose-50 text-rose-700"
+                    }`}
+                  >
+                    {(showMessage || !isGenMat || effectiveStatus !== "success") && (
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="break-words">
+                          {showMessage ? message : actionStatusLabel(effectiveStatus)}
+                        </span>
+                      </div>
+                    )}
+
+                    {isAttachMat && (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <a
+                          href={materialPreviewUrl(String(det.material_id))}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="quiet-button text-xs"
+                        >
+                          预览原件（{String(det.page_count ?? "")} 页）
+                        </a>
+                        {det.sufficient !== false && onGenerateMaterialOutput && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => onGenerateMaterialOutput(String(det.material_id), "notes")}
+                              className="quiet-button text-xs"
+                            >
+                              章节笔记
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => onGenerateMaterialOutput(String(det.material_id), "quiz")}
+                              className="quiet-button text-xs"
+                            >
+                              章节测试
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => onGenerateMaterialOutput(String(det.material_id), "graph")}
+                              className="quiet-button text-xs"
+                            >
+                              知识图谱
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {confirmCoverage && (
+                      <div className="space-y-2">
+                        <p>每个待识别页会将原页图片发送给 DeepSeek，预计每页使用 1 次模型请求。识别完成后继续生成。</p>
+                        <div className="flex flex-wrap gap-2">
+                          <button type="button" className="quiet-button" disabled={busy}
+                            onClick={() => confirmCoverage("recognize")}>
+                            {previousPartial ? "补齐并生成新版" : "识别并生成"}
+                          </button>
+                          {needsInput && det.can_generate_partial === true && (
+                            <button type="button" className="quiet-button" disabled={busy}
+                              onClick={() => confirmCoverage("partial")}>
+                              仅生成部分成果
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {isGenMat && (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {previousPartial && <span>资料有缺页</span>}
+                        {!hasResultCard && onOpenMaterialArtifact && visibleOutputs.some((output) => getMaterialStatus(output) === "ready") && (
+                          <button type="button" className="quiet-button" onClick={() => onOpenMaterialArtifact(
+                            String(det.artifact_id), String(det.material_title ?? liveArtifact?.title ?? "个人资料"),
+                            Number(liveArtifact?.end_page ?? det.end_page ?? 0),
+                          )}>定位复习成果</button>
+                        )}
+                        {visibleOutputs.map((outKind) => {
+                          const st = getMaterialStatus(outKind);
+                          const label =
+                            outKind === "notes"
+                              ? "章节笔记"
+                              : outKind === "quiz"
+                                ? "章节测试"
+                                : "知识图谱";
+                          if (st === "failed" && onRetryMaterialOutput) {
+                            return (
+                              <button
+                                key={outKind}
+                                type="button"
+                                disabled={busy}
+                                onClick={() => onRetryMaterialOutput(String(det.artifact_id), outKind)}
+                                className="rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 font-medium text-rose-800 hover:bg-rose-100 disabled:opacity-50"
+                              >
+                                重试{label}
+                              </button>
+                            );
+                          }
+                          return null;
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
+
+          {materialResultCards}
 
           {/* 试卷检索结果（普通查询轮次或动态查卷动作产出） */}
           {hasSavedResults && turn.result && (
@@ -372,12 +717,11 @@ export default function ConversationTurn({
               onAction={onQuestionAction}
             />
           )}
-          {hasSavedResults && Array.from(references, ([key, card]) => (
+          {hasSavedResults && isQuestionRelatedTurn && Array.from(references, ([key, card]) => (
             <div key={key} className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600"
               data-question-reference={key}>
-              <span>沿用第 {card.number_label} 题 · {({ choice: "选择题", fill: "填空题", code: "编程题" })[card.question_type]}</span>
-              {card.answer_revealed ? <span>答案已查看</span> : null}
-              <button type="button" className="text-river underline" onClick={() => onJumpToQuestion?.(key)}>查看题目主卡</button>
+              <span>当前关联第 {card.number_label} 题</span>
+              <button type="button" className="text-river underline" onClick={() => onJumpToQuestion?.(key)}>回到题目</button>
             </div>
           ))}
 
@@ -391,11 +735,15 @@ export default function ConversationTurn({
               onCorrect={
                 onCorrectExercise ? () => onCorrectExercise(exercise.id) : undefined
               }
+              mistakeRecord={hasRecordCard ? null : mistakeRecordForExercise}
+              savingMistake={savingMistakeRootId === exercise.root_problem_id}
+              onSaveMistake={hasRecordCard ? undefined : onSaveExerciseMistake}
+              onOpenRecord={onOpenRecord}
             />
           )}
 
           {showsExerciseReference && exercise && (
-            <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+            <div className="reading-note">
               <p className="text-xs leading-6 text-slate-600">
                 这道练习的题目在上方主卡；本次作答与评价保留在卡片的最新记录中。
               </p>
@@ -404,7 +752,7 @@ export default function ConversationTurn({
                 onClick={() => onJumpToExercise?.(exercise.id)}
                 className="mt-2 text-xs font-medium text-river underline decoration-river/30 hover:text-river/80"
               >
-                查看题目主卡
+                回到题目
               </button>
             </div>
           )}
@@ -421,8 +769,18 @@ export default function ConversationTurn({
               onSubmitAnswer={onSubmitExerciseAnswer}
               onRevealSolution={onRevealExerciseSolution}
               draft={exerciseDrafts?.[exercise.id]}
+              draftImages={exerciseDraftImages?.[exercise.id]}
+              imageNotice={exerciseImageNotices?.[exercise.id] ?? null}
+              imagesBlocked={imagesBlocked}
               solutionImageNames={solutionImageNames}
               onDraftChange={(draft) => onExerciseDraftChange?.(exercise.id, draft)}
+              onAddImages={onAddExerciseImages}
+              onRemoveImage={onRemoveExerciseImage}
+              onRetryImage={onRetryExerciseImage}
+              mistakeRecord={hasRecordCard ? null : mistakeRecordForExercise}
+              savingMistake={savingMistakeRootId === exercise.root_problem_id}
+              onSaveMistake={hasRecordCard ? undefined : onSaveExerciseMistake}
+              onOpenRecord={onOpenRecord}
             />
           )}
 
@@ -431,26 +789,23 @@ export default function ConversationTurn({
               <ProblemCard
                 result={tutoring}
                 showStatement={!turn.question}
-                // 正文已经完整讲过一遍时，卡片默认收起，避免同一段讲解出现两次。
-                // 这里用保存的完整正文判断，而不是页面上被拆句后的片段。
-                compact={(turn.assistant_message ?? "").length > 120}
+                canCorrect={!isBankLesson || tutoring.problem.clarity === "unclear"}
                 busy={busy}
                 onFeedback={onFeedback}
                 onRecord={onRecord}
                 onCorrect={onCorrect}
                 onSupplement={onSupplement}
-                onNew={onNew}
               />
             )}
 
           {hasSavedResults &&
             tutoring?.kind === "needs_clarification" && (
-              <div className="rounded-2xl border border-amber-200 bg-amber-50/80 p-4">
+              <div className="lesson-sheet">
                 <p className="text-sm font-semibold text-amber-900">
                   题目还不清楚，先补充再讲解
                 </p>
-                <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-amber-950">
-                  {tutoring.problem.statement_text}
+                <p className="lesson-statement">
+                  <MathText text={tutoring.problem.statement_text} />
                 </p>
                 <ul className="mt-2 list-disc space-y-1 pl-5 text-xs leading-6 text-amber-900">
                   {tutoring.questions.map((question) => (
@@ -478,7 +833,7 @@ export default function ConversationTurn({
 
           {hasSavedResults &&
             tutoring?.kind === "intent_clarification" && (
-              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+              <div className="reading-note">
                 <p className="text-sm leading-6 text-slate-700">
                   {tutoring.message}
                 </p>
@@ -487,7 +842,10 @@ export default function ConversationTurn({
                     <button
                       key={option}
                       type="button"
-                      onClick={() => onIntentChoice(turn, option)}
+                      onClick={() => {
+                        if (option === "new_problem") onNew(turn.query);
+                        else onIntentChoice(turn, option);
+                      }}
                       className="rounded-lg border border-river/30 bg-white px-3 py-1.5 text-xs font-medium text-river hover:bg-river/5"
                     >
                       {OPTION_LABELS[option] ?? option}
@@ -497,15 +855,17 @@ export default function ConversationTurn({
               </div>
             )}
 
+          {/* 正文已承载追问回答时不再在卡片区全文重复；仅旧记录缺正文时兜底展示。 */}
           {hasSavedResults &&
-            tutoring?.kind === "followup_answer" && (
-              <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
-                <p className="text-[11px] font-medium text-slate-500">追问回答</p>
-                <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-7 text-slate-800">
-                  {tutoring.answer}
-                </p>
+            tutoring?.kind === "followup_answer" &&
+            !assistantText.trim() && (
+              <div className="reading-note">
+                <p className="text-xs font-medium text-slate-500">追问回答</p>
+                <div className="assistant-prose mt-1">
+                  <AssistantMarkdown text={tutoring.answer} />
+                </div>
                 {tutoring.related_steps.length > 0 && (
-                  <p className="mt-2 text-[11px] text-slate-500">
+                  <p className="mt-2 text-xs text-slate-500">
                     相关步骤：{tutoring.related_steps.join("、")}
                   </p>
                 )}
@@ -515,32 +875,25 @@ export default function ConversationTurn({
           {hasSavedResults &&
             (tutoring?.kind === "record_created" ||
               tutoring?.kind === "record_exists") && (
-              <div className="rounded-2xl border border-emerald-200 bg-emerald-50/80 p-4">
-                <p className="text-sm font-semibold text-emerald-900">
-                  {tutoring.kind === "record_created"
-                    ? "已记录到错题本"
-                    : tutoring.needs_update
-                      ? "已有旧版本记录"
-                      : "这道题已经记录过了"}
-                </p>
-                <p className="mt-1 text-sm leading-6 text-emerald-900">
-                  {tutoring.kind === "record_exists" && tutoring.needs_update
-                    ? "原记录对应旧题干，可在错题本中更新或重新讲解。"
-                    : "记录包含题目、图片、来源、讲解和反馈；删除记录不会删除原会话。"}
-                </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-emerald-800">
                 <button
                   type="button"
                   onClick={() => onOpenRecord(tutoring.record.id)}
-                  className="mt-2 rounded-lg border border-emerald-300 bg-white px-3 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
+                  className="inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-3 py-1 font-medium text-emerald-900 hover:bg-emerald-100"
                 >
-                  打开错题本记录
+                  已加入错题本 · 查看
                 </button>
+                {tutoring.kind === "record_exists" && tutoring.needs_update && (
+                  <span className="text-slate-500">
+                    （原记录对应旧题干，可在错题本中更新）
+                  </span>
+                )}
               </div>
             )}
 
           {hasSavedResults &&
             tutoring?.kind === "feedback_recorded" && (
-              <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-3">
+              <div className="reading-note">
                 <p className="text-sm leading-6 text-emerald-900">
                   {tutoring.message}
                 </p>
@@ -552,7 +905,7 @@ export default function ConversationTurn({
               <p className="break-words text-sm leading-6 text-rose-800">
                 {turn.error.message}
               </p>
-              <details className="mt-1 text-[11px] text-rose-500">
+              <details className="mt-1 text-xs text-rose-500">
                 <summary className="cursor-pointer">诊断信息</summary>
                 <p className="mt-1">错误码：{turn.error.code}</p>
               </details>
@@ -574,14 +927,6 @@ export default function ConversationTurn({
               这一轮仍在进行中。若长时间没有变化，请刷新会话记录确认状态。
             </p>
           )}
-
-          {hasSavedResults &&
-            tutoring?.kind === "explanation" &&
-            tutoring.problem.source.type !== "none" && (
-              <div className="mt-2">
-                <SourceBadge source={tutoring.problem.source} />
-              </div>
-            )}
 
           {/* 快捷建议操作：只在最新一轮展示仍然有效的建议 */}
           {suggestions.length > 0 && (

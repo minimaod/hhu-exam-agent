@@ -21,7 +21,7 @@ from typing import (
 )
 
 from app import images
-from app.conversations import repository as conversation_repository
+from app.conversations import answer_gate, repository as conversation_repository
 from app.conversations.errors import (
     ConversationConflictError,
     ConversationStorageError,
@@ -32,6 +32,7 @@ from app.conversations.inputs import (
     query_input,
 )
 from app.conversations.models import (
+    WorkbenchSource,
     ExerciseEvaluation,
     ExerciseView,
     Turn,
@@ -99,6 +100,15 @@ class TurnInput:
     question_id: str | None = None
     question_source_turn: str | None = None
     question_action: str | None = None
+    material_guide_id: str | None = None
+    material_item_id: str | None = None
+    material_study_mode: str | None = None
+    material_artifact_id: str | None = None
+    material_question_id: str | None = None
+    material_kc_id: str | None = None
+    material_workbench_view: Literal["notes", "graph", "quiz"] | None = None
+    material_source_pages: tuple[int, ...] = ()
+    workbench_source: WorkbenchSource | None = None
 
 @dataclass
 class _AttemptPlan:
@@ -115,13 +125,21 @@ class _AttemptPlan:
 
 @dataclass(frozen=True)
 class ConversationStoreState:
-    """启动时固定的数据库状态；存储不可用不阻止应用启动。"""
+    """启动时固定的数据库状态；存储不可用不阻止应用启动。
 
-    repository: ConversationRepository | None
+    这里只保留数据库路径，不把全库仓库交给 HTTP/Agent；请求依赖会按当前
+    用户构造 scoped 仓库。
+    """
+
+    db_path: Path | None
     error: str | None
 
 def build_store_state() -> ConversationStoreState:
-    """启动时调用：初始化数据库、恢复遗留轮次、清理过期待提交附件。"""
+    """启动时调用：初始化数据库、恢复遗留轮次、清理过期待提交附件。
+
+    旧库不会被自动升级：没有迁移管理员时返回错误，学习/认证接口 503，
+    健康检查与试卷目录仍可用。
+    """
 
     raw_path = os.environ.get("HHU_STUDY_DB")
     db_path = (
@@ -129,12 +147,12 @@ def build_store_state() -> ConversationStoreState:
         if raw_path
         else conversation_repository.DEFAULT_DB_PATH
     )
-    repository = ConversationRepository(db_path)
+    repository = ConversationRepository.for_maintenance(db_path)
     try:
         repository.initialize()
     except ConversationStorageError as exc:
         logger.warning("本地学习数据库不可用：%s", exc)
-        return ConversationStoreState(repository=None, error=str(exc))
+        return ConversationStoreState(db_path=db_path, error=str(exc))
 
     try:
         cutoff = (
@@ -145,7 +163,7 @@ def build_store_state() -> ConversationStoreState:
     except Exception:
         logger.warning("清理过期待提交附件失败，不影响应用启动。", exc_info=True)
 
-    return ConversationStoreState(repository=repository, error=None)
+    return ConversationStoreState(db_path=db_path, error=None)
 
 @dataclass(frozen=True)
 class ReplayTurn:
@@ -238,6 +256,8 @@ class _DynamicContext:
     memory_focus_entry_ids: set[str] = field(default_factory=set)
     # F010 D：学生给出新卷条件、旧 paper_id 已过期时，记录覆盖事实供回复与审计。
     last_paper_switch_override: dict[str, Any] | None = None
+    # 本轮 record_mistake 门禁核准的唯一目标 problem_id（消费后清空，防串写他题）。
+    authorized_mistake_problem_id: str | None = None
     recovery: dict[str, Any] = field(default_factory=dict)
     action_index: int = -1
     # F010 B：读时派生的结构化工作区、跨轮历史与短引用表；本轮工具步骤记录。
@@ -441,6 +461,22 @@ class TurnInputRulesMixin:
             payload["question_source_turn"] = data.question_source_turn
         if data.question_action is not None:
             payload["question_action"] = data.question_action
+        if data.material_guide_id is not None:
+            payload["material_guide_id"] = data.material_guide_id
+        if data.material_item_id is not None:
+            payload["material_item_id"] = data.material_item_id
+        if data.material_study_mode is not None:
+            payload["material_study_mode"] = data.material_study_mode
+        if data.material_artifact_id is not None:
+            payload["material_artifact_id"] = data.material_artifact_id
+        if data.material_question_id is not None:
+            payload["material_question_id"] = data.material_question_id
+        if data.material_kc_id is not None:
+            payload["material_kc_id"] = data.material_kc_id
+        if data.material_workbench_view is not None:
+            payload["material_workbench_view"] = data.material_workbench_view
+        if data.material_source_pages:
+            payload["material_source_pages"] = list(data.material_source_pages)
         if data.attempt_kind:
             payload["attempt_kind"] = data.attempt_kind
         return canonical_json(payload)
@@ -467,5 +503,5 @@ class TurnInputRulesMixin:
             evaluation = ExerciseEvaluation.model_validate(
                 json.loads(ex.evaluation_json)
             )
-            return bool(evaluation.needs_supplement)
+            return answer_gate.evaluation_requires_supplement(evaluation)
         return False

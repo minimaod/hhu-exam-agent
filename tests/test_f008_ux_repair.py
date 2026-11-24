@@ -770,9 +770,9 @@ async def test_reply_material_round_trip_keeps_page_and_materials(tmp_path: Path
 
 
 def test_page_description_states_remaining_and_exhaustion() -> None:
-    """分页事实的措辞：还有多少、是否已经列完，都要说清楚。"""
+    """分页事实的措辞应明确检查范围、余量与是否列完。"""
 
-    from app.conversations.reply import ReplyMaterial
+    from app.conversations.reply import ReplyMaterial, ReplyResult
 
     partial = ReplyMaterial(
         user_text="这张卷的选择题",
@@ -798,7 +798,23 @@ def test_page_description_states_remaining_and_exhaustion() -> None:
             "next_offset": None,
         },
     ).describe()
-    assert "已经全部显示" in done
+    assert "【整卷浏览】" in done and "已经全部显示" in done
+
+    cross_paper = ReplyMaterial(
+        user_text="找 Python 期末选择题",
+        question_page={"question_type": "choice", "total": 398, "returned": 3},
+    )
+    for description in (cross_paper.describe(), cross_paper.describe_context()):
+        assert "【查题结果】本次跨卷检索的选择题，共 398 道" in description
+        assert "当前试卷" not in description
+        assert "已经全部显示" not in description
+
+    search_result_only = ReplyMaterial(
+        user_text="找 Python 期末选择题",
+        results=(ReplyResult("search_questions", "success", "", {"total": 398, "returned": 3}),),
+    ).describe()
+    assert "本次跨卷检索共 398 道" in search_result_only
+    assert "指定试卷" not in search_result_only
     assert json.dumps(ReplyMaterial(user_text="x").describe(), ensure_ascii=False)
 
 # --- 第二轮复核（2026-10-30）：提示/考点/题号/分页/上下文/换一道 ---
@@ -1003,6 +1019,62 @@ async def test_swap_question_returns_an_unseen_one(tmp_path: Path) -> None:
     ))
     second = result_of(await run(service, conversation.id, turn_input(text="换一道")))
     assert [card.number_label for card in second.question_results] == ["2"]
+
+
+@pytest.mark.anyio
+async def test_switch_to_requested_topic_then_keep_it_without_repeating(tmp_path: Path) -> None:
+    scheduler = FakeScheduler(decisions=[search_decision(
+        query="循环", question_type="choice", limit=1,
+    )])
+    service, repository, runtime = build_service(tmp_path, cards=paper_cards(3), scheduler=scheduler)
+    conversation = service.create_conversation()
+
+    first = result_of(await run(service, conversation.id, turn_input(text="找一道 Python 循环选择题")))
+    assert [card.number_label for card in first.question_results] == ["1"]
+
+    scheduler.push(search_decision(
+        query="数组", question_type="choice", exclude_previous=True, limit=1, defer_answer=True,
+    ))
+    second = result_of(await run(service, conversation.id, turn_input(text="换一道数组的题目")))
+    assert runtime.search_calls[-1]["request"].query == "数组"
+    assert [card.number_label for card in second.question_results] == ["2"]
+    assert [item.action for item in second.composite_results] == ["search_questions"]
+    assert second.question is not None and second.question.selected is True and second.tutoring is None
+    assert not second.question_results[0].answer_revealed
+
+    scheduler.push(search_decision(exclude_previous=True, limit=1, defer_answer=True))
+    third = result_of(await run(service, conversation.id, turn_input(text="换一道题目")))
+    request = runtime.search_calls[-1]["request"]
+    assert (request.query, request.question_type) == ("数组", "choice")
+    assert [card.number_label for card in third.question_results] == ["3"]
+    active = repository.get_active_question(conversation.id)
+    assert active is not None and active.number_label == "3"
+
+    scheduler.push(search_decision(exclude_previous=True, limit=1, defer_answer=True))
+    exhausted = result_of(await run(service, conversation.id, turn_input(text="再换一道题目")))
+    assert exhausted.question_results == []
+    assert exhausted.question_result_status == "no_match"
+    assert "没有找到没看过的匹配题" in exhausted.composite_results[0].message
+
+
+@pytest.mark.anyio
+async def test_switch_in_current_paper_keeps_the_browse_cursor(tmp_path: Path) -> None:
+    scheduler = FakeScheduler(decisions=[search_decision(
+        paper_id=PAPER, question_type="choice", limit=1,
+    )])
+    service, _, runtime = build_service(tmp_path, cards=paper_cards(4), scheduler=scheduler)
+    conversation = service.create_conversation()
+    await run(service, conversation.id, turn_input(text="给我这张卷的第一个选择题"))
+
+    scheduler.push(search_decision(exclude_previous=True, limit=1, defer_answer=True))
+    switched = result_of(await run(service, conversation.id, turn_input(text="换一道题目")))
+    assert runtime.search_calls[-1]["request"].paper_id == PAPER
+    assert [card.number_label for card in switched.question_results] == ["2"]
+
+    scheduler.push(search_decision(continue_from_previous=True, limit=1))
+    continued = result_of(await run(service, conversation.id, turn_input(text="继续翻页")))
+    assert runtime.search_calls[-1]["request"].offset == 2
+    assert [card.number_label for card in continued.question_results] == ["3"]
 
 
 # --- 第三轮复核（2026-10-30）：考点范围/题型校验/旧会话总量/换题继承 ---

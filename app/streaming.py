@@ -8,14 +8,44 @@
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
-from typing import TypeVar
+from typing import Any, TypeVar
 
+import anyio
 from fastapi import Request
+from starlette.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 T = TypeVar("T")
 
 DISCONNECT_POLL_SECONDS = 0.2
 SENTINEL = object()
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """发送失败或响应取消时显式关闭生成器；未开始迭代也释放预占用。"""
+
+    def __init__(
+        self,
+        content: AsyncIterator[str],
+        *,
+        on_close: Callable[[], None],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self._content = content
+        self._on_close = on_close
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # ASGI 2.4 的 send 错误可能发生在生成器 yield 之后；框架不会替我们
+            # 关闭暂停的业务流。2.3 的取消作用域也不能打断这段清理。
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self._content.aclose()
+                finally:
+                    self._on_close()
 
 
 async def stream_events(
@@ -65,9 +95,10 @@ async def stream_events(
 
             getter = asyncio.create_task(queue.get())
     finally:
-        getter.cancel()
-        worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await getter
-        with suppress(asyncio.CancelledError):
-            await worker
+        with anyio.CancelScope(shield=True):
+            getter.cancel()
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await getter
+            with suppress(asyncio.CancelledError):
+                await worker

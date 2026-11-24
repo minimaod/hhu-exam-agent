@@ -26,8 +26,15 @@ def _new_id() -> str:
 
 
 class Seed:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, owner_id: str | None = None) -> None:
+        from tests.f012_support import TEST_USER_ID, ensure_owner
+
         self.db_path = Path(db_path)
+        self.owner_id = owner_id or TEST_USER_ID
+        try:
+            ensure_owner(self.db_path, self.owner_id)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
@@ -41,9 +48,9 @@ class Seed:
         moment = _iso(_now() - timedelta(days=days_ago))
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO conversations (id, title, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                (conversation_id, title, moment, moment),
+                "INSERT INTO conversations (id, title, created_at, updated_at, owner_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, title, moment, moment, self.owner_id),
             )
             connection.commit()
         return conversation_id

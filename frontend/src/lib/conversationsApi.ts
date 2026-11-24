@@ -13,6 +13,13 @@ import {
   type ResultEvent,
 } from "./queryApi.ts";
 import { createSseParser } from "./sseParser.ts";
+import type { ConversationMaterialItem } from "./materialsApi.ts";
+import { apiFetch } from "./apiFetch.ts";
+import {
+  parseQuotaFailure,
+  parseQuotaInfo,
+  type QuotaInfo,
+} from "./usageApi.ts";
 
 const CONVERSATIONS_PATH = "/api/conversations";
 const MAX_QUERY_LENGTH = 2000;
@@ -55,7 +62,7 @@ export type TurnKind =
   | "explain_question"
   | "view_question_answer";
 export type TurnErrorCode = QueryErrorCode | "STORAGE_UNAVAILABLE" | "TUTORING_FAILED" | "BUSINESS_REJECTED"
-  | "QUESTION_SEARCH_FAILED" | "QUESTION_BANK_UNAVAILABLE";
+  | "QUESTION_SEARCH_FAILED" | "QUESTION_BANK_UNAVAILABLE" | "TURN_IN_PROGRESS";
 export type TurnStage =
   | "dispatching"
   | "scheduling"
@@ -71,6 +78,7 @@ export type TurnStage =
   | "searching_questions"
   | "viewing_question"
   | "composing_reply"
+  | "generating_material"
   | "saving";
 
 export type SourceType = "none" | "student_text" | "registered_paper";
@@ -87,6 +95,11 @@ export type AttachmentRole =
   | "supplement"
   | "student_answer"
   | "student_solution";
+
+export type AttachmentInput = {
+  id: string;
+  role: AttachmentRole;
+};
 
 export type SuggestionItem = {
   label: string;
@@ -136,6 +149,7 @@ export type RecordSummary = {
   title: string;
   statement_excerpt: string;
   source: Source;
+  is_model_generated?: boolean;
   problem_version: number;
   self_reported_understood: boolean;
   created_at: string;
@@ -295,12 +309,14 @@ export type QuestionIndependentSolution = {
   text: string;
   note?: string | null;
 };
+export type QuestionType = "choice" | "fill" | "code" | "solve" | "proof" | "judge";
+
 export type QuestionCard = {
   question_id: string;
   build_id: string;
   selection_id?: string | null;
   source_request_id?: string | null;
-  question_type: "choice" | "fill" | "code";
+  question_type: QuestionType;
   number_label: string;
   statement: string;
   content_sha256: string;
@@ -375,6 +391,15 @@ export type RecordRef = {
   problem_version: number;
 };
 
+export type WorkbenchSource = {
+  artifact_id: string;
+  view: "notes" | "graph" | "quiz";
+  kc_id?: string | null;
+  question_id?: string | null;
+  label: string;
+  pages: number[];
+};
+
 export type ConversationTurn = BusinessOutcome &
   ReplyOutcome & {
   request_id: string;
@@ -388,6 +413,7 @@ export type ConversationTurn = BusinessOutcome &
   evaluation?: ExerciseEvaluation | null;
   composite_results?: ActionResultItem[] | null;
   assistant_message?: string | null;
+  workbench_source?: WorkbenchSource | null;
   suggestions?: SuggestionItem[] | null;
   exercise_id?: string | null;
   question_results?: QuestionCard[] | null;
@@ -407,6 +433,8 @@ export type ConversationDetail = {
   active_question?: QuestionCard | null;
   context?: ConversationContextView | null;
   record: RecordRef | null;
+  records_by_root?: Record<string, RecordRef>;
+  materials?: ConversationMaterialItem[];
 };
 
 export type TurnProgressEvent = {
@@ -464,6 +492,8 @@ export type TurnErrorEvent = {
   request_id: string;
   code: TurnErrorCode;
   message: string;
+  quota?: QuotaInfo | null;
+  saved?: boolean;
 };
 
 export type TurnEvent =
@@ -489,6 +519,14 @@ export type StreamTurnOptions = {
   questionId?: string;
   questionSourceTurn?: string;
   questionAction?: "exercise" | "record";
+  materialGuideId?: string;
+  materialItemId?: string;
+  materialStudyMode?: "explain" | "exercise" | "evaluate";
+  materialArtifactId?: string;
+  materialQuestionId?: string;
+  materialKcId?: string;
+  workbenchView?: WorkbenchSource["view"];
+  materialSourcePages?: number[];
   signal?: AbortSignal;
   onProgress?: (event: TurnProgressEvent) => void;
   onMessageDelta?: (event: TurnMessageDeltaEvent) => void;
@@ -497,15 +535,24 @@ export type StreamTurnOptions = {
 export class ConversationsApiError extends Error {
   readonly status: number | undefined;
   readonly code: string | undefined;
+  readonly quota: QuotaInfo | null;
+  readonly saved: boolean;
 
   constructor(
     message: string,
-    options: { status?: number; code?: string } = {},
+    options: {
+      status?: number;
+      code?: string;
+      quota?: QuotaInfo | null;
+      saved?: boolean;
+    } = {},
   ) {
     super(message);
     this.name = "ConversationsApiError";
     this.status = options.status;
     this.code = options.code;
+    this.quota = options.quota ?? null;
+    this.saved = options.saved ?? false;
   }
 }
 
@@ -847,7 +894,12 @@ function isQuestionCard(value: unknown): value is QuestionCard {
     isRecord(value) &&
     typeof value.question_id === "string" &&
     typeof value.build_id === "string" &&
-    (value.question_type === "choice" || value.question_type === "fill" || value.question_type === "code") &&
+    (value.question_type === "choice" ||
+      value.question_type === "fill" ||
+      value.question_type === "code" ||
+      value.question_type === "solve" ||
+      value.question_type === "proof" ||
+      value.question_type === "judge") &&
     typeof value.number_label === "string" &&
     typeof value.statement === "string" &&
     Array.isArray(value.options) &&
@@ -1071,7 +1123,10 @@ function isConversationDetail(value: unknown): value is ConversationDetail {
     (value.context === undefined ||
       value.context === null ||
       isConversationContext(value.context)) &&
-    (value.record === null || isRecordRef(value.record))
+    (value.record === null || isRecordRef(value.record)) &&
+    (value.records_by_root === undefined ||
+      (isRecord(value.records_by_root) &&
+        Object.values(value.records_by_root).every(isRecordRef)))
   );
 }
 
@@ -1104,6 +1159,7 @@ function isTurnStage(value: unknown): value is TurnStage {
     value === "searching_questions" ||
     value === "viewing_question" ||
     value === "composing_reply" ||
+    value === "generating_material" ||
     value === "saving"
   );
 }
@@ -1121,7 +1177,11 @@ function isTurnErrorCode(value: unknown): value is TurnErrorCode {
     value === "BUSINESS_REJECTED" ||
     value === "QUESTION_SEARCH_FAILED" ||
     value === "QUESTION_BANK_UNAVAILABLE" ||
-    value === "STORAGE_UNAVAILABLE"
+    value === "STORAGE_UNAVAILABLE" ||
+    value === "MODEL_QUOTA_EXCEEDED" ||
+    value === "IMAGE_QUOTA_EXCEEDED" ||
+    value === "QUOTA_STORAGE_UNAVAILABLE" ||
+    value === "TURN_IN_PROGRESS"
   );
 }
 
@@ -1158,9 +1218,15 @@ async function readJson(response: Response, description: string): Promise<unknow
 
 async function ensureOk(response: Response): Promise<void> {
   if (!response.ok) {
-    throw new ConversationsApiError(await readErrorDetail(response), {
-      status: response.status,
-    });
+    const failure = await parseQuotaFailure(response.clone());
+    throw new ConversationsApiError(
+      failure?.message ?? (await readErrorDetail(response)),
+      {
+        status: response.status,
+        code: failure?.code ?? undefined,
+        quota: failure?.quota,
+      },
+    );
   }
 }
 
@@ -1169,7 +1235,7 @@ export async function createConversation(
 ): Promise<ConversationSummary> {
   let response: Response;
   try {
-    response = await fetch(CONVERSATIONS_PATH, {
+    response = await apiFetch(CONVERSATIONS_PATH, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: "{}",
@@ -1196,7 +1262,7 @@ export async function listConversations(
 ): Promise<ConversationListResponse> {
   let response: Response;
   try {
-    response = await fetch(CONVERSATIONS_PATH, {
+    response = await apiFetch(CONVERSATIONS_PATH, {
       method: "GET",
       headers: { Accept: "application/json" },
       cache: "no-store",
@@ -1223,7 +1289,7 @@ export async function getConversation(
 ): Promise<ConversationDetail> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}`,
       {
         method: "GET",
@@ -1245,6 +1311,17 @@ export async function getConversation(
     throw new ConversationsApiError("后端返回的会话记录格式不符合约定。");
   }
   return payload;
+}
+
+export async function stopConversationMaterialTurn(
+  conversationId: string,
+  requestId: string,
+): Promise<void> {
+  const response = await apiFetch(
+    `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(requestId)}/stop-material`,
+    { method: "POST" },
+  );
+  await ensureOk(response);
 }
 
 export function isReplyStatus(value: unknown): value is ReplyStatus {
@@ -1316,6 +1393,8 @@ export function parseTurnEvent(
       request_id: requestId,
       code: payload.code,
       message: payload.message,
+      quota: parseQuotaInfo(payload.quota),
+      saved: payload.saved === true,
     };
   }
 
@@ -1577,6 +1656,32 @@ export async function streamTurn(
   if (options.questionAction) {
     body.question_action = options.questionAction;
   }
+  if (options.materialGuideId && options.materialItemId) {
+    body.material_guide_id = options.materialGuideId;
+    body.material_item_id = options.materialItemId;
+    if (options.materialStudyMode) {
+      body.material_study_mode = options.materialStudyMode;
+    }
+  }
+  if (options.materialArtifactId && options.materialQuestionId) {
+    body.material_artifact_id = options.materialArtifactId;
+    body.material_question_id = options.materialQuestionId;
+    if (options.materialStudyMode) {
+      body.material_study_mode = options.materialStudyMode;
+    }
+  } else if (options.materialArtifactId && options.materialKcId) {
+    body.material_artifact_id = options.materialArtifactId;
+    body.material_kc_id = options.materialKcId;
+    if (options.materialStudyMode) {
+      body.material_study_mode = options.materialStudyMode;
+    }
+  }
+  if (options.workbenchView && options.materialArtifactId) {
+    body.material_workbench_view = options.workbenchView;
+    body.material_artifact_id = options.materialArtifactId;
+    if (options.materialKcId) body.material_kc_id = options.materialKcId;
+    if (options.materialSourcePages?.length) body.material_source_pages = options.materialSourcePages;
+  }
   if (options.retryOf) {
     Object.keys(body).forEach((key) => { if (key !== "request_id") delete body[key]; });
     body.retry_of = options.retryOf;
@@ -1584,7 +1689,7 @@ export async function streamTurn(
 
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(options.conversationId)}/turns`,
       {
         method: "POST",
@@ -1638,7 +1743,11 @@ export async function streamTurn(
         continue;
       }
       if (event.type === "error") {
-        throw new ConversationsApiError(event.message, { code: event.code });
+        throw new ConversationsApiError(event.message, {
+          code: event.code,
+          quota: event.quota,
+          saved: event.saved,
+        });
       }
       return event;
     }
@@ -1706,7 +1815,7 @@ export async function regenerateTurnReply(
 ): Promise<RegeneratedReply> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(requestId)}/reply`,
       {
         method: "POST",
@@ -1748,7 +1857,7 @@ export async function revealExerciseSolution(
 ): Promise<ExerciseView> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${CONVERSATIONS_PATH}/${encodeURIComponent(conversationId)}/exercises/${encodeURIComponent(exerciseId)}/reveal`,
       {
         method: "POST",

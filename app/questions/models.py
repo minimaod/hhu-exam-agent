@@ -17,9 +17,9 @@ from app.question_bank.models import (
     CodeAnnotation,
     CodeBlock,
     IndependentSolution,
+    QuestionType,
 )
 
-QuestionType = Literal["choice", "fill", "code"]
 AnswerState = Literal["original", "missing", "pending_review", "conflict"]
 SearchStatus = Literal[
     "ok",
@@ -99,6 +99,7 @@ class QuestionSourceView(BaseModel):
 
     paper_id: str
     paper_title: str | None = None
+    course: str | None = None
     exam_type: str | None = None
     academic_year: str | None = None
     question_number: str

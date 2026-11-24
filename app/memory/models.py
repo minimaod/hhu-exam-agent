@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-MemoryEntryKind = Literal["exercise", "attempt", "selfreport"]
+MemoryEntryKind = Literal["exercise", "attempt", "selfreport", "material_quiz"]
 
 # 一条证据（或一次作答）的判断标签。这里只描述“记录是什么”，
 # 不表达“学生会不会”。
@@ -33,7 +33,7 @@ MemoryVerdict = Literal[
 
 MemoryValidity = Literal["ok", "superseded", "unverified", "unavailable"]
 MemoryStatus = Literal["ok", "empty", "unavailable"]
-MemoryCourseSource = Literal["user", "paper", "problem", "unknown"]
+MemoryCourseSource = Literal["user", "paper", "problem", "conversation", "unknown"]
 
 VERDICT_LABELS: dict[str, str] = {
     "wrong_independent": "独立作答被判错",

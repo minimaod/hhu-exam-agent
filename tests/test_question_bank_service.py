@@ -26,14 +26,20 @@ def test_capability_distinguishes_ready_catalog_only_unknown(service: QuestionBa
     assert python.searchable_count == 1152
     assert python.by_type == {"choice": 790, "fill": 324, "code": 40}
     assert python.answer_coverage == {"original": 1096, "missing": 58}
-    assert python.approved_count == len(service.approved_ids)
-    assert python.verified_label_count >= service.repository.verified_label_count()
+    assert python.approved_count == 1152
+    assert python.verified_label_count >= 143
     assert python.paper_count == 20
 
-    math = service.capability("高等数学")
-    assert math.status == "catalog_only"
-    assert math.paper_count and math.paper_count > 0
-    assert math.searchable_count == 0
+    total_approved = sum(
+        service.capability(c).approved_count
+        for c in ("Python", "高等数学", "几何与线性代数", "大学物理")
+    )
+    assert total_approved == len(service.approved_ids)
+
+    prob = service.capability("概率论与数理统计")
+    assert prob.status == "catalog_only"
+    assert prob.paper_count and prob.paper_count > 0
+    assert prob.searchable_count == 0
 
     unknown = service.capability("星际航行")
     assert unknown.status == "unknown"
@@ -41,11 +47,31 @@ def test_capability_distinguishes_ready_catalog_only_unknown(service: QuestionBa
 
 
 def test_other_course_is_bank_not_built_not_no_match(service: QuestionBankService) -> None:
-    response = service.search(SearchRequest(course="高等数学", query="极限"))
+    response = service.search(SearchRequest(course="概率论与数理统计", query="正态分布"))
     assert response.status == "bank_not_built"
     assert response.returned == 0
     assert "尚未建立题目库" in (response.message or "")
     assert response.course.known is True
+
+
+def test_published_other_exam_can_be_read_as_a_question_result(tmp_path: Path) -> None:
+    import sqlite3
+
+    from tests.test_f007_multicourse_extension import _FakeEmbedder, _build_multicourse_bank
+
+    root, catalog = _build_multicourse_bank(tmp_path / "bank")
+    paths = BankPaths(root)
+    current = read_current(paths)
+    assert current is not None
+    with sqlite3.connect(paths.build_dir(current["build_id"]) / "questions.sqlite3") as connection:
+        connection.execute("UPDATE papers SET exam_type = 'other' WHERE paper_id = 'py-2024-final'")
+
+    with QuestionBankService(root, embedder=_FakeEmbedder(), catalog_path=catalog) as bank:
+        result = bank.search(SearchRequest(course="Python", paper_id="py-2024-final"))
+        assert result.status == "ok"
+        assert len(result.items) == 1
+        assert result.items[0].review.approved is True
+        assert result.items[0].paper.exam_type == "other"
 
 
 def test_public_summary_does_not_leak_answer_or_reference_code(service: QuestionBankService) -> None:

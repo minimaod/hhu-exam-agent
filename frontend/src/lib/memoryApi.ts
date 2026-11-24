@@ -1,3 +1,4 @@
+import { apiFetch } from "./apiFetch.ts";
 /**
  * F009 学习记忆接口。
  *
@@ -43,7 +44,7 @@ export type MemoryEntry = {
   entry_id: string;
   kind: "exercise" | "attempt" | "selfreport";
   course: string | null;
-  course_source: "user" | "paper" | "problem" | "unknown";
+  course_source: "user" | "paper" | "problem" | "conversation" | "unknown";
   knowledge_points: string[];
   knowledge_points_normalized: boolean[];
   statement_excerpt: string | null;
@@ -161,7 +162,7 @@ async function readDetail(response: Response): Promise<string> {
 async function request(path: string, init?: RequestInit): Promise<unknown> {
   let response: Response;
   try {
-    response = await fetch(path, init);
+    response = await apiFetch(path, init);
   } catch {
     throw new MemoryApiError("无法连接后端服务，请确认服务已启动。");
   }

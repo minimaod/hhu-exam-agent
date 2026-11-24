@@ -1,4 +1,4 @@
-"""本地学习数据库的结构与迁移（当前 v6）。
+"""本地学习数据库的结构与迁移（当前 v7）。
 
 只有两种数据库允许写入：真正的空库，或结构与目标版本完全兼容的库。旧版
 数据库在单个事务中逐级迁移到 v6；任何未知结构、损坏或迁移失败都只返回
@@ -29,6 +29,7 @@ v6（F009）只追加两张“记忆覆盖”表，不改旧列、不回填旧�
 import logging
 import sqlite3
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.conversations.errors import ConversationStorageError
@@ -36,7 +37,7 @@ from app.conversations.inputs import query_input
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 12
 
 _STORAGE_MESSAGE = "本地学习数据暂时不可用，请稍后再试。"
 _UPGRADE_MESSAGE = "本地学习数据的结构版本不兼容，请保留原文件并联系维护者。"
@@ -46,6 +47,9 @@ _UNKNOWN_MESSAGE = (
 )
 _MIGRATION_MESSAGE = (
     "本地学习数据的结构升级失败，已回滚并保留原数据；请停止使用并联系维护者。"
+)
+_MIGRATION_NEEDED_MESSAGE = (
+    "本地学习数据库仍为旧版本。请先停止服务，运行管理员迁移命令后再启动。"
 )
 
 # ---------------------------------------------------------------------------
@@ -496,6 +500,470 @@ _V6_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
 _V6_UNIQUE_SETS = set(_V5_UNIQUE_SETS)
 _V6_FOREIGN_KEYS = set(_V5_FOREIGN_KEYS)
 _V6_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = dict(_V5_REQUIRED_CHECKS)
+
+# ---------------------------------------------------------------------------
+# v7 结构（F012：账号、邀请码、登录会话与数据归属）
+# ---------------------------------------------------------------------------
+
+_V7_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V6_COLUMNS,
+    "conversations": ("id", "title", "created_at", "updated_at", "owner_id"),
+    "users": (
+        "id",
+        "username",
+        "username_normalized",
+        "password_hash",
+        "created_at",
+        "disabled_at",
+    ),
+    "invite_codes": (
+        "id",
+        "code_sha256",
+        "label",
+        "created_by",
+        "created_at",
+        "expires_at",
+        "used_at",
+        "used_by",
+    ),
+    "login_sessions": (
+        "id",
+        "user_id",
+        "token_sha256",
+        "created_at",
+        "expires_at",
+        "revoked_at",
+    ),
+    "memory_corrections": (
+        "owner_id",
+        "entry_key",
+        "course",
+        "knowledge_point",
+        "note",
+        "created_at",
+        "updated_at",
+    ),
+    "memory_exclusions": (
+        "owner_id",
+        "entry_key",
+        "reason",
+        "created_at",
+    ),
+}
+
+_V7_TABLES = frozenset(_V7_COLUMNS)
+_V7_INDEXES = frozenset(
+    _V6_INDEXES
+    | {
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+    }
+)
+
+_V7_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V6_PRIMARY_KEYS,
+    "conversations": ("id",),
+    "users": ("id",),
+    "invite_codes": ("id",),
+    "login_sessions": ("id",),
+    "memory_corrections": ("owner_id", "entry_key"),
+    "memory_exclusions": ("owner_id", "entry_key"),
+}
+
+_V7_UNIQUE_SETS = {
+    *_V6_UNIQUE_SETS,
+    ("username_normalized",),
+    ("code_sha256",),
+    ("token_sha256",),
+}
+
+_V7_FOREIGN_KEYS = {
+    *_V6_FOREIGN_KEYS,
+    ("owner_id", "users", "id"),
+    ("user_id", "users", "id"),
+    ("created_by", "users", "id"),
+    ("used_by", "users", "id"),
+}
+
+_V7_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = dict(_V6_REQUIRED_CHECKS)
+
+# ---------------------------------------------------------------------------
+# v8 结构（F013：模型用量、临时额度与每账号执行占用）
+# ---------------------------------------------------------------------------
+
+_V8_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V7_COLUMNS,
+    "model_usage_events": (
+        "id",
+        "owner_id",
+        "usage_date",
+        "created_at",
+        "kind",
+        "conversation_id",
+        "request_id",
+    ),
+    "model_quota_overrides": (
+        "owner_id",
+        "daily_requests",
+        "daily_images",
+        "expires_on",
+        "updated_at",
+    ),
+    "user_active_turns": (
+        "owner_id",
+        "conversation_id",
+        "request_id",
+        "lease_token",
+        "started_at",
+    ),
+}
+
+_V8_TABLES = frozenset(_V8_COLUMNS)
+_V8_INDEXES = frozenset(
+    _V7_INDEXES
+    | {
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+    }
+)
+
+_V8_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V7_PRIMARY_KEYS,
+    "model_usage_events": ("id",),
+    "model_quota_overrides": ("owner_id",),
+    "user_active_turns": ("owner_id",),
+}
+
+_V8_UNIQUE_SETS = {
+    *_V7_UNIQUE_SETS,
+    ("lease_token",),
+}
+
+_V8_FOREIGN_KEYS = {
+    *_V7_FOREIGN_KEYS,
+    ("owner_id", "users", "id"),
+    ("conversation_id", "conversations", "id"),
+}
+
+_V8_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = dict(_V7_REQUIRED_CHECKS)
+
+# ---------------------------------------------------------------------------
+# v9 结构（F019 第二阶段：个人资料 PDF、物理页缓存、章节复习清单与清单项）
+# ---------------------------------------------------------------------------
+
+_V9_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V8_COLUMNS,
+    "personal_materials": (
+        "id",
+        "owner_id",
+        "display_name",
+        "stored_name",
+        "file_sha256",
+        "size_bytes",
+        "page_count",
+        "status",
+        "dedicated_conversation_id",
+        "created_at",
+        "updated_at",
+    ),
+    "personal_material_pages": (
+        "material_id",
+        "page_no",
+        "extracted_text",
+        "char_count",
+        "scanned_suspect",
+        "garbled_ratio",
+        "formula_warning",
+        "parser_version",
+        "created_at",
+    ),
+    "material_review_guides": (
+        "id",
+        "owner_id",
+        "material_id",
+        "file_sha256",
+        "start_page",
+        "end_page",
+        "rule_version",
+        "course_hint",
+        "conversation_id",
+        "status",
+        "generation_token",
+        "readability_json",
+        "error_code",
+        "error_message",
+        "created_at",
+        "updated_at",
+    ),
+    "material_guide_items": (
+        "id",
+        "guide_id",
+        "owner_id",
+        "sort_order",
+        "category",
+        "title",
+        "source_excerpt",
+        "ai_explanation",
+        "practice_prompt",
+        "verified_citations_json",
+        "created_at",
+    ),
+    "pending_file_cleanups": (
+        "id",
+        "root_kind",
+        "stored_name",
+        "attempts",
+        "last_error",
+        "created_at",
+    ),
+}
+
+_V9_TABLES = frozenset(_V9_COLUMNS)
+_V9_INDEXES = frozenset(
+    _V8_INDEXES
+    | {
+        "personal_materials_owner",
+        "material_review_guides_owner",
+        "material_guide_items_guide",
+    }
+)
+
+_V9_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V8_PRIMARY_KEYS,
+    "personal_materials": ("id",),
+    "personal_material_pages": ("material_id", "page_no"),
+    "material_review_guides": ("id",),
+    "material_guide_items": ("id",),
+    "pending_file_cleanups": ("id",),
+}
+
+_V9_UNIQUE_SETS = {
+    *_V8_UNIQUE_SETS,
+    ("stored_name",),
+    ("owner_id", "material_id", "file_sha256", "start_page", "end_page", "rule_version", "course_hint"),
+}
+
+_V9_FOREIGN_KEYS = {
+    *_V8_FOREIGN_KEYS,
+    ("dedicated_conversation_id", "conversations", "id"),
+    ("material_id", "personal_materials", "id"),
+    ("guide_id", "material_review_guides", "id"),
+}
+
+_V9_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = {
+    **_V8_REQUIRED_CHECKS,
+    "personal_materials": (
+        "statusin('active','deleting')",
+        "page_count>=1",
+    ),
+    "personal_material_pages": (
+        "page_no>=1",
+        "scanned_suspectin(0,1)",
+        "formula_warningin(0,1)",
+    ),
+    "material_review_guides": (
+        "start_page>=1",
+        "end_page>=start_page",
+        "statusin('generating','ready','failed')",
+    ),
+    "material_guide_items": (
+        "categoryin('concept','formula','method','pitfall')",
+    ),
+    "pending_file_cleanups": (
+        "root_kindin('material','attachment')",
+    ),
+}
+
+_V10_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V9_COLUMNS,
+    "material_artifacts": (
+        "id",
+        "owner_id",
+        "material_id",
+        "file_sha256",
+        "start_page",
+        "end_page",
+        "rule_version",
+        "course_hint",
+        "title",
+        "is_sample",
+        "status",
+        "current_step",
+        "generation_token",
+        "conversation_id",
+        "skeleton_json",
+        "notes_html",
+        "graph_tree_json",
+        "coverage_warnings_json",
+        "error_code",
+        "error_message",
+        "created_at",
+        "updated_at",
+    ),
+    "material_quiz_questions": (
+        "id",
+        "artifact_id",
+        "owner_id",
+        "sort_order",
+        "kc_id",
+        "q_type",
+        "stem",
+        "options_json",
+        "answer_json",
+        "explanation",
+        "pitfall",
+        "cognitive",
+        "difficulty",
+        "points",
+        "source_pages_json",
+        "created_at",
+    ),
+    "material_quiz_attempts": (
+        "id",
+        "question_id",
+        "artifact_id",
+        "owner_id",
+        "user_answer_json",
+        "is_correct",
+        "score",
+        "max_points",
+        "grading_status",
+        "evaluation_json",
+        "revealed_solution_at",
+        "answered_after_revealed",
+        "created_at",
+        "updated_at",
+    ),
+    "material_graph_notes": (
+        "id",
+        "owner_id",
+        "material_id",
+        "artifact_id",
+        "node_id",
+        "note_text",
+        "updated_at",
+    ),
+}
+
+_V10_TABLES = frozenset(_V10_COLUMNS)
+_V10_INDEXES = frozenset(
+    _V9_INDEXES
+    | {
+        "material_artifacts_owner",
+        "material_quiz_questions_artifact",
+        "material_quiz_attempts_artifact",
+        "material_graph_notes_artifact",
+    }
+)
+
+_V10_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V9_PRIMARY_KEYS,
+    "material_artifacts": ("id",),
+    "material_quiz_questions": ("id",),
+    "material_quiz_attempts": ("id",),
+    "material_graph_notes": ("id",),
+}
+
+_V10_UNIQUE_SETS = {
+    *_V9_UNIQUE_SETS,
+    ("owner_id", "material_id", "file_sha256", "start_page", "end_page", "rule_version", "course_hint"),
+    ("owner_id", "question_id"),
+    ("owner_id", "artifact_id", "node_id"),
+}
+
+_V10_FOREIGN_KEYS = {
+    *_V9_FOREIGN_KEYS,
+    ("artifact_id", "material_artifacts", "id"),
+    ("question_id", "material_quiz_questions", "id"),
+}
+
+_V10_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = {
+    **_V9_REQUIRED_CHECKS,
+    "material_artifacts": (
+        "start_page>=1",
+        "end_page>=start_page",
+        "is_samplein(0,1)",
+        "statusin('generating','ready','failed')",
+    ),
+    "material_quiz_questions": (
+        "q_typein('choice','multi','tf','fill','calc','code','short')",
+    ),
+    "material_quiz_attempts": (
+        "grading_statusin('auto_graded','pending_review','evaluated','unanswered')",
+        "answered_after_revealedin(0,1)",
+    ),
+}
+
+# v11（F007 多学科拓展）：扩展 question_selections.question_type 允许解答/证明/判断题。
+_V11_COLUMNS: dict[str, tuple[str, ...]] = dict(_V10_COLUMNS)
+_V11_TABLES = _V10_TABLES
+_V11_INDEXES = _V10_INDEXES
+_V11_PRIMARY_KEYS: dict[str, tuple[str, ...]] = dict(_V10_PRIMARY_KEYS)
+_V11_UNIQUE_SETS = set(_V10_UNIQUE_SETS)
+_V11_FOREIGN_KEYS = set(_V10_FOREIGN_KEYS)
+_V11_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = {
+    **_V10_REQUIRED_CHECKS,
+    "question_selections": (
+        "question_typein('choice','fill','code','solve','proof','judge')",
+        "answer_reveal_sourcein('view','explain')",
+        "activein(0,1)",
+    ),
+}
+
+# v12（F019 第三阶段）：会话-资料多对多关联与产物分项按需生成状态。
+_V12_COLUMNS: dict[str, tuple[str, ...]] = {
+    **_V11_COLUMNS,
+    "material_artifacts": (
+        *_V11_COLUMNS["material_artifacts"],
+        "requested_outputs_json",
+        "notes_status",
+        "notes_error_code",
+        "notes_error_message",
+        "quiz_status",
+        "quiz_error_code",
+        "quiz_error_message",
+        "graph_status",
+        "graph_error_code",
+        "graph_error_message",
+    ),
+    "conversation_materials": (
+        "id",
+        "owner_id",
+        "conversation_id",
+        "material_id",
+        "created_at",
+    ),
+}
+_V12_TABLES = frozenset(_V12_COLUMNS)
+_V12_INDEXES = frozenset(
+    _V11_INDEXES
+    | {
+        "conversation_materials_conv",
+        "conversation_materials_mat",
+    }
+)
+_V12_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    **_V11_PRIMARY_KEYS,
+    "conversation_materials": ("id",),
+}
+_V12_UNIQUE_SETS = {
+    *_V11_UNIQUE_SETS,
+    ("owner_id", "conversation_id", "material_id"),
+}
+_V12_FOREIGN_KEYS = set(_V11_FOREIGN_KEYS)
+_V12_REQUIRED_CHECKS: dict[str, tuple[str, ...]] = {
+    **_V11_REQUIRED_CHECKS,
+    "material_artifacts": (
+        *_V11_REQUIRED_CHECKS["material_artifacts"],
+        "notes_statusin('none','generating','ready','failed')",
+        "quiz_statusin('none','generating','ready','failed')",
+        "graph_statusin('none','generating','ready','failed')",
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # DDL
@@ -1120,12 +1588,643 @@ def _v5_migration_statements() -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
+# v7 DDL（F012 账号与归属）
+# ---------------------------------------------------------------------------
+
+_USERS = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    username_normalized TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    disabled_at TEXT
+)
+"""
+
+_USERS_USERNAME = """
+CREATE UNIQUE INDEX IF NOT EXISTS users_username
+    ON users(username_normalized)
+"""
+
+_INVITE_CODES = """
+CREATE TABLE IF NOT EXISTS invite_codes (
+    id TEXT PRIMARY KEY,
+    code_sha256 TEXT NOT NULL,
+    label TEXT,
+    created_by TEXT REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    used_at TEXT,
+    used_by TEXT REFERENCES users(id),
+    CHECK (used_at IS NULL OR used_by IS NOT NULL)
+)
+"""
+
+_INVITE_CODES_CODE = """
+CREATE UNIQUE INDEX IF NOT EXISTS invite_codes_code
+    ON invite_codes(code_sha256)
+"""
+
+_LOGIN_SESSIONS = """
+CREATE TABLE IF NOT EXISTS login_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+)
+"""
+
+_LOGIN_SESSIONS_TOKEN = """
+CREATE UNIQUE INDEX IF NOT EXISTS login_sessions_token
+    ON login_sessions(token_sha256)
+"""
+
+_LOGIN_SESSIONS_USER = """
+CREATE INDEX IF NOT EXISTS login_sessions_user
+    ON login_sessions(user_id, expires_at)
+"""
+
+_CONVERSATIONS_V7 = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    owner_id TEXT REFERENCES users(id)
+)
+"""
+
+_CONVERSATIONS_OWNER = """
+CREATE INDEX IF NOT EXISTS conversations_owner
+    ON conversations(owner_id, updated_at DESC)
+"""
+
+_MEMORY_CORRECTIONS_V7 = """
+CREATE TABLE IF NOT EXISTS memory_corrections (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    course TEXT,
+    knowledge_point TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_MEMORY_EXCLUSIONS_V7 = """
+CREATE TABLE IF NOT EXISTS memory_exclusions (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_MEMORY_CORRECTIONS_V7_TMP = """
+CREATE TABLE memory_corrections_v7 (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    course TEXT,
+    knowledge_point TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_MEMORY_EXCLUSIONS_V7_TMP = """
+CREATE TABLE memory_exclusions_v7 (
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    entry_key TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_id, entry_key)
+)
+"""
+
+_CREATE_V7_STATEMENTS = (
+    _USERS,
+    _USERS_USERNAME,
+    _INVITE_CODES,
+    _INVITE_CODES_CODE,
+    _LOGIN_SESSIONS,
+    _LOGIN_SESSIONS_TOKEN,
+    _LOGIN_SESSIONS_USER,
+    _CONVERSATIONS_V7,
+    _CONVERSATIONS_OWNER,
+    *(
+        statement
+        for statement in _CREATE_V6_STATEMENTS
+        if statement
+        not in {
+            _CONVERSATIONS,
+            _MEMORY_CORRECTIONS,
+            _MEMORY_EXCLUSIONS,
+        }
+    ),
+    _MEMORY_CORRECTIONS_V7,
+    _MEMORY_EXCLUSIONS_V7,
+)
+
+_V7_MIGRATION_STATEMENTS = (
+    _USERS,
+    _USERS_USERNAME,
+    _INVITE_CODES,
+    _INVITE_CODES_CODE,
+    _LOGIN_SESSIONS,
+    _LOGIN_SESSIONS_TOKEN,
+    _LOGIN_SESSIONS_USER,
+    "ALTER TABLE conversations ADD COLUMN owner_id TEXT REFERENCES users(id)",
+    _CONVERSATIONS_OWNER,
+)
+
+
+def _v7_migration_statements() -> tuple[str, ...]:
+    return _V7_MIGRATION_STATEMENTS
+
+
+# ---------------------------------------------------------------------------
+# v8 DDL（F013 用量）
+# ---------------------------------------------------------------------------
+
+_MODEL_USAGE_EVENTS = """
+CREATE TABLE IF NOT EXISTS model_usage_events (
+    id INTEGER PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    usage_date TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('model_request', 'image_upload')),
+    conversation_id TEXT,
+    request_id TEXT
+)
+"""
+
+_MODEL_USAGE_USER_DAY = """
+CREATE INDEX IF NOT EXISTS model_usage_user_day
+    ON model_usage_events(owner_id, usage_date, kind)
+"""
+
+_MODEL_USAGE_SITE_DAY = """
+CREATE INDEX IF NOT EXISTS model_usage_site_day
+    ON model_usage_events(usage_date, kind)
+"""
+
+_MODEL_QUOTA_OVERRIDES = """
+CREATE TABLE IF NOT EXISTS model_quota_overrides (
+    owner_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    daily_requests INTEGER CHECK (daily_requests IS NULL OR daily_requests >= 0),
+    daily_images INTEGER CHECK (daily_images IS NULL OR daily_images >= 0),
+    expires_on TEXT,
+    updated_at TEXT NOT NULL
+)
+"""
+
+_USER_ACTIVE_TURNS = """
+CREATE TABLE IF NOT EXISTS user_active_turns (
+    owner_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL,
+    lease_token TEXT NOT NULL UNIQUE,
+    started_at TEXT NOT NULL
+)
+"""
+
+_USER_ACTIVE_TURNS_REQUEST = """
+CREATE INDEX IF NOT EXISTS user_active_turns_request
+    ON user_active_turns(request_id)
+"""
+
+_CREATE_V8_STATEMENTS = (
+    *_CREATE_V7_STATEMENTS,
+    _MODEL_USAGE_EVENTS,
+    _MODEL_USAGE_USER_DAY,
+    _MODEL_USAGE_SITE_DAY,
+    _MODEL_QUOTA_OVERRIDES,
+    _USER_ACTIVE_TURNS,
+    _USER_ACTIVE_TURNS_REQUEST,
+)
+
+_V8_MIGRATION_STATEMENTS = (
+    _MODEL_USAGE_EVENTS,
+    _MODEL_USAGE_USER_DAY,
+    _MODEL_USAGE_SITE_DAY,
+    _MODEL_QUOTA_OVERRIDES,
+    _USER_ACTIVE_TURNS,
+    _USER_ACTIVE_TURNS_REQUEST,
+)
+
+
+def _v8_migration_statements() -> tuple[str, ...]:
+    return _V8_MIGRATION_STATEMENTS
+
+
+# ---------------------------------------------------------------------------
+# v9 DDL（F019 第二阶段：个人资料）
+# ---------------------------------------------------------------------------
+
+_PERSONAL_MATERIALS = """
+CREATE TABLE IF NOT EXISTS personal_materials (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    display_name TEXT NOT NULL,
+    stored_name TEXT NOT NULL UNIQUE,
+    file_sha256 TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+    page_count INTEGER NOT NULL CHECK (page_count >= 1),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'deleting')),
+    dedicated_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+_PERSONAL_MATERIALS_OWNER = """
+CREATE INDEX IF NOT EXISTS personal_materials_owner
+    ON personal_materials(owner_id, created_at DESC)
+"""
+
+_PERSONAL_MATERIAL_PAGES = """
+CREATE TABLE IF NOT EXISTS personal_material_pages (
+    material_id TEXT NOT NULL
+        REFERENCES personal_materials(id) ON DELETE CASCADE,
+    page_no INTEGER NOT NULL CHECK (page_no >= 1),
+    extracted_text TEXT NOT NULL,
+    char_count INTEGER NOT NULL CHECK (char_count >= 0),
+    scanned_suspect INTEGER NOT NULL DEFAULT 0
+        CHECK (scanned_suspect IN (0, 1)),
+    garbled_ratio REAL NOT NULL DEFAULT 0.0,
+    formula_warning INTEGER NOT NULL DEFAULT 0
+        CHECK (formula_warning IN (0, 1)),
+    parser_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (material_id, page_no)
+)
+"""
+
+_MATERIAL_REVIEW_GUIDES = """
+CREATE TABLE IF NOT EXISTS material_review_guides (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    material_id TEXT NOT NULL
+        REFERENCES personal_materials(id) ON DELETE CASCADE,
+    file_sha256 TEXT NOT NULL,
+    start_page INTEGER NOT NULL CHECK (start_page >= 1),
+    end_page INTEGER NOT NULL CHECK (end_page >= start_page),
+    rule_version TEXT NOT NULL,
+    course_hint TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('generating', 'ready', 'failed')),
+    generation_token TEXT NOT NULL,
+    readability_json TEXT NOT NULL,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (owner_id, material_id, file_sha256, start_page, end_page, rule_version, course_hint)
+)
+"""
+
+_MATERIAL_REVIEW_GUIDES_OWNER = """
+CREATE INDEX IF NOT EXISTS material_review_guides_owner
+    ON material_review_guides(owner_id, material_id, created_at DESC)
+"""
+
+_MATERIAL_GUIDE_ITEMS = """
+CREATE TABLE IF NOT EXISTS material_guide_items (
+    id TEXT PRIMARY KEY,
+    guide_id TEXT NOT NULL
+        REFERENCES material_review_guides(id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
+    category TEXT NOT NULL
+        CHECK (category IN ('concept', 'formula', 'method', 'pitfall')),
+    title TEXT NOT NULL,
+    source_excerpt TEXT NOT NULL,
+    ai_explanation TEXT NOT NULL,
+    practice_prompt TEXT NOT NULL,
+    verified_citations_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+_MATERIAL_GUIDE_ITEMS_GUIDE = """
+CREATE INDEX IF NOT EXISTS material_guide_items_guide
+    ON material_guide_items(guide_id, sort_order ASC)
+"""
+
+_PENDING_FILE_CLEANUPS = """
+CREATE TABLE IF NOT EXISTS pending_file_cleanups (
+    id TEXT PRIMARY KEY,
+    root_kind TEXT NOT NULL CHECK (root_kind IN ('material', 'attachment')),
+    stored_name TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL
+)
+"""
+
+_CREATE_V9_STATEMENTS = (
+    *_CREATE_V8_STATEMENTS,
+    _PERSONAL_MATERIALS,
+    _PERSONAL_MATERIALS_OWNER,
+    _PERSONAL_MATERIAL_PAGES,
+    _MATERIAL_REVIEW_GUIDES,
+    _MATERIAL_REVIEW_GUIDES_OWNER,
+    _MATERIAL_GUIDE_ITEMS,
+    _MATERIAL_GUIDE_ITEMS_GUIDE,
+    _PENDING_FILE_CLEANUPS,
+)
+
+_V9_MIGRATION_STATEMENTS = (
+    _PERSONAL_MATERIALS,
+    _PERSONAL_MATERIALS_OWNER,
+    _PERSONAL_MATERIAL_PAGES,
+    _MATERIAL_REVIEW_GUIDES,
+    _MATERIAL_REVIEW_GUIDES_OWNER,
+    _MATERIAL_GUIDE_ITEMS,
+    _MATERIAL_GUIDE_ITEMS_GUIDE,
+    _PENDING_FILE_CLEANUPS,
+)
+
+
+def _v9_migration_statements() -> tuple[str, ...]:
+    return _V9_MIGRATION_STATEMENTS
+
+
+_MATERIAL_ARTIFACTS = """
+CREATE TABLE IF NOT EXISTS material_artifacts (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
+    material_id TEXT NOT NULL
+        REFERENCES personal_materials(id) ON DELETE CASCADE,
+    file_sha256 TEXT NOT NULL,
+    start_page INTEGER NOT NULL CHECK (start_page >= 1),
+    end_page INTEGER NOT NULL CHECK (end_page >= start_page),
+    rule_version TEXT NOT NULL,
+    course_hint TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    is_sample INTEGER NOT NULL DEFAULT 0 CHECK (is_sample IN (0, 1)),
+    status TEXT NOT NULL
+        CHECK (status IN ('generating', 'ready', 'failed')),
+    current_step TEXT NOT NULL DEFAULT 'pending',
+    generation_token TEXT,
+    conversation_id TEXT
+        REFERENCES conversations(id) ON DELETE SET NULL,
+    skeleton_json TEXT,
+    notes_html TEXT,
+    graph_tree_json TEXT,
+    coverage_warnings_json TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (owner_id, material_id, file_sha256, start_page, end_page, rule_version, course_hint)
+)
+"""
+
+_MATERIAL_ARTIFACTS_OWNER = """
+CREATE INDEX IF NOT EXISTS material_artifacts_owner
+    ON material_artifacts(owner_id, material_id, updated_at DESC)
+"""
+
+_MATERIAL_QUIZ_QUESTIONS = """
+CREATE TABLE IF NOT EXISTS material_quiz_questions (
+    id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL
+        REFERENCES material_artifacts(id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
+    sort_order INTEGER NOT NULL,
+    kc_id TEXT NOT NULL DEFAULT '',
+    q_type TEXT NOT NULL
+        CHECK (q_type IN ('choice', 'multi', 'tf', 'fill', 'calc', 'code', 'short')),
+    stem TEXT NOT NULL,
+    options_json TEXT,
+    answer_json TEXT NOT NULL,
+    explanation TEXT NOT NULL DEFAULT '',
+    pitfall TEXT NOT NULL DEFAULT '',
+    cognitive TEXT NOT NULL DEFAULT '',
+    difficulty TEXT NOT NULL DEFAULT '',
+    points REAL NOT NULL DEFAULT 5,
+    source_pages_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+)
+"""
+
+_MATERIAL_QUIZ_QUESTIONS_ARTIFACT = """
+CREATE INDEX IF NOT EXISTS material_quiz_questions_artifact
+    ON material_quiz_questions(artifact_id, sort_order)
+"""
+
+_MATERIAL_QUIZ_ATTEMPTS = """
+CREATE TABLE IF NOT EXISTS material_quiz_attempts (
+    id TEXT PRIMARY KEY,
+    question_id TEXT NOT NULL
+        REFERENCES material_quiz_questions(id) ON DELETE CASCADE,
+    artifact_id TEXT NOT NULL
+        REFERENCES material_artifacts(id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
+    user_answer_json TEXT,
+    is_correct INTEGER CHECK (is_correct IS NULL OR is_correct IN (0, 1)),
+    score REAL,
+    max_points REAL NOT NULL,
+    grading_status TEXT NOT NULL
+        CHECK (grading_status IN ('auto_graded', 'pending_review', 'evaluated', 'unanswered')),
+    evaluation_json TEXT,
+    revealed_solution_at TEXT,
+    answered_after_revealed INTEGER NOT NULL DEFAULT 0 CHECK (answered_after_revealed IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (owner_id, question_id)
+)
+"""
+
+_MATERIAL_QUIZ_ATTEMPTS_ARTIFACT = """
+CREATE INDEX IF NOT EXISTS material_quiz_attempts_artifact
+    ON material_quiz_attempts(owner_id, artifact_id, question_id)
+"""
+
+_MATERIAL_GRAPH_NOTES = """
+CREATE TABLE IF NOT EXISTS material_graph_notes (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
+    material_id TEXT NOT NULL
+        REFERENCES personal_materials(id) ON DELETE CASCADE,
+    artifact_id TEXT NOT NULL
+        REFERENCES material_artifacts(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    note_text TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    UNIQUE (owner_id, artifact_id, node_id)
+)
+"""
+
+_MATERIAL_GRAPH_NOTES_ARTIFACT = """
+CREATE INDEX IF NOT EXISTS material_graph_notes_artifact
+    ON material_graph_notes(owner_id, artifact_id, node_id)
+"""
+
+_V10_MIGRATION_STATEMENTS = (
+    _MATERIAL_ARTIFACTS,
+    _MATERIAL_ARTIFACTS_OWNER,
+    _MATERIAL_QUIZ_QUESTIONS,
+    _MATERIAL_QUIZ_QUESTIONS_ARTIFACT,
+    _MATERIAL_QUIZ_ATTEMPTS,
+    _MATERIAL_QUIZ_ATTEMPTS_ARTIFACT,
+    _MATERIAL_GRAPH_NOTES,
+    _MATERIAL_GRAPH_NOTES_ARTIFACT,
+)
+
+_CREATE_V10_STATEMENTS = (
+    *_CREATE_V9_STATEMENTS,
+    *_V10_MIGRATION_STATEMENTS,
+)
+
+_QUESTION_SELECTIONS_V11 = _QUESTION_SELECTIONS.replace(
+    "CHECK (question_type IN ('choice', 'fill', 'code'))",
+    "CHECK (question_type IN ('choice', 'fill', 'code', 'solve', 'proof', 'judge'))",
+)
+
+_CREATE_V11_STATEMENTS = tuple(
+    _QUESTION_SELECTIONS_V11 if stmt is _QUESTION_SELECTIONS else stmt
+    for stmt in _CREATE_V10_STATEMENTS
+)
+
+
+_MATERIAL_ARTIFACTS_V12 = """
+CREATE TABLE IF NOT EXISTS material_artifacts (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
+    material_id TEXT NOT NULL
+        REFERENCES personal_materials(id) ON DELETE CASCADE,
+    file_sha256 TEXT NOT NULL,
+    start_page INTEGER NOT NULL CHECK (start_page >= 1),
+    end_page INTEGER NOT NULL CHECK (end_page >= start_page),
+    rule_version TEXT NOT NULL,
+    course_hint TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    is_sample INTEGER NOT NULL DEFAULT 0 CHECK (is_sample IN (0, 1)),
+    status TEXT NOT NULL
+        CHECK (status IN ('generating', 'ready', 'failed')),
+    current_step TEXT NOT NULL DEFAULT 'pending',
+    generation_token TEXT,
+    conversation_id TEXT
+        REFERENCES conversations(id) ON DELETE SET NULL,
+    skeleton_json TEXT,
+    notes_html TEXT,
+    graph_tree_json TEXT,
+    coverage_warnings_json TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    requested_outputs_json TEXT NOT NULL DEFAULT '["notes","quiz","graph"]',
+    notes_status TEXT NOT NULL DEFAULT 'none'
+        CHECK (notes_status IN ('none', 'generating', 'ready', 'failed')),
+    notes_error_code TEXT,
+    notes_error_message TEXT,
+    quiz_status TEXT NOT NULL DEFAULT 'none'
+        CHECK (quiz_status IN ('none', 'generating', 'ready', 'failed')),
+    quiz_error_code TEXT,
+    quiz_error_message TEXT,
+    graph_status TEXT NOT NULL DEFAULT 'none'
+        CHECK (graph_status IN ('none', 'generating', 'ready', 'failed')),
+    graph_error_code TEXT,
+    graph_error_message TEXT,
+    UNIQUE (owner_id, material_id, file_sha256, start_page, end_page, rule_version, course_hint)
+)
+"""
+
+_CONVERSATION_MATERIALS = """
+CREATE TABLE IF NOT EXISTS conversation_materials (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL
+        REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    material_id TEXT NOT NULL
+        REFERENCES personal_materials(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    UNIQUE (owner_id, conversation_id, material_id)
+)
+"""
+
+_CONVERSATION_MATERIALS_CONV = """
+CREATE INDEX IF NOT EXISTS conversation_materials_conv
+    ON conversation_materials(owner_id, conversation_id, created_at DESC)
+"""
+
+_CONVERSATION_MATERIALS_MAT = """
+CREATE INDEX IF NOT EXISTS conversation_materials_mat
+    ON conversation_materials(owner_id, material_id)
+"""
+
+_CREATE_V12_STATEMENTS = (
+    *(
+        _MATERIAL_ARTIFACTS_V12 if stmt is _MATERIAL_ARTIFACTS else stmt
+        for stmt in _CREATE_V11_STATEMENTS
+    ),
+    _CONVERSATION_MATERIALS,
+    _CONVERSATION_MATERIALS_CONV,
+    _CONVERSATION_MATERIALS_MAT,
+)
+
+_V12_ALTER_MATERIAL_ARTIFACTS = (
+    "ALTER TABLE material_artifacts ADD COLUMN requested_outputs_json TEXT NOT NULL DEFAULT '[\"notes\",\"quiz\",\"graph\"]'",
+    "ALTER TABLE material_artifacts ADD COLUMN notes_status TEXT NOT NULL DEFAULT 'none' CHECK (notes_status IN ('none', 'generating', 'ready', 'failed'))",
+    "ALTER TABLE material_artifacts ADD COLUMN notes_error_code TEXT",
+    "ALTER TABLE material_artifacts ADD COLUMN notes_error_message TEXT",
+    "ALTER TABLE material_artifacts ADD COLUMN quiz_status TEXT NOT NULL DEFAULT 'none' CHECK (quiz_status IN ('none', 'generating', 'ready', 'failed'))",
+    "ALTER TABLE material_artifacts ADD COLUMN quiz_error_code TEXT",
+    "ALTER TABLE material_artifacts ADD COLUMN quiz_error_message TEXT",
+    "ALTER TABLE material_artifacts ADD COLUMN graph_status TEXT NOT NULL DEFAULT 'none' CHECK (graph_status IN ('none', 'generating', 'ready', 'failed'))",
+    "ALTER TABLE material_artifacts ADD COLUMN graph_error_code TEXT",
+    "ALTER TABLE material_artifacts ADD COLUMN graph_error_message TEXT",
+)
+
+
+def _v10_migration_statements() -> tuple[str, ...]:
+    return _V10_MIGRATION_STATEMENTS
+
+
+@dataclass(frozen=True)
+class SchemaOwner:
+    """v6→v7 迁移时创建/复用的管理员。"""
+
+    id: str
+    username: str
+    username_normalized: str
+    password_hash: str
+    created_at: str
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
 
-def initialize_database(db_path: Path) -> None:
-    """建库、校验或迁移到 v6，并恢复遗留运行中轮次。"""
+def initialize_database(
+    db_path: Path,
+    *,
+    migration_owner: SchemaOwner | None = None,
+) -> None:
+    """建库、校验或迁移到 v8，并恢复遗留运行中轮次。
+
+    旧库不会在普通启动中自动升级：v6 及更早需要管理员账号，v7→v8 不需要。
+    空库仍可直接创建 v8。
+    """
 
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1136,33 +2235,91 @@ def initialize_database(db_path: Path) -> None:
     try:
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
+            objects = _user_objects(connection)
         except sqlite3.DatabaseError as exc:
             raise ConversationStorageError(_STORAGE_MESSAGE) from exc
 
         if version == 0:
-            if not _user_objects(connection):
-                _create_v6(connection)
+            if not objects:
+                _create_v12(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v12(connection):
+                _adopt_version(connection, SCHEMA_VERSION)
+                _enable_wal(connection)
+            elif _is_compatible_v11(connection):
+                _migrate_v11_to_v12(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v10(connection):
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v9(connection):
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v8(connection):
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
+                _enable_wal(connection)
+            elif _is_compatible_v7(connection):
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
                 _enable_wal(connection)
             elif _is_compatible_v6(connection):
-                _adopt_version(connection, SCHEMA_VERSION)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
                 _enable_wal(connection)
             elif _is_compatible_v5(connection):
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
                 _enable_wal(connection)
             elif _is_compatible_v4(connection):
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
                 _enable_wal(connection)
             elif _is_compatible_v3(connection):
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
                 _enable_wal(connection)
             elif _is_compatible_v2(connection):
                 _migrate_v2_to_v3(connection)
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
                 _enable_wal(connection)
             elif _is_compatible_v1(connection):
                 _migrate_v1_to_v2(connection)
@@ -1170,6 +2327,12 @@ def initialize_database(db_path: Path) -> None:
                 _migrate_v3_to_v4(connection)
                 _migrate_v4_to_v5(connection)
                 _migrate_v5_to_v6(connection)
+                _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+                _migrate_v7_to_v8(connection)
+                _migrate_v8_to_v9(connection)
+                _migrate_v9_to_v10(connection)
+                _migrate_v10_to_v11(connection)
+                _migrate_v11_to_v12(connection)
                 _enable_wal(connection)
             else:
                 raise ConversationStorageError(_UNKNOWN_MESSAGE)
@@ -1181,6 +2344,12 @@ def initialize_database(db_path: Path) -> None:
             _migrate_v3_to_v4(connection)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
             _enable_wal(connection)
         elif version == 2:
             if not _is_compatible_v2(connection):
@@ -1189,6 +2358,12 @@ def initialize_database(db_path: Path) -> None:
             _migrate_v3_to_v4(connection)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
             _enable_wal(connection)
         elif version == 3:
             if not _is_compatible_v3(connection):
@@ -1196,20 +2371,83 @@ def initialize_database(db_path: Path) -> None:
             _migrate_v3_to_v4(connection)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
             _enable_wal(connection)
         elif version == 4:
             if not _is_compatible_v4(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v4_to_v5(connection)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
             _enable_wal(connection)
         elif version == 5:
             if not _is_compatible_v5(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _migrate_v5_to_v6(connection)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
+            _enable_wal(connection)
+        elif version == 6:
+            if not _is_compatible_v6(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v6_to_v7(connection, _require_owner(migration_owner))
+            _migrate_v7_to_v8(connection)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
+            _enable_wal(connection)
+        elif version == 7:
+            if not _is_compatible_v7(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v7_to_v8(connection)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
+            _enable_wal(connection)
+        elif version == 8:
+            if not _is_compatible_v8(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v8_to_v9(connection)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
+            _enable_wal(connection)
+        elif version == 9:
+            if not _is_compatible_v9(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v9_to_v10(connection)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
+            _enable_wal(connection)
+        elif version == 10:
+            if not _is_compatible_v10(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v10_to_v11(connection)
+            _migrate_v11_to_v12(connection)
+            _enable_wal(connection)
+        elif version == 11:
+            if not _is_compatible_v11(connection):
+                raise ConversationStorageError(_UPGRADE_MESSAGE)
+            _migrate_v11_to_v12(connection)
             _enable_wal(connection)
         elif version == SCHEMA_VERSION:
-            if not _is_compatible_v6(connection):
+            if not _is_compatible_v12(connection):
                 raise ConversationStorageError(_UPGRADE_MESSAGE)
             _enable_wal(connection)
         else:
@@ -1218,6 +2456,12 @@ def initialize_database(db_path: Path) -> None:
         _recover_running(connection)
     finally:
         connection.close()
+
+
+def _require_owner(owner: SchemaOwner | None) -> SchemaOwner:
+    if owner is None:
+        raise ConversationStorageError(_MIGRATION_NEEDED_MESSAGE)
+    return owner
 
 
 def _open(db_path: Path) -> sqlite3.Connection:
@@ -1458,6 +2702,341 @@ def _is_compatible_v6(connection: sqlite3.Connection) -> bool:
     )
 
 
+def _is_compatible_v7(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V7_TABLES) | set(_V7_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V7_COLUMNS,
+            primary_keys=_V7_PRIMARY_KEYS,
+            unique_sets=_V7_UNIQUE_SETS,
+            foreign_keys=_V7_FOREIGN_KEYS,
+            required_checks=_V7_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
+def _is_compatible_v8(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V8_TABLES) | set(_V8_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V8_COLUMNS,
+            primary_keys=_V8_PRIMARY_KEYS,
+            unique_sets=_V8_UNIQUE_SETS,
+            foreign_keys=_V8_FOREIGN_KEYS,
+            required_checks=_V8_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
+def _is_compatible_v12(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V12_TABLES) | set(_V12_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+        "personal_materials_owner",
+        "material_review_guides_owner",
+        "material_guide_items_guide",
+        "material_artifacts_owner",
+        "material_quiz_questions_artifact",
+        "material_quiz_attempts_artifact",
+        "material_graph_notes_artifact",
+        "conversation_materials_conv",
+        "conversation_materials_mat",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V12_COLUMNS,
+            primary_keys=_V12_PRIMARY_KEYS,
+            unique_sets=_V12_UNIQUE_SETS,
+            foreign_keys=_V12_FOREIGN_KEYS,
+            required_checks=_V12_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
+def _is_compatible_v11(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V11_TABLES) | set(_V11_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+        "personal_materials_owner",
+        "material_review_guides_owner",
+        "material_guide_items_guide",
+        "material_artifacts_owner",
+        "material_quiz_questions_artifact",
+        "material_quiz_attempts_artifact",
+        "material_graph_notes_artifact",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V11_COLUMNS,
+            primary_keys=_V11_PRIMARY_KEYS,
+            unique_sets=_V11_UNIQUE_SETS,
+            foreign_keys=_V11_FOREIGN_KEYS,
+            required_checks=_V11_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
+def _is_compatible_v10(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V10_TABLES) | set(_V10_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+        "personal_materials_owner",
+        "material_review_guides_owner",
+        "material_guide_items_guide",
+        "material_artifacts_owner",
+        "material_quiz_questions_artifact",
+        "material_quiz_attempts_artifact",
+        "material_graph_notes_artifact",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V10_COLUMNS,
+            primary_keys=_V10_PRIMARY_KEYS,
+            unique_sets=_V10_UNIQUE_SETS,
+            foreign_keys=_V10_FOREIGN_KEYS,
+            required_checks=_V10_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
+def _is_compatible_v9(connection: sqlite3.Connection) -> bool:
+    objects = _user_objects(connection)
+    if set(objects) != set(_V9_TABLES) | set(_V9_INDEXES):
+        return False
+    for name in (
+        "turns_one_running",
+        "problems_one_active",
+        "question_selections_one_active",
+        "users_username",
+        "invite_codes_code",
+        "login_sessions_token",
+        "login_sessions_user",
+        "conversations_owner",
+        "model_usage_user_day",
+        "model_usage_site_day",
+        "user_active_turns_request",
+        "personal_materials_owner",
+        "material_review_guides_owner",
+        "material_guide_items_guide",
+    ):
+        if objects.get(name) != "index":
+            return False
+    return (
+        _check_common(
+            connection,
+            columns=_V9_COLUMNS,
+            primary_keys=_V9_PRIMARY_KEYS,
+            unique_sets=_V9_UNIQUE_SETS,
+            foreign_keys=_V9_FOREIGN_KEYS,
+            required_checks=_V9_REQUIRED_CHECKS,
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="conversation_turns",
+            name="turns_one_running",
+            column="conversation_id",
+            where="wherestatus='running'",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="problems",
+            name="problems_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+        and _has_partial_unique_index(
+            connection,
+            table="question_selections",
+            name="question_selections_one_active",
+            column="conversation_id",
+            where="whereactive=1",
+        )
+    )
+
+
 def _check_common(
     connection: sqlite3.Connection,
     *,
@@ -1648,7 +3227,7 @@ def _create_v5(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _CREATE_V5_STATEMENTS:
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 5")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
@@ -1661,12 +3240,301 @@ def _create_v6(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _CREATE_V6_STATEMENTS:
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 6")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
             connection.rollback()
         raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _create_v7(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V7_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 7")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _create_v12(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V12_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v11_to_v12(connection: sqlite3.Connection) -> None:
+    """升级到 v12：追加会话-资料关联表，为产物表增加按需生成分项状态并回填历史记录。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _V12_ALTER_MATERIAL_ARTIFACTS:
+            connection.execute(statement)
+        connection.execute(_CONVERSATION_MATERIALS)
+        connection.execute(_CONVERSATION_MATERIALS_CONV)
+        connection.execute(_CONVERSATION_MATERIALS_MAT)
+
+        # 回填历史 material_artifacts 分项状态
+        connection.execute(
+            """
+            UPDATE material_artifacts
+            SET notes_status = CASE
+                    WHEN notes_html IS NOT NULL AND notes_html != '' THEN 'ready'
+                    WHEN status = 'failed' THEN 'failed'
+                    ELSE 'none'
+                END,
+                quiz_status = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM material_quiz_questions q
+                        WHERE q.artifact_id = material_artifacts.id
+                    ) THEN 'ready'
+                    WHEN status = 'failed' THEN 'failed'
+                    ELSE 'none'
+                END,
+                graph_status = CASE
+                    WHEN graph_tree_json IS NOT NULL AND graph_tree_json != '' THEN 'ready'
+                    WHEN status = 'failed' THEN 'failed'
+                    ELSE 'none'
+                END
+            """
+        )
+
+        # 回填历史专用会话关联到 conversation_materials
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO conversation_materials (
+                id, owner_id, conversation_id, material_id, created_at
+            )
+            SELECT lower(hex(randomblob(16))), m.owner_id, m.dedicated_conversation_id, m.id, m.created_at
+            FROM personal_materials m
+            JOIN conversations c ON c.id = m.dedicated_conversation_id AND c.owner_id = m.owner_id
+            WHERE m.dedicated_conversation_id IS NOT NULL
+            """
+        )
+        connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        logger.warning("本地学习数据库 v11→v12 迁移失败：%s", exc)
+        raise ConversationStorageError(_MIGRATION_MESSAGE) from exc
+
+
+def _create_v11(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V11_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 11")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v10_to_v11(connection: sqlite3.Connection) -> None:
+    """重建 question_selections 以扩展 question_type CHECK 约束，完整保留历史数据。"""
+
+    cols = ", ".join(_V11_COLUMNS["question_selections"])
+    create_temp = _QUESTION_SELECTIONS_V11.replace(
+        "CREATE TABLE IF NOT EXISTS question_selections",
+        "CREATE TABLE question_selections_v11",
+    )
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(create_temp)
+        connection.execute(
+            f"INSERT INTO question_selections_v11 ({cols}) "
+            f"SELECT {cols} FROM question_selections"
+        )
+        connection.execute("DROP TABLE question_selections")
+        connection.execute(
+            "ALTER TABLE question_selections_v11 RENAME TO question_selections"
+        )
+        connection.execute(_QUESTION_SELECTIONS_ONE_ACTIVE)
+        connection.execute(_QUESTION_SELECTIONS_CONVERSATION)
+        connection.execute("PRAGMA user_version = 11")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _create_v10(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V10_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 10")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v9_to_v10(connection: sqlite3.Connection) -> None:
+    """只追加 v10 ExamPass 个人资料产物、测试与图谱笔记表，保留旧数据。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _v10_migration_statements():
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 10")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _create_v9(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V9_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 9")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v8_to_v9(connection: sqlite3.Connection) -> None:
+    """只追加 v9 个人资料与复习清单表，不改旧数据。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _v9_migration_statements():
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 9")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _create_v8(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _CREATE_V8_STATEMENTS:
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
+    """只追加 v8 用量表，不改旧数据。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _v8_migration_statements():
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise ConversationStorageError(_STORAGE_MESSAGE) from exc
+
+
+def _migrate_v6_to_v7(
+    connection: sqlite3.Connection, owner: SchemaOwner
+) -> None:
+    """单事务升级：建认证表、回填会话归属、重建记忆覆盖表。"""
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in _v7_migration_statements():
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO users (
+                id, username, username_normalized, password_hash,
+                created_at, disabled_at
+            ) VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                owner.id,
+                owner.username,
+                owner.username_normalized,
+                owner.password_hash,
+                owner.created_at,
+            ),
+        )
+        connection.execute(
+            "UPDATE conversations SET owner_id = ?", (owner.id,)
+        )
+        connection.execute(_MEMORY_CORRECTIONS_V7_TMP)
+        connection.execute(_MEMORY_EXCLUSIONS_V7_TMP)
+        connection.execute(
+            """
+            INSERT INTO memory_corrections_v7 (
+                owner_id, entry_key, course, knowledge_point, note,
+                created_at, updated_at
+            )
+            SELECT ?, entry_key, course, knowledge_point, note,
+                   created_at, updated_at
+            FROM memory_corrections
+            """,
+            (owner.id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO memory_exclusions_v7 (
+                owner_id, entry_key, reason, created_at
+            )
+            SELECT ?, entry_key, reason, created_at
+            FROM memory_exclusions
+            """,
+            (owner.id,),
+        )
+        connection.execute("DROP TABLE memory_corrections")
+        connection.execute("DROP TABLE memory_exclusions")
+        connection.execute(
+            "ALTER TABLE memory_corrections_v7 RENAME TO memory_corrections"
+        )
+        connection.execute(
+            "ALTER TABLE memory_exclusions_v7 RENAME TO memory_exclusions"
+        )
+        connection.execute("PRAGMA user_version = 7")
+
+        unowned = connection.execute(
+            "SELECT COUNT(*) FROM conversations WHERE owner_id IS NULL"
+        ).fetchone()[0]
+        if unowned:
+            raise ConversationStorageError(_MIGRATION_MESSAGE)
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise ConversationStorageError(_MIGRATION_MESSAGE)
+        connection.commit()
+    except ConversationStorageError:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        with suppress(sqlite3.Error):
+            connection.rollback()
+        logger.warning("本地学习数据库 v6→v7 迁移失败：%s", exc)
+        raise ConversationStorageError(_MIGRATION_MESSAGE) from exc
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -1754,7 +3622,7 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _v5_migration_statements():
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 5")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
@@ -1770,7 +3638,7 @@ def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         for statement in _v6_migration_statements():
             connection.execute(statement)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        connection.execute("PRAGMA user_version = 6")
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):
@@ -1798,37 +3666,95 @@ def _enable_wal(connection: sqlite3.Connection) -> None:
 
 
 def _recover_running(connection: sqlite3.Connection) -> None:
-    """启动恢复：遗留 running 轮次变成 interrupted，不重跑模型。"""
+    """启动恢复：遗留 running 轮次变成 interrupted，不重跑模型。
+
+    当前部署以单后端进程为前提，因此启动时可以清空全部执行占用；多进程部署
+    不能直接复用这个假设。
+    """
 
     from datetime import datetime, timezone
 
     try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM user_active_turns")
         running = connection.execute(
             "SELECT COUNT(*) FROM conversation_turns WHERE status = 'running'"
         ).fetchone()[0]
-        if not running:
+        generating_guides = connection.execute(
+            "SELECT COUNT(*) FROM material_review_guides WHERE status = 'generating'"
+        ).fetchone()[0]
+        generating_artifacts = connection.execute(
+            """
+            SELECT COUNT(*) FROM material_artifacts
+            WHERE status = 'generating'
+               OR notes_status = 'generating'
+               OR quiz_status = 'generating'
+               OR graph_status = 'generating'
+            """
+        ).fetchone()[0]
+        if not running and not generating_guides and not generating_artifacts:
+            connection.commit()
             return
 
         now = datetime.now(timezone.utc).isoformat()
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            UPDATE conversations SET updated_at = ?
-            WHERE id IN (
-                SELECT conversation_id FROM conversation_turns
-                WHERE status = 'running'
+        if running:
+            connection.execute(
+                """
+                UPDATE conversations SET updated_at = ?
+                WHERE id IN (
+                    SELECT conversation_id FROM conversation_turns
+                    WHERE status = 'running'
+                )
+                """,
+                (now,),
             )
-            """,
-            (now,),
-        )
-        connection.execute(
-            """
-            UPDATE conversation_turns
-            SET status = 'interrupted', finished_at = ?
-            WHERE status = 'running'
-            """,
-            (now,),
-        )
+            connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = 'interrupted', finished_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+        if generating_guides:
+            connection.execute(
+                """
+                UPDATE material_review_guides
+                SET status = 'failed',
+                    error_code = 'INTERRUPTED',
+                    error_message = '服务重启导致生成中断，请重试。',
+                    updated_at = ?
+                WHERE status = 'generating'
+                """,
+                (now,),
+            )
+        if generating_artifacts:
+            connection.execute(
+                """
+                UPDATE material_artifacts
+                SET status = CASE
+                        WHEN notes_status = 'ready' OR quiz_status = 'ready' OR graph_status = 'ready' THEN 'ready'
+                        ELSE 'failed'
+                    END,
+                    notes_status = CASE WHEN notes_status = 'generating' THEN 'failed' ELSE notes_status END,
+                    notes_error_code = CASE WHEN notes_status = 'generating' THEN 'INTERRUPTED' ELSE notes_error_code END,
+                    notes_error_message = CASE WHEN notes_status = 'generating' THEN '服务重启导致笔记生成中断，请重试。' ELSE notes_error_message END,
+                    quiz_status = CASE WHEN quiz_status = 'generating' THEN 'failed' ELSE quiz_status END,
+                    quiz_error_code = CASE WHEN quiz_status = 'generating' THEN 'INTERRUPTED' ELSE quiz_error_code END,
+                    quiz_error_message = CASE WHEN quiz_status = 'generating' THEN '服务重启导致测试生成中断，请重试。' ELSE quiz_error_message END,
+                    graph_status = CASE WHEN graph_status = 'generating' THEN 'failed' ELSE graph_status END,
+                    graph_error_code = CASE WHEN graph_status = 'generating' THEN 'INTERRUPTED' ELSE graph_error_code END,
+                    graph_error_message = CASE WHEN graph_status = 'generating' THEN '服务重启导致图谱生成中断，请重试。' ELSE graph_error_message END,
+                    error_code = COALESCE(error_code, 'INTERRUPTED'),
+                    error_message = COALESCE(error_message, '服务重启导致生成中断，请重试。'),
+                    updated_at = ?
+                WHERE status = 'generating'
+                   OR notes_status = 'generating'
+                   OR quiz_status = 'generating'
+                   OR graph_status = 'generating'
+                """,
+                (now,),
+            )
         connection.commit()
     except sqlite3.Error as exc:
         with suppress(sqlite3.Error):

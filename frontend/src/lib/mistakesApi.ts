@@ -11,6 +11,8 @@ import type {
   Step,
 } from "./conversationsApi.ts";
 import { createSseParser } from "./sseParser.ts";
+import { apiFetch } from "./apiFetch.ts";
+import { parseQuotaInfo, type QuotaInfo } from "./usageApi.ts";
 
 const PATH = "/api/mistake-records";
 
@@ -56,6 +58,7 @@ export type MistakeRecordDetail = {
   student_answer_text: string | null;
   solution_text: string | null;
   source: Source;
+  is_model_generated?: boolean;
   attachments: AttachmentView[];
   explanation: {
     knowledge_points: KnowledgePoint[];
@@ -70,6 +73,7 @@ export type MistakeRecordDetail = {
   revisions: RevisionView[];
   conversation_has_newer_version: boolean;
   newer_problem: ProblemRef | null;
+  primary_exercise?: ExerciseView | null;
   exercises?: ExerciseView[];
   created_at: string;
   updated_at: string;
@@ -114,6 +118,7 @@ export type RecordCorrectionErrorEvent = {
   request_id: string;
   code: string;
   message: string;
+  quota?: QuotaInfo | null;
 };
 
 export type RecordCorrectionEvent =
@@ -277,7 +282,7 @@ export async function listMistakeRecords(
   params.set("offset", String(options.offset ?? 0));
   let response: Response;
   try {
-    response = await fetch(`${PATH}?${params}`, {
+    response = await apiFetch(`${PATH}?${params}`, {
       headers: { Accept: "application/json" },
       cache: "no-store",
       signal,
@@ -296,13 +301,52 @@ export async function listMistakeRecords(
   return { items: payload.items, total: payload.total };
 }
 
+export async function createMistakeRecord(options: {
+  requestId: string;
+  conversationId: string;
+  problemId?: string;
+  title?: string;
+  feedbackText?: string;
+}): Promise<MistakeRecordDetail> {
+  const body: Record<string, unknown> = {
+    request_id: options.requestId,
+    conversation_id: options.conversationId,
+  };
+  if (options.problemId) {
+    body.problem_id = options.problemId;
+  }
+  if (options.title) {
+    body.title = options.title;
+  }
+  if (options.feedbackText) {
+    body.feedback_text = options.feedbackText;
+  }
+  let response: Response;
+  try {
+    response = await apiFetch(PATH, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+  } catch {
+    throw new MistakesApiError("无法保存到错题本，请确认后端正在运行。");
+  }
+  await ensureOk(response);
+  const payload = await readJson(response);
+  if (!isMistakeRecordDetail(payload)) {
+    throw new MistakesApiError("后端返回的错题记录格式不符合约定。");
+  }
+  return payload;
+}
+
 export async function getMistakeRecord(
   recordId: string,
   signal?: AbortSignal,
 ): Promise<MistakeRecordDetail> {
   let response: Response;
   try {
-    response = await fetch(`${PATH}/${encodeURIComponent(recordId)}`, {
+    response = await apiFetch(`${PATH}/${encodeURIComponent(recordId)}`, {
       headers: { Accept: "application/json" },
       cache: "no-store",
       signal,
@@ -329,7 +373,7 @@ export async function updateMistakeRecord(
 ): Promise<MistakeRecordDetail> {
   let response: Response;
   try {
-    response = await fetch(`${PATH}/${encodeURIComponent(recordId)}`, {
+    response = await apiFetch(`${PATH}/${encodeURIComponent(recordId)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(patch),
@@ -349,7 +393,7 @@ export async function updateMistakeRecord(
 export async function deleteMistakeRecord(recordId: string): Promise<void> {
   let response: Response;
   try {
-    response = await fetch(`${PATH}/${encodeURIComponent(recordId)}`, {
+    response = await apiFetch(`${PATH}/${encodeURIComponent(recordId)}`, {
       method: "DELETE",
       headers: { Accept: "application/json" },
       cache: "no-store",
@@ -374,7 +418,7 @@ export async function adoptProblem(
 ): Promise<MistakeRecordDetail> {
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${PATH}/${encodeURIComponent(recordId)}/adopt-problem`,
       {
         method: "POST",
@@ -443,6 +487,7 @@ function parseCorrectionEvent(
       request_id: requestId,
       code: payload.code,
       message: payload.message,
+      quota: parseQuotaInfo(payload.quota),
     };
   }
 
@@ -509,7 +554,7 @@ export async function streamRecordCorrection(
 
   let response: Response;
   try {
-    response = await fetch(
+    response = await apiFetch(
       `${PATH}/${encodeURIComponent(options.recordId)}/corrections`,
       {
         method: "POST",

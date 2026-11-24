@@ -11,6 +11,7 @@ from app.conversations import schema
 from app.conversations.errors import ConversationStorageError
 from app.conversations.repository import ConversationRepository
 from app.conversations.inputs import query_input
+from tests.f012_support import TEST_MIGRATION_OWNER
 
 V1_DDL = """
 CREATE TABLE conversations (
@@ -120,7 +121,7 @@ def test_v1_upgrades_and_preserves_conversation_turns(tmp_path: Path) -> None:
     build_v1(path)
 
     repository = ConversationRepository(path)
-    repository.initialize()
+    repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
@@ -145,7 +146,7 @@ def test_v0_complete_v1_schema_is_migrated(tmp_path: Path) -> None:
     build_v1(path, version=0)
 
     repository = ConversationRepository(path)
-    repository.initialize()
+    repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
@@ -163,7 +164,7 @@ def test_migration_failure_rolls_back_and_keeps_file(tmp_path: Path, monkeypatch
     monkeypatch.setattr(schema, "_migration_statements", broken_statements)
 
     with pytest.raises(ConversationStorageError):
-        ConversationRepository(path).initialize()
+        ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     assert file_hash(path) == before
     with sqlite3.connect(path) as connection:
@@ -187,7 +188,7 @@ def test_v1_with_extra_table_is_not_modified(tmp_path: Path) -> None:
     before = file_hash(path)
 
     with pytest.raises(ConversationStorageError):
-        ConversationRepository(path).initialize()
+        ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     assert file_hash(path) == before
 
@@ -201,14 +202,14 @@ def test_v1_with_broken_running_index_is_not_migrated(tmp_path: Path) -> None:
     before = file_hash(path)
 
     with pytest.raises(ConversationStorageError):
-        ConversationRepository(path).initialize()
+        ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     assert file_hash(path) == before
 
 
 def test_v2_reopens_and_rejects_damaged_index(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
-    ConversationRepository(path).initialize()
+    ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == schema.SCHEMA_VERSION
         connection.execute("DROP INDEX problems_one_active")
@@ -216,7 +217,7 @@ def test_v2_reopens_and_rejects_damaged_index(tmp_path: Path) -> None:
         connection.commit()
 
     with pytest.raises(ConversationStorageError):
-        ConversationRepository(path).initialize()
+        ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
 
 
 def test_migration_recovers_running_turn(tmp_path: Path) -> None:
@@ -234,7 +235,7 @@ def test_migration_recovers_running_turn(tmp_path: Path) -> None:
         connection.commit()
 
     repository = ConversationRepository(path)
-    repository.initialize()
+    repository.initialize(migration_owner=TEST_MIGRATION_OWNER)
 
     turn = repository.find_turn("conv-1", "req-running")
     assert turn is not None and turn.status == "interrupted"
@@ -242,10 +243,10 @@ def test_migration_recovers_running_turn(tmp_path: Path) -> None:
 
 def test_v2_rejects_unknown_version(tmp_path: Path) -> None:
     path = tmp_path / "study.sqlite3"
-    ConversationRepository(path).initialize()
+    ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA user_version = 99")
         connection.commit()
 
     with pytest.raises(ConversationStorageError):
-        ConversationRepository(path).initialize()
+        ConversationRepository(path).initialize(migration_owner=TEST_MIGRATION_OWNER)

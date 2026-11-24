@@ -61,12 +61,13 @@ class LearningMemoryService:
         self,
         db_path: Path,
         *,
+        owner_id: str,
         papers: Any | None = None,
         taxonomy_path: Path | None = None,
         current_file: Path | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._repository = MemoryRepository(Path(db_path))
+        self._repository = MemoryRepository(Path(db_path), owner_id=owner_id)
         self._papers = papers
         self._taxonomy_path = taxonomy_path
         self._current_file = current_file
@@ -139,6 +140,7 @@ class LearningMemoryService:
         with self._repository.read() as connection:
             bundle = collect_all(
                 connection,
+                owner_id=self._repository.owner_id,
                 paper_lookup=self._lookup_paper,
                 normalizer=self._knowledge(),
                 corrections=self._repository.corrections(),
@@ -164,6 +166,7 @@ class LearningMemoryService:
         with self._repository.read() as connection:
             bundle = collect_evidence(
                 connection,
+                owner_id=self._repository.owner_id,
                 course=course,
                 paper_lookup=self._lookup_paper,
                 normalizer=self._knowledge(),
@@ -236,6 +239,8 @@ class LearningMemoryService:
         kind: str,
         source_id: str,
         request: MemoryCorrectionRequest,
+        *,
+        checkpoint: Callable[[Any], None] | None = None,
     ) -> MemoryEntryView:
         if kind == "attempt":
             raise MemoryCorrectionUnsupportedError(
@@ -261,6 +266,7 @@ class LearningMemoryService:
                 UNSET if request.knowledge_point is None else request.knowledge_point
             ),
             note=UNSET if request.note is None else request.note,
+            checkpoint=checkpoint,
         )
         view = self._entry_view(entry_key)
         if view is None:
@@ -269,7 +275,12 @@ class LearningMemoryService:
         return view
 
     def delete(
-        self, kind: str, source_id: str, *, reason: str | None = None
+        self,
+        kind: str,
+        source_id: str,
+        *,
+        reason: str | None = None,
+        checkpoint: Callable[[Any], None] | None = None,
     ) -> bool:
         """写持续排除；返回 True 表示本次新移除，False 表示之前已移除。"""
 
@@ -278,7 +289,9 @@ class LearningMemoryService:
         entry_key = build_entry_id(kind, source_id)
         if not self._repository.entry_exists(kind, source_id):
             raise MemoryEntryNotFoundError("没有这条学习记忆。")
-        return self._repository.add_exclusion(entry_key, reason)
+        return self._repository.add_exclusion(
+            entry_key, reason, checkpoint=checkpoint
+        )
 
     # ------------------------------------------------------------------
     # 给 Agent 的两个入口

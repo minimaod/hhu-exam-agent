@@ -11,7 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from app.questions.models import ExerciseSourceView, QuestionCard
-from app.querying.models import ErrorCode, ResultEvent
+from app.querying.models import ErrorCode, QuotaInfo, ResultEvent
 from app.tutoring.models import AttachmentView, ProblemView, TutoringResult
 
 TurnStatus = Literal["running", "completed", "failed", "interrupted"]
@@ -20,6 +20,7 @@ RECOVERABLE_CODES = {
     "MODEL_TIMEOUT", "MODEL_RATE_LIMITED", "MODEL_UNAVAILABLE",
     "MODEL_RESPONSE_INVALID", "CATALOG_UNAVAILABLE", "QUERY_FAILED", "TUTORING_FAILED",
     "QUESTION_SEARCH_FAILED", "QUESTION_BANK_UNAVAILABLE",
+    "MODEL_QUOTA_EXCEEDED", "QUOTA_STORAGE_UNAVAILABLE",
 }
 
 QuestionResultStatus = Literal[
@@ -138,6 +139,7 @@ TurnStage = Literal[
     "searching_questions",
     "viewing_question",
     "composing_reply",
+    "generating_material",
 ]
 
 ExerciseStatus = Literal["pending_answer", "submitted", "revealed"]
@@ -240,6 +242,19 @@ class RecordRef(BaseModel):
     problem_version: int
 
 
+class WorkbenchSource(BaseModel):
+    artifact_id: str
+    view: Literal["notes", "graph", "quiz"]
+    kc_id: str | None = None
+    question_id: str | None = None
+    label: str
+    pages: list[int] = Field(default_factory=list)
+
+    def describe(self) -> str:
+        pages = "、".join(str(page) for page in self.pages) or "待核对"
+        return f"复习工作台当前内容：{self.label}（原页：{pages}）"
+
+
 class Turn(BaseModel):
     """一轮已保存的会话输入；status、kind 与结果必须自洽。"""
 
@@ -258,6 +273,7 @@ class Turn(BaseModel):
     question: QuestionCard | None = None
     composite_results: list[ActionResultItem] = Field(default_factory=list)
     assistant_message: str | None = None
+    workbench_source: WorkbenchSource | None = None
     suggestions: list[SuggestionItem] = Field(default_factory=list)
     exercise_id: str | None = None
     error: TurnError | None = None
@@ -288,8 +304,20 @@ class Turn(BaseModel):
             entries = self.recovery.get("actions", [])
             if entries and not self.recovery.get("pending") and all(entry.get("outcome", {}).get("status") == "success" for entry in entries):
                 self.business_status = "succeeded"
-                self.retryable = False
-                self.retry_hint = "业务操作已保存；本轮连接未完整结束，可刷新查看已保存结果。"
+                quota_stopped = (
+                    self.error is not None
+                    and self.error.code in {
+                        "MODEL_QUOTA_EXCEEDED",
+                        "QUOTA_STORAGE_UNAVAILABLE",
+                    }
+                )
+                # 已保存业务结果但配额中断：允许从恢复记录继续补齐后续回复。
+                self.retryable = quota_stopped
+                self.retry_hint = (
+                    "业务结果已保存；可重试补齐后续步骤。"
+                    if quota_stopped
+                    else "业务操作已保存；本轮连接未完整结束，可刷新查看已保存结果。"
+                )
         if self.status == "completed":
             has_payload = any(
                 [
@@ -340,6 +368,8 @@ class ConversationDetail(BaseModel):
     active_question: QuestionCard | None = None
     context: ConversationContextView | None = None
     record: RecordRef | None = None
+    records_by_root: dict[str, RecordRef] = Field(default_factory=dict)
+    materials: list[Any] = Field(default_factory=list)
 
 
 class TurnProgressEvent(BaseModel):
@@ -421,6 +451,8 @@ class TurnErrorEvent(BaseModel):
     request_id: str
     code: TurnErrorCode
     message: str
+    quota: QuotaInfo | None = None
+    saved: bool = False
 
 
 TurnEvent = TurnProgressEvent | TurnMessageDeltaEvent | TurnResultEvent | TurnErrorEvent

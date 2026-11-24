@@ -5,21 +5,17 @@ export default {
   theme: {
     extend: {
       colors: {
-        paper: "#f6f4ee",
-        ink: "#1f2933",
-        river: "#0f6b5c",
+        paper: "var(--canvas)",
+        ink: "rgb(var(--ink-rgb) / <alpha-value>)",
+        river: "rgb(var(--accent-rgb) / <alpha-value>)",
       },
       fontFamily: {
-        sans: [
-          '"Noto Sans SC"',
-          '"Source Han Sans SC"',
-          '"Microsoft YaHei"',
-          "system-ui",
-          "sans-serif",
-        ],
+        sans: ["var(--font-sans)"],
+        serif: ["var(--font-serif)"],
+        mono: ["var(--font-mono)"],
       },
       boxShadow: {
-        card: "0 24px 60px -34px rgba(31, 41, 51, 0.45)",
+        card: "var(--shadow-sheet)",
       },
     },
   },

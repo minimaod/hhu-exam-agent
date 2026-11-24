@@ -196,7 +196,8 @@ describe("QuestionCardView", () => {
     );
     expect(screen.getByText(/题面第 1 页/)).toBeTruthy();
     expect(screen.getByText(/答案第 2 页/)).toBeTruthy();
-    expect(screen.getByText(/循环（候选）/)).toBeTruthy();
+    expect(screen.getByText("循环")).toBeTruthy();
+    expect(screen.queryByText(/（候选）/)).toBeNull();
     expect(screen.getByText(/原卷可能包含答案页/)).toBeTruthy();
   });
 });
@@ -219,7 +220,7 @@ describe("QuestionResultList", () => {
         onAction={onAction}
       />,
     );
-    expect(screen.getByText(/找到 2 道已审核真题/)).toBeTruthy();
+    expect(screen.getByText(/相关真题（共 2 道）/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "选第 2 道题" }));
     expect(onAction).toHaveBeenCalledWith(
       "select",
@@ -240,4 +241,74 @@ test("来源页链接绑定版本与物理页，查看事实可在刷新后显�
   expect(screen.getByRole("link", { name: "查看答案原页 · 第 2 页" }).getAttribute("href"))
     .toContain("kind=answer&page=2#page=2");
   expect(screen.getByText(/已查看原卷来源：答案第 2 页/)).toBeTruthy();
+});
+
+test.each([
+  { sourceUrl: null, statementPages: [1], answerPages: [2], warning: true },
+  { sourceUrl: "/api/conversations/c/questions/q/source?build=iv-old", statementPages: [], answerPages: [], warning: false },
+  { sourceUrl: null, statementPages: [], answerPages: [], warning: false },
+])("缺少可用题面页入口时仍能打开原卷 %j", ({ sourceUrl, statementPages, answerPages, warning }) => {
+  const original = card();
+  const downloadUrl = "/api/papers/p1/download";
+  render(<QuestionCardView card={card({
+    source_url: sourceUrl,
+    pages: { statement: statementPages, answer: answerPages },
+    source: { ...original.source, download_url: downloadUrl, may_show_answer: warning },
+  })} />);
+  const summary = screen.queryByText("原卷与答案页（点击展开）");
+  if (summary) fireEvent.click(summary);
+  const links = screen.getAllByRole("link", { name: "查看原卷" });
+  expect(links).toHaveLength(1);
+  expect(links[0].getAttribute("href")).toBe(downloadUrl);
+  expect(Boolean(screen.queryByText(/原卷可能包含答案页/))).toBe(warning);
+});
+
+test("理工科解答题、证明题与判断题标签及 LaTeX 公式正常渲染", () => {
+  const { container, rerender } = render(
+    <QuestionCardView
+      card={card({
+        question_id: "math-bi-20250116-final-solve-01",
+        question_type: "solve",
+        number_label: "1",
+        statement: String.raw`求极限 $\lim_{x \to 0} \frac{\sin x}{x}$。`,
+        options: [],
+        source: {
+          paper_id: "math-bi-20250116-final",
+          paper_title: "2024-2025学年第一学期《高等数学BⅠ》期末试题及答案",
+          exam_type: "final",
+          academic_year: "2024-2025",
+          question_number: "1",
+          may_show_answer: true,
+        },
+      })}
+    />,
+  );
+  expect(screen.getByText(/第 1 题 · 解答题/)).toBeTruthy();
+  expect(container.querySelector(".katex")).toBeTruthy();
+
+  rerender(
+    <QuestionCardView
+      card={card({
+        question_id: "geo-2022-2023-s2-final-proof-02",
+        question_type: "proof",
+        number_label: "2",
+        statement: "证明矩阵 $A$ 与 $B$ 有相同特征向量。",
+        options: [],
+      })}
+    />,
+  );
+  expect(screen.getByText(/第 2 题 · 证明题/)).toBeTruthy();
+
+  rerender(
+    <QuestionCardView
+      card={card({
+        question_id: "phys-judge-01",
+        question_type: "judge",
+        number_label: "3",
+        statement: "保守力做功与路径无关。",
+        options: [],
+      })}
+    />,
+  );
+  expect(screen.getByText(/第 3 题 · 判断题/)).toBeTruthy();
 });

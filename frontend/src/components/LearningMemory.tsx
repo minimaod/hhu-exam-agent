@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import {
   correctMemory,
   deleteMemory,
@@ -10,10 +10,12 @@ import {
   type MemoryEntry,
 } from "../lib/memoryApi";
 import { formatDateTime, memoryValidityLabel, memoryVerdictLabel } from "../lib/display";
+import MathText from "./MathText";
 
 type Props = {
   /** 从记忆条目跳回原会话：只带会话 id，不复制任何学习内容。 */
   onOpenConversation?: (conversationId: string) => void;
+  onCountChange?: (count: number) => void;
 };
 
 type Phase =
@@ -27,11 +29,12 @@ const RANGES = [
   { days: 90, label: "近 90 天" },
 ];
 
-/** 课程归属只有这四种来源；未知时要显示“待确认”，不能默认算进某门课。 */
+/** 课程归属来源；未知时显示“课程待确认”，不能默认算进某门课。 */
 const COURSE_SOURCE_LABELS: Record<string, string> = {
   user: "你手动指定",
   paper: "按试卷归属",
   problem: "按题目归属",
+  conversation: "按会话科目",
   unknown: "课程待确认",
 };
 
@@ -81,7 +84,7 @@ function EntryForm({
         onSubmit(change);
       }}
     >
-      <label className="block text-[11px] text-slate-600">
+      <label className="block text-xs text-slate-600">
         课程（留空表示改为待确认）
         <input
           className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1 text-xs"
@@ -90,7 +93,7 @@ function EntryForm({
           placeholder="例如：Python语言程序设计"
         />
       </label>
-      <label className="block text-[11px] text-slate-600">
+      <label className="block text-xs text-slate-600">
         知识点
         <input
           className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2 py-1 text-xs"
@@ -99,7 +102,7 @@ function EntryForm({
           placeholder="例如：循环的条件与终止条件"
         />
       </label>
-      <label className="block text-[11px] text-slate-600">
+      <label className="block text-xs text-slate-600">
         附注（只写你的说明，不改原记录）
         <textarea
           className="mt-1 h-16 w-full rounded-md border border-slate-300 bg-white px-2 py-1 text-xs"
@@ -112,14 +115,14 @@ function EntryForm({
         <button
           type="submit"
           disabled={busy}
-          className="rounded-lg bg-river px-3 py-1 text-[11px] font-medium text-white disabled:opacity-50"
+          className="rounded-lg bg-river px-3 py-1 text-xs font-medium text-white disabled:opacity-50"
         >
           保存更正
         </button>
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-[11px] text-slate-600"
+          className="rounded-lg border border-slate-300 bg-white px-3 py-1 text-xs text-slate-600"
         >
           取消
         </button>
@@ -128,7 +131,7 @@ function EntryForm({
   );
 }
 
-export default function LearningMemory({ onOpenConversation }: Props) {
+export default function LearningMemory({ onOpenConversation, onCountChange }: Props) {
   const [courses, setCourses] = useState<MemoryCourseCount[]>([]);
   const [pending, setPending] = useState(0);
   const [coursesLoaded, setCoursesLoaded] = useState(false);
@@ -144,8 +147,10 @@ export default function LearningMemory({ onOpenConversation }: Props) {
     const controller = new AbortController();
     fetchMemoryCourses(controller.signal)
       .then((payload) => {
+        if (controller.signal.aborted) return;
         setCourses(payload.items);
         setPending(payload.pending);
+        onCountChange?.(payload.items.reduce((total, item) => total + item.evidence, 0) + payload.pending);
         setCoursesLoaded(true);
         setCourse((current) => current ?? payload.items[0]?.course ?? null);
       })
@@ -161,7 +166,7 @@ export default function LearningMemory({ onOpenConversation }: Props) {
         });
       });
     return () => controller.abort();
-  }, [reloadKey]);
+  }, [onCountChange, reloadKey]);
 
   useEffect(() => {
     if (!coursesLoaded) {
@@ -249,21 +254,14 @@ export default function LearningMemory({ onOpenConversation }: Props) {
   );
 
   return (
-    <div className="mx-auto max-w-4xl pb-10">
-      <section className="mt-2">
-        <p className="text-xs font-medium tracking-[0.2em] text-river">
-          学习记忆 · 复习建议
-        </p>
-        <h1 className="mt-3 text-2xl font-semibold leading-tight tracking-tight text-ink sm:text-3xl">
-          从你已经做过的题，找回还没稳的那一块。
-        </h1>
-        <p className="mt-3 text-sm leading-7 text-slate-600">
-          这里只统计程序里真实存在的练习、作答和你的更正；不做百分制估算，
-          一次做对也不会被当成永久掌握。需要改哪一条，直接在这里更正或移除。
-        </p>
-      </section>
+    <div className="page-frame memory-page">
+      <header className="page-heading">
+        <p className="eyebrow">个人学习记录</p>
+        <h1>知识点掌握账本与复习建议</h1>
+        <p>按作答和更正记录查看知识点。一次做对也不会被当成永久掌握。</p>
+      </header>
 
-      <div className="mt-5 flex flex-wrap items-center gap-2">
+      <div className="memory-controls">
         <div className="flex flex-wrap gap-1.5">
           {courses.map((item) => (
             <button
@@ -278,7 +276,7 @@ export default function LearningMemory({ onOpenConversation }: Props) {
               }`}
             >
               {item.label}
-              <span className="ml-1 text-[10px] opacity-75">{item.evidence}</span>
+              <span className="ml-1 text-xs opacity-75">{item.evidence}</span>
             </button>
           ))}
           {courses.length === 0 && pending > 0 && (
@@ -296,8 +294,8 @@ export default function LearningMemory({ onOpenConversation }: Props) {
               aria-pressed={days === item.days}
               className={`rounded-lg border px-3 py-1 text-xs ${
                 days === item.days
-                  ? "border-ink bg-ink text-white"
-                  : "border-slate-200 bg-white text-slate-600"
+                  ? "border-river bg-river text-white"
+                  : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
               }`}
             >
               {item.label}
@@ -334,13 +332,13 @@ export default function LearningMemory({ onOpenConversation }: Props) {
 
       {view && (
         <>
-          <section className="mt-5 rounded-xl border border-slate-200 bg-white/80 p-4">
+          <section className="memory-ledger">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <h2 className="text-sm font-semibold text-ink">
-                {view.course ?? "课程待确认"} · {view.range_text}
+              <h2 className="ledger-heading">
+                {view.course ?? "课程待确认"} · 近 {days} 天
               </h2>
-              <p className="text-[11px] text-slate-500">
-                证据 {view.counts.evidence} 条 · 练习 {view.counts.practices} 道 ·
+              <p className="text-xs text-slate-500">
+                记录 {view.counts.evidence} 条 · 练习 {view.counts.practices} 道 ·
                 作答 {view.counts.attempts} 次
                 {view.counts.pending_course > 0 &&
                   ` · 课程待确认 ${view.counts.pending_course} 条`}
@@ -359,59 +357,35 @@ export default function LearningMemory({ onOpenConversation }: Props) {
                 <p className="text-xs font-medium text-amber-900">建议先补</p>
                 <ul className="mt-1 list-inside list-disc space-y-0.5 text-xs leading-6 text-amber-900">
                   {view.suggestions.map((item) => (
-                    <li key={item}>{item}</li>
+                    <li key={item} className="break-words">
+                      <MathText text={item} />
+                    </li>
                   ))}
                 </ul>
               </div>
             )}
 
             {view.groups.length > 0 && (
-              <div className="mt-4 overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead className="text-[11px] text-slate-500">
-                    <tr>
-                      <th className="py-1 pr-3 font-medium">知识点</th>
-                      <th className="py-1 pr-3 font-medium">独立做错</th>
-                      <th className="py-1 pr-3 font-medium">独立做对</th>
-                      <th className="py-1 pr-3 font-medium">看答案后作答</th>
-                      <th className="py-1 pr-3 font-medium">独立性未确认</th>
-                      <th className="py-1 pr-3 font-medium">更早判错</th>
-                      <th className="py-1 pr-3 font-medium">评价已排除</th>
-                      <th className="py-1 pr-3 font-medium">尚未作答</th>
-                      <th className="py-1 font-medium">最近一次</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {view.groups.map((group) => (
-                      <tr key={group.label} className="border-t border-slate-100">
-                        <td className="py-1.5 pr-3 text-slate-800">
-                          {group.label}
-                          {!group.normalized && (
-                            <span className="ml-1 text-[10px] text-amber-700">
-                              未归一
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-1.5 pr-3">{group.wrong_count}</td>
-                        <td className="py-1.5 pr-3">{group.correct_count}</td>
-                        <td className="py-1.5 pr-3">{group.after_reveal_count}</td>
-                        <td className="py-1.5 pr-3">{group.unclear_count}</td>
-                        <td className="py-1.5 pr-3">
-                          {group.earlier_wrong_count > 0
-                            ? `${group.earlier_wrong_count}（窗口前）`
-                            : 0}
-                        </td>
-                        <td className="py-1.5 pr-3">
-                          {group.excluded_evaluation_count}
-                        </td>
-                        <td className="py-1.5 pr-3">{group.no_attempt_count}</td>
-                        <td className="py-1.5 text-slate-500">
-                          {formatDateTime(group.latest_at, "无记录")}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="ledger-grid">
+                {view.groups.map((group) => (
+                  <article key={group.label} className="ledger-entry">
+                    <header>
+                      <h3>
+                        <MathText text={group.label} />
+                      </h3>
+                    </header>
+                    <p className="ledger-date">最近一次 · {formatDateTime(group.latest_at, "无记录")}</p>
+                    <dl className="ledger-metrics">
+                      <div><dt>独立做错</dt><dd className="ledger-wrong">{group.wrong_count}</dd></div>
+                      <div><dt>独立做对</dt><dd>{group.correct_count}</dd></div>
+                      <div><dt>看答案后作答</dt><dd>{group.after_reveal_count}</dd></div>
+                      {group.unclear_count > 0 && <div><dt>是否独立待确认</dt><dd>{group.unclear_count}</dd></div>}
+                      {group.earlier_wrong_count > 0 && <div><dt>更早做错</dt><dd>{group.earlier_wrong_count}</dd></div>}
+                      {group.excluded_evaluation_count > 0 && <div><dt>评价已排除</dt><dd>{group.excluded_evaluation_count}</dd></div>}
+                      {group.no_attempt_count > 0 && <div><dt>尚未作答</dt><dd>{group.no_attempt_count}</dd></div>}
+                    </dl>
+                  </article>
+                ))}
               </div>
             )}
           </section>
@@ -424,16 +398,18 @@ export default function LearningMemory({ onOpenConversation }: Props) {
               {entries.map((entry) => (
                 <article
                   key={entry.entry_id}
-                  className="rounded-xl border border-slate-200 bg-white/80 p-3.5"
+                  className="evidence-entry"
                 >
-                  <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
                     <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-slate-700">
                       {memoryVerdictLabel(entry.verdict)}
                     </span>
                     <span className="text-slate-500">{entryCourseText(entry)}</span>
-                    <span className="text-slate-400">
-                      {COURSE_SOURCE_LABELS[entry.course_source] ?? "课程待确认"}
-                    </span>
+                    {entry.course && (
+                      <span className="text-slate-400">
+                        {COURSE_SOURCE_LABELS[entry.course_source] ?? "课程待确认"}
+                      </span>
+                    )}
                     <span className="text-slate-400">
                       {formatDateTime(entry.recorded_at)}
                     </span>
@@ -446,26 +422,30 @@ export default function LearningMemory({ onOpenConversation }: Props) {
 
                   {entry.statement_excerpt && (
                     <p className="mt-2 text-sm leading-6 text-slate-700">
-                      {entry.statement_excerpt}
+                      <MathText text={entry.statement_excerpt} />
                     </p>
                   )}
 
                   {entry.knowledge_points.length > 0 && (
-                    <p className="mt-1 text-[11px] text-slate-500">
-                      知识点：{entry.knowledge_points.join("、")}
-                      {entry.knowledge_points_normalized.some((item) => !item) &&
-                        "（有一条未归一）"}
+                    <p className="mt-1 break-words text-xs text-slate-500">
+                      知识点：
+                      {entry.knowledge_points.map((kp, index) => (
+                        <Fragment key={`${kp}-${index}`}>
+                          {index > 0 ? "、" : ""}
+                          <MathText text={kp} />
+                        </Fragment>
+                      ))}
                     </p>
                   )}
 
                   {entry.note && (
-                    <p className="mt-1 text-[11px] text-slate-600">
+                    <p className="mt-1 text-xs text-slate-600">
                       附注：{entry.note}
                     </p>
                   )}
 
                   {entry.attempts.length > 0 && (
-                    <ul className="mt-1.5 space-y-0.5 text-[11px] text-slate-500">
+                    <ul className="mt-1.5 space-y-0.5 text-xs text-slate-500">
                       {entry.attempts.map((attempt) => (
                         <li key={attempt.attempt_id}>
                           第 {attempt.attempt_no} 次 · {attempt.label}
@@ -483,7 +463,7 @@ export default function LearningMemory({ onOpenConversation }: Props) {
                           current === entry.entry_id ? null : entry.entry_id,
                         )
                       }
-                      className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-[11px] text-slate-700 hover:bg-slate-50"
+                      className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs text-slate-700 hover:bg-slate-50"
                     >
                       {editingId === entry.entry_id ? "收起更正" : "更正这条"}
                     </button>
@@ -491,7 +471,7 @@ export default function LearningMemory({ onOpenConversation }: Props) {
                       type="button"
                       onClick={() => void removeEntry(entry)}
                       disabled={busyId === entry.entry_id}
-                      className="rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-[11px] text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                      className="rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
                     >
                       从学习记忆移除
                     </button>
@@ -501,7 +481,7 @@ export default function LearningMemory({ onOpenConversation }: Props) {
                         onClick={() =>
                           onOpenConversation(entry.source.conversation_id)
                         }
-                        className="text-[11px] text-river underline-offset-2 hover:underline"
+                        className="rounded-lg border border-river/40 bg-white px-2.5 py-1 text-xs text-river hover:bg-slate-50"
                       >
                         回到原会话
                       </button>
@@ -521,10 +501,6 @@ export default function LearningMemory({ onOpenConversation }: Props) {
             </section>
           )}
 
-          <p className="mt-6 text-[11px] leading-6 text-slate-500">
-            记忆只描述已有记录：一次答对不代表已经掌握，也不会计算比例。
-            移除只影响学习记忆与复习建议，原会话里的题目、讲解和作答都保留。
-          </p>
         </>
       )}
     </div>

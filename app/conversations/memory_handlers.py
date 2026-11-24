@@ -2,9 +2,10 @@
 
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 from app.conversations.errors import (
+    ConversationStorageError,
     MemoryCorrectionUnsupportedError,
     MemoryEntryNotFoundError,
 )
@@ -299,7 +300,12 @@ class MemoryHandlerMixin:
         return parsed, None
 
     def _memory_correct_outcome(
-        self, prepared: ExecuteTurn, action: ActionPlan, ctx: _DynamicContext
+        self,
+        prepared: ExecuteTurn,
+        action: ActionPlan,
+        ctx: _DynamicContext,
+        *,
+        checkpoint: Callable[[Any], None] | None = None,
     ) -> ActionOutcome:
         name = action.action
         if self._memory is None:
@@ -325,7 +331,11 @@ class MemoryHandlerMixin:
             note=action.parameters.get("note"),
         )
         try:
-            view = self._memory.correct(parsed[0], parsed[1], request)
+            view = self._memory.correct(
+                parsed[0], parsed[1], request, checkpoint=checkpoint
+            )
+        except ConversationStorageError:
+            raise
         except MemoryEntryNotFoundError:
             return ActionOutcome(
                 name,
@@ -368,7 +378,12 @@ class MemoryHandlerMixin:
         )
 
     def _memory_delete_outcome(
-        self, prepared: ExecuteTurn, action: ActionPlan, ctx: _DynamicContext
+        self,
+        prepared: ExecuteTurn,
+        action: ActionPlan,
+        ctx: _DynamicContext,
+        *,
+        checkpoint: Callable[[Any], None] | None = None,
     ) -> ActionOutcome:
         name = action.action
         if self._memory is None:
@@ -382,8 +397,13 @@ class MemoryHandlerMixin:
         assert parsed is not None
         try:
             removed = self._memory.delete(
-                parsed[0], parsed[1], reason=action.parameters.get("reason")
+                parsed[0],
+                parsed[1],
+                reason=action.parameters.get("reason"),
+                checkpoint=checkpoint,
             )
+        except ConversationStorageError:
+            raise
         except MemoryEntryNotFoundError:
             return ActionOutcome(
                 name,

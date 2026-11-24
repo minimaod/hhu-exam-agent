@@ -1,0 +1,31 @@
+# F013 Nginx 兜底限流示例（合并到服务器现有 server 块，不直接覆盖）
+#
+# 当前 F011 通过 SSH 隧道访问，所有用户表现为 127.0.0.1，按 IP 限流实际是
+# 所有隧道用户共享一个桶。它只能挡住异常高频请求，不能区分同学；公网部署
+# 并拿到真实客户端 IP 后，再按实际流量调整 rate/burst。
+
+limit_req_zone $binary_remote_addr zone=hhu_api:10m rate=60r/m;
+limit_req_status 429;
+
+server {
+    # ... 现有前端与证书配置 ...
+
+    location /api/ {
+        limit_req zone=hhu_api burst=30 nodelay;
+        limit_req_log_level notice;
+
+        # 支持 10 MB 个人 PDF 上传与图片附件上传（保留 multipart 开销余量）
+        client_max_body_size 12m;
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # SSE：关闭缓冲，保持长连接
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

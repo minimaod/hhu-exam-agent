@@ -136,7 +136,7 @@ describe("ConversationWorkspace 异步隔离", () => {
     );
 
     fireEvent.click(await screen.findByRole("button", { name: /会话 A/ }));
-    const recordButtons = await screen.findAllByRole("button", { name: "记录这题" });
+    const recordButtons = await screen.findAllByRole("button", { name: "加入错题本" });
     expect(recordButtons.length).toBe(2);
     fireEvent.click(recordButtons[0]);
 
@@ -173,6 +173,7 @@ describe("ConversationWorkspace 异步隔离", () => {
       name: "纠正题干",
     });
     expect(correctButtons.length).toBe(2);
+    expect(screen.queryByRole("button", { name: "开始新题" })).toBeNull();
     fireEvent.click(correctButtons[0]);
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
@@ -180,6 +181,32 @@ describe("ConversationWorkspace 异步隔离", () => {
     const call = streamTurn.mock.calls[0][0];
     expect(call.kind).toBe("correction");
     expect(call.problemId).toBe("problem-a");
+  });
+
+  test("意图不明确时仍能明确开始新题，并保留原输入", async () => {
+    const item = problem("problem-current", "当前题");
+    const clarification = {
+      ...storedTurn("clarify", 2, item),
+      query: "求另一个极限",
+      tutoring: {
+        kind: "intent_clarification" as const,
+        message: "要开始新题吗？",
+        options: ["new_problem" as const],
+      },
+    };
+    listConversations.mockResolvedValue({ items: [A], total: 1 });
+    getConversation.mockResolvedValue({
+      ...detail(A), active_problem: item, turns: [clarification],
+    });
+    streamTurn.mockReturnValue(new Promise<TurnResultEvent>(() => undefined));
+    render(<ConversationWorkspace downloads={{}} onDownload={() => undefined} onOpenRecord={() => undefined} />);
+    fireEvent.click(await screen.findByRole("button", { name: /会话 A/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "开始新题" }));
+    expect(screen.getByText("正在输入新题")).toBeTruthy();
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("求另一个极限");
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await waitFor(() => expect(streamTurn).toHaveBeenCalledTimes(1));
+    expect(streamTurn.mock.calls[0][0]).toMatchObject({ kind: "problem", startNew: true, query: "求另一个极限" });
   });
 
   test("切换会话后，A 的迟到结果不会写入 B", async () => {

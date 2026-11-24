@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from app.question_bank.config import COURSE, DEFAULT_BANK_ROOT
-from app.question_bank.models import SearchRequest
+from app.question_bank.models import QUESTION_TYPES, SearchRequest
 from app.question_bank.service import QuestionBankService
 
 
@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--course", default=COURSE)
     parser.add_argument("--query", default="")
     parser.add_argument("--limit", type=int, default=5)
-    parser.add_argument("--type", dest="question_type", choices=("choice", "fill", "code"))
+    parser.add_argument("--type", dest="question_type", choices=QUESTION_TYPES)
     parser.add_argument("--exam", dest="exam_type", choices=("midterm", "final"))
     parser.add_argument("--paper")
     parser.add_argument("--kp", action="append", default=[])

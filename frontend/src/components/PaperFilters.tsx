@@ -37,10 +37,10 @@ export default function PaperFilters({
   return (
     <form
       onSubmit={handleSubmit}
-      className="flex flex-col gap-3 rounded-2xl border border-slate-200/90 bg-white/90 p-4 shadow-card backdrop-blur sm:flex-row sm:items-end"
+      className="archive-filters"
     >
-      <label className="flex-1">
-        <span className="block text-[11px] font-medium tracking-[0.18em] text-slate-500">
+      <label className="archive-search">
+        <span className="field-label">
           课程
         </span>
         <input
@@ -48,12 +48,12 @@ export default function PaperFilters({
           value={course}
           onChange={(event) => onCourseChange(event.target.value)}
           placeholder="例如 高数、高等数学BⅠ"
-          className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-ink outline-none transition placeholder:text-slate-400 focus:border-river focus:ring-2 focus:ring-river/20"
+          className="field-control"
         />
       </label>
 
-      <label className="sm:w-40">
-        <span className="block text-[11px] font-medium tracking-[0.18em] text-slate-500">
+      <label className="archive-type">
+        <span className="field-label">
           考试类型
         </span>
         <select
@@ -61,7 +61,7 @@ export default function PaperFilters({
           onChange={(event) =>
             onExamTypeChange(event.target.value as ExamTypeFilter)
           }
-          className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-ink outline-none transition focus:border-river focus:ring-2 focus:ring-river/20"
+          className="field-control"
         >
           {EXAM_TYPE_OPTIONS.map((option) => (
             <option key={option.value} value={option.value}>
@@ -74,7 +74,7 @@ export default function PaperFilters({
       <button
         type="submit"
         disabled={loading}
-        className="inline-flex items-center justify-center gap-2 rounded-xl bg-ink px-5 py-2.5 text-sm font-medium text-white transition hover:bg-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-river focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:bg-slate-400"
+        className="primary-button"
       >
         {loading ? "查询中…" : "查询试卷"}
       </button>

@@ -1,6 +1,5 @@
 """F010 收尾：模型猜题型不能代替用户，真实讲解须可恢复。"""
 
-import json
 
 import pytest
 
@@ -100,7 +99,7 @@ async def test_real_explanation_result_persists_recoverable_fingerprint(tmp_path
     reply = ReplyFactory(["重新讲解这道题。"])
     harness.service._make_reply = reply
     regenerated = await harness.service.regenerate_reply(conversation, prepared.request_id)
-    prompt = json.dumps(reply.models[-1].calls, ensure_ascii=False, default=str)
-    assert record.explanation.final_answer in prompt
+    assert not reply.models
+    assert record.explanation.final_answer in regenerated["assistant_message"]
     assert "答案版本已变化" not in regenerated["assistant_message"]
     assert regenerated["reply_status"] == "complete"

@@ -26,8 +26,8 @@ from app.papers.locator import (
     paper_matches,
 )
 from app.querying.models import ResultEvent
-from app.question_bank.config import MAX_BROWSE_LIMIT
-from app.question_bank.models import SearchRequest
+from app.question_bank.config import MAX_BROWSE_LIMIT, MAX_LIMIT
+from app.question_bank.models import QUESTION_TYPE_LABELS, SearchRequest
 from app.questions.errors import QuestionError
 from app.questions.intent import SearchIntent
 from app.questions.models import QuestionSearchResult
@@ -45,7 +45,7 @@ class SearchMixin:
         emit: Callable[[str, str], None],
     ) -> ActionOutcome:
         name = "search_questions"
-        emit("searching_questions", "正在检索已审核的 Python 真题")
+        emit("searching_questions", "正在检索历年真题题库")
         intent = self._intent_from_params(ctx, action)
         if not intent.course:
             return self._action_result(prepared, ctx, ActionOutcome(
@@ -72,8 +72,9 @@ class SearchMixin:
                 name, "clarification", self._exhausted_text(ctx, intent), needs_user=True
             ))
         exclude = action.parameters.get("exclude_question_id")
-        if not exclude and action.parameters.get("exclude_previous"):
-            exclude = self._source_question_id(ctx)
+        if intent.next_card:
+            intent = replace(intent, limit=1)
+            exclude = exclude or self._source_question_id(ctx)
         result = await self._run_question_search(
             prepared, ctx, name, intent, emit,
             exclude_question_id=exclude,
@@ -94,6 +95,16 @@ class SearchMixin:
     ) -> Any:
         """执行一次题库检索；失败时返回可以直接回传的 ``ActionOutcome``。"""
 
+        next_question = name == "search_questions" and intent.next_card
+        excluded = set(self._shown_ids(ctx)) if next_question else set()
+        if exclude_question_id:
+            excluded.add(exclude_question_id)
+        limit = intent.limit
+        if next_question:
+            # 排除发生在检索之后，须多取候选才能在限取一题时越过已展示的题。
+            cap = MAX_LIMIT if intent.query else MAX_BROWSE_LIMIT
+            limit = min(cap, limit + len(excluded))
+
         request = SearchRequest(
             course=intent.course,
             query=intent.query,
@@ -103,7 +114,7 @@ class SearchMixin:
             number_label=intent.number_label,
             knowledge_points=list(intent.knowledge_points),
             offset=intent.offset,
-            limit=intent.limit,
+            limit=limit,
             preview_candidates=False,
         )
         try:
@@ -129,15 +140,38 @@ class SearchMixin:
                 name, "failed", exc.message, error_code=exc.code,
                 retryable=exc.status_code == 503,
             ))
+        if next_question and result.status == "ok":
+            return self._next_unseen_question(result, excluded, ranked=bool(intent.query))
         if exclude_question_id and result.cards:
-            # 学生要的是“另一道类似的题”，把刚做过的原题过滤掉；请求时已经
-            # 多要了一条，所以过滤后仍有内容可展示。
             kept = [c for c in result.cards if c.question_id != exclude_question_id]
             if len(kept) != len(result.cards):
                 result = result.model_copy(
                     update={"cards": kept, "returned": len(kept)}
                 )
         return result
+
+    @staticmethod
+    def _next_unseen_question(
+        result: QuestionSearchResult, excluded: set[str], *, ranked: bool
+    ) -> QuestionSearchResult:
+        for index, card in enumerate(result.cards):
+            if card.question_id in excluded:
+                continue
+            offset = result.offset if ranked else result.offset + index
+            has_more = index + 1 < len(result.cards) or result.next_offset is not None
+            return result.model_copy(update={
+                "cards": [card],
+                "offset": offset,
+                "returned": 1,
+                "next_offset": offset + 1 if has_more and not ranked else None,
+            })
+        return result.model_copy(update={
+            "status": "no_match",
+            "cards": [],
+            "returned": 0,
+            "next_offset": None,
+            "message": "这次没有找到没看过的匹配题。可以换个考点或放宽筛选条件。",
+        })
 
     def _question_search_outcome(
         self,
@@ -150,25 +184,6 @@ class SearchMixin:
         """把一次真实检索结果变成动作结果：公开总数、本次范围与下一步。"""
 
         shown = self._shown_ids(ctx)
-        if intent.next_card and not intent.paper_id and result.cards:
-            # 相关度检索没有“位置”可翻：按已经展示过的题排除，给出下一道没看过的。
-            seen = set(shown)
-            fresh = [card for card in result.cards if card.question_id not in seen]
-            if not fresh:
-                # 不能把旧题（可能已经公开答案）回显成这次的结果。
-                ctx.question_results = []
-                ctx.question_card = None
-                ctx.question_selection = None
-                ctx.tutoring = None
-                return self._action_result(prepared, ctx, ActionOutcome(
-                    name,
-                    "clarification",
-                    "这条条件下的题我都已经给你看过了；换个条件或去掉关键词再找，我就能给你新题。",
-                    needs_user=True,
-                ))
-            result = result.model_copy(
-                update={"cards": fresh[:1], "returned": 1, "next_offset": None}
-            )
         ctx.question_results = list(result.cards)
         # Do not echo an already-revealed previous selection into a fresh search.
         ctx.question_card = None
@@ -177,7 +192,7 @@ class SearchMixin:
         ctx.question_result_status = result.status
         ctx.question_result_message = result.message
         if intent.number_label is not None and intent.question_type is None and len(result.cards) > 1:
-            kinds_all = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+            kinds_all = QUESTION_TYPE_LABELS
             types = "、".join(
                 dict.fromkeys(kinds_all.get(card.question_type, "题目") for card in result.cards)
             )
@@ -191,6 +206,18 @@ class SearchMixin:
                 result.message,
                 error_code="QUESTION_BANK_UNAVAILABLE",
                 retryable=True,
+            ))
+        if result.status == "bank_not_built":
+            return self._action_result(prepared, ctx, ActionOutcome(
+                name,
+                "success",
+                f"{result.message}（当前题库没有该科目的单题真题数据；可继续帮学生查原卷下载，或按考点自主生成模型练习题）",
+                {
+                    "course": intent.course,
+                    "has_question_bank": False,
+                    "bank_status": "bank_not_built",
+                },
+                needs_user=False,
             ))
         if result.status != "ok":
             return self._action_result(prepared, ctx, ActionOutcome(
@@ -234,7 +261,9 @@ class SearchMixin:
         )[-200:]
 
         selected = False
-        if intent.auto_explain and len(result.cards) == 1:
+        if len(result.cards) == 1 and (
+            intent.auto_explain or name == "search_questions"
+        ):
             card = result.cards[0]
             selection = self._select_question_card(
                 prepared.conversation_id,
@@ -243,11 +272,11 @@ class SearchMixin:
                 card,
             )
             ctx.question_selection = selection
-            ctx.question_card = card
+            ctx.question_card = self.questions.card_for_selection(selection, selected=True)
             selected = True
         range_text = self._range_text(result, intent)
         if selected:
-            message = f"找到 1 道已审核真题，并已选中第 {result.cards[0].number_label} 题。"
+            message = f"已找到并选中第 {result.cards[0].number_label} 题，可以直接在下方卡片作答。"
         elif intent.number_label is not None and intent.question_type is None and len(result.cards) > 1:
             message = ctx.question_result_message or result.message
         else:
@@ -286,7 +315,7 @@ class SearchMixin:
         """这一条件下已经全部展示过：说明范围，而不是从第 1 道重放。"""
 
         context = self._question_context(ctx)
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         kind = kinds.get(context.get("question_type") or "", "")
         total = context.get("total")
         title = context.get("paper_title") or "这份试卷"
@@ -336,7 +365,7 @@ class SearchMixin:
     def _range_text(self, result: QuestionSearchResult, intent: Any) -> str:
         """“共 N 道，本次第 a–b 道，还有多少没显示”。"""
 
-        kinds = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+        kinds = QUESTION_TYPE_LABELS
         paper_title = result.paper_title if intent.paper_id else None
         scope = f"{paper_title}的" if paper_title else ""
         kind = kinds.get(intent.question_type or "", "")
@@ -350,7 +379,7 @@ class SearchMixin:
             )
         if intent.number_label is not None:
             if intent.question_type is None and len(result.cards) > 1:
-                kinds_all = {"choice": "选择题", "fill": "填空题", "code": "编程题"}
+                kinds_all = QUESTION_TYPE_LABELS
                 types = "、".join(
                     dict.fromkeys(kinds_all.get(card.question_type, "题目") for card in result.cards)
                 )
@@ -444,6 +473,20 @@ class SearchMixin:
         page_exhausted = False
         page_error: str | None = None
         continue_page = bool(params.get("continue_from_previous"))
+        next_card = bool(params.get("exclude_previous"))
+        if (
+            action.action == "search_questions"
+            and next_card
+            and not continue_page
+            and not query
+            and number_label is None
+            and not params.get("knowledge_points")
+            and scope == "current"
+            and paper_id == current_paper
+            and (not params.get("course") or course == normalize_course(ctx.confirmed_course or ""))
+        ):
+            query = str(context.get("query") or "")
+            question_type = question_type or context.get("question_type")
         explicit_offset = params.get("offset")
         if continue_page and explicit_offset is not None:
             page_error = "offset 与 continue_from_previous 只能选一个。"
@@ -495,7 +538,7 @@ class SearchMixin:
             limit=max(1, min(int(limit), 64)),
             offset=max(0, offset),
             auto_explain=auto_explain,
-            next_card=bool(params.get("exclude_previous")),
+            next_card=next_card,
             page_exhausted=page_exhausted,
             page_error=page_error,
             paper_unresolved=unresolved,
@@ -608,13 +651,21 @@ class SearchMixin:
                 items=[],
                 total=0,
             )
-        details = {
+        details: dict[str, Any] = {
             "total": papers.total,
             "course": course,
             "exam_type": exam_type,
-            "papers": [{"paper_id": item.id, "title": item.title,
-                        "academic_year": item.academic_year, "exam_type": item.exam_type}
-                       for item in papers.items],
+            "result_cards_rendered": bool(papers.items),
+            # 决策循环仍然需要真实候选，才能继续比较或定位试卷。
+            "papers": [
+                {
+                    "paper_id": item.id,
+                    "title": item.title,
+                    "academic_year": item.academic_year,
+                    "exam_type": item.exam_type,
+                }
+                for item in papers.items
+            ],
         }
         if getattr(ctx, "last_paper_switch_override", None):
             details["paper_switch_override"] = ctx.last_paper_switch_override
