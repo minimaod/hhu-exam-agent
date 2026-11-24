@@ -130,6 +130,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 site_requests=usage_config.site_requests,
                 images=usage_config.images,
             ),
+            unlimited_owner_id=usage_config.unlimited_owner_id,
         )
         app.state.model_http_client = httpx.AsyncClient(
             transport=QuotaTransport(app.state.usage_gate),

@@ -19,6 +19,7 @@ export default function UsageNotice({ usage, error = null, placement = "all" }: 
     return error && showWarnings ? <p role="status" className="quota-warning">{error}</p> : null;
   }
 
+  const { requests, images } = usage;
   const blocked = quotaBlocksRequests(usage);
   const imageBlocked = quotaBlocksImages(usage);
   const reason = quotaReason(usage);
@@ -28,19 +29,21 @@ export default function UsageNotice({ usage, error = null, placement = "all" }: 
       {showSummary && (
         <section className="quota-widget" aria-label="今日模型额度">
           <p className="quota-heading">
-            <span>今日剩余模型请求</span>
-            <strong>{usage.requests.remaining} / {usage.requests.limit}</strong>
+            <span>{requests.limit === null ? "今日模型请求" : "今日剩余模型请求"}</span>
+            <strong>{requests.limit === null ? "不限" : <>{requests.remaining} / {requests.limit}</>}</strong>
           </p>
-          <progress
-            className="quota-meter"
-            aria-label="剩余模型请求比例"
-            max={Math.max(usage.requests.limit, 1)}
-            value={Math.max(0, usage.requests.remaining)}
-            data-blocked={blocked}
-          />
+          {requests.limit !== null && requests.remaining !== null && (
+            <progress
+              className="quota-meter"
+              aria-label="剩余模型请求比例"
+              max={Math.max(requests.limit, 1)}
+              value={Math.max(0, requests.remaining)}
+              data-blocked={blocked}
+            />
+          )}
           <p className="quota-meta">
-            <span>图片剩余 {usage.images.remaining}/{usage.images.limit} 张</span>
-            <span>00:00 重置</span>
+            <span>{images.limit === null ? "图片上传不限" : <>图片剩余 {images.remaining}/{images.limit} 张</>}</span>
+            <span>{requests.limit === null ? <>已调用 {requests.used} 次</> : "00:00 重置"}</span>
           </p>
         </section>
       )}

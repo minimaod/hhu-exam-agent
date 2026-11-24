@@ -3178,7 +3178,7 @@ export default function ConversationWorkspace({
                       {renderNotice()}
                     </>
                   }
-                  remainingRequests={usage?.requests.remaining}
+                  remainingRequests={usage?.requests.remaining ?? undefined}
                   value={draft}
                   running={busy}
                   canCancel={(live !== null || Boolean(activeMaterialTurnId)) &&

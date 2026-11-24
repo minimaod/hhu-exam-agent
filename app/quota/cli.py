@@ -39,6 +39,7 @@ def _gate(database: Path) -> UsageGate:
             site_requests=config.site_requests,
             images=config.images,
         ),
+        unlimited_owner_id=config.unlimited_owner_id,
     )
 
 
@@ -69,14 +70,17 @@ def _cmd_report(args: argparse.Namespace) -> int:
         return 0
     site = report["site"]
     print(
-        f"{report['date']} 全站模型请求：{site['model_requests']['used']}/"
-        f"{site['model_requests']['limit']}，图片：{site['images']}；"
+        f"{report['date']} 内测共享额度：{site['model_requests']['used']}/"
+        f"{site['model_requests']['limit']}，不限额账号请求：{site['unlimited_model_requests']}，"
+        f"图片：{site['images']}，"
         f"重置：{report['reset_at']}"
     )
     for item in report["users"]:
+        limit = "不限" if item["limit"] is None else item["limit"]
+        image_limit = "不限" if item["image_limit"] is None else item["image_limit"]
         print(
             f"{item['owner_id']}\t模型 {item['model_requests']}，"
-            f"图片 {item['images']}\t个人额度 {item['limit']}/{item['image_limit']}"
+            f"图片 {item['images']}\t个人额度 {limit}/{image_limit}"
         )
     if report["overrides"]:
         print("临时覆盖：")

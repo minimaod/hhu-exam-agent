@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import UUID
 
 from dotenv import dotenv_values
 
@@ -200,6 +201,7 @@ class UsageConfigState:
     model_requests: int = DEFAULT_MODEL_DAILY_LIMIT
     site_requests: int = DEFAULT_SITE_DAILY_LIMIT
     images: int = DEFAULT_IMAGE_DAILY_LIMIT
+    unlimited_owner_id: str | None = None
     error: str | None = None
 
 
@@ -220,7 +222,9 @@ def load_usage_config_state() -> UsageConfigState:
 
     source = _SettingsSource(ENV_FILE)
     try:
+        owner_id = (source.get("HHU_UNLIMITED_OWNER_ID") or "").strip()
         return UsageConfigState(
+            unlimited_owner_id=str(UUID(owner_id)) if owner_id else None,
             model_requests=_parse_limit(
                 source.get("HHU_MODEL_DAILY_LIMIT"),
                 "HHU_MODEL_DAILY_LIMIT",

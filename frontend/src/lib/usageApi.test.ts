@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  fetchUsage,
   millisecondsUntilReset,
   parseQuotaInfo,
   quotaBlocksImages,
@@ -51,6 +52,19 @@ test("额度耗尽判断区分模型与图片", () => {
   assert.equal(quotaBlocksRequests(siteOnly), true);
   assert.equal(quotaBlocksImages(siteOnly), false);
   assert.equal(quotaReason(siteOnly), "全站今天的模型请求额度已用完");
+});
+
+test("管理员不限额并保留已用量", async (context) => {
+  const unlimited: UsageSnapshot = {
+    ...usage,
+    requests: { limit: null, used: 125, remaining: null },
+    images: { limit: null, used: 20, remaining: null },
+  };
+  context.mock.method(globalThis, "fetch", async () => Response.json(unlimited));
+  assert.deepEqual(await fetchUsage(), unlimited);
+  assert.equal(quotaBlocksRequests(unlimited), false);
+  assert.equal(quotaBlocksImages(unlimited), false);
+  assert.equal(quotaReason(unlimited), null);
 });
 
 test("重置时间换算至少保留 1 秒", () => {

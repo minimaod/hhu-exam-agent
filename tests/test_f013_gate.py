@@ -66,6 +66,43 @@ def test_site_limit_blocks_other_user(tmp_path: Path) -> None:
     assert caught.value.scope == "site"
 
 
+def test_unlimited_account_is_metered_separately(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    gate = UsageGate(db, limits=UsageLimits(2, 1, 1), unlimited_owner_id="u1")
+    for _ in range(3):
+        gate.ensure_available("u1")
+        gate.acquire_model_request("u1")
+    assert gate.snapshot("u2")["site_exhausted"] is False
+
+    gate.acquire_model_request("u2")
+    with pytest.raises(ModelQuotaExceeded) as error:
+        gate.ensure_available("u2")
+    assert error.value.scope == "site"
+    with pytest.raises(ModelQuotaExceeded):
+        gate.acquire_model_request("u2")
+    gate.ensure_available("u1")
+    gate.acquire_model_request("u1")
+
+    with sqlite3.connect(db) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        gate.check_and_insert_image(connection, "u1")
+        gate.check_and_insert_image(connection, "u1")
+        gate.check_and_insert_image(connection, "u2")
+        with pytest.raises(ImageQuotaExceeded):
+            gate.check_and_insert_image(connection, "u2")
+
+    snapshot = gate.snapshot("u1")
+    assert snapshot["requests"] == {"limit": None, "used": 4, "remaining": None}
+    assert snapshot["images"] == {"limit": None, "used": 2, "remaining": None}
+    assert snapshot["site_exhausted"] is False
+    assert gate.snapshot("u2")["site_exhausted"] is True
+    assert gate.report()["site"] == {
+        "model_requests": {"used": 1, "limit": 1, "remaining": 0},
+        "unlimited_model_requests": 4,
+        "images": 3,
+    }
+
+
 def test_override_and_expiry(tmp_path: Path) -> None:
     db = _db(tmp_path)
     gate = _gate(db, user=2)

@@ -11,20 +11,18 @@ export type QuotaInfo = {
   reset_at: string;
 };
 
+type DailyUsage = {
+  limit: number | null;
+  used: number;
+  remaining: number | null;
+};
+
 export type UsageSnapshot = {
   date: string;
   reset_at: string;
-  requests: {
-    limit: number;
-    used: number;
-    remaining: number;
-  };
+  requests: DailyUsage;
   site_exhausted: boolean;
-  images: {
-    limit: number;
-    used: number;
-    remaining: number;
-  };
+  images: DailyUsage;
   active_turn: boolean;
 };
 
@@ -62,21 +60,28 @@ export function parseQuotaInfo(value: unknown): QuotaInfo | null {
   };
 }
 
+function parseDailyUsage(value: unknown): DailyUsage | null {
+  if (!isRecord(value) || typeof value.used !== "number") return null;
+  const { limit, used, remaining } = value;
+  if (
+    (typeof limit === "number" && typeof remaining === "number") ||
+    (limit === null && remaining === null)
+  ) {
+    return { limit, used, remaining };
+  }
+  return null;
+}
+
 function parseUsage(payload: unknown): UsageSnapshot {
-  if (!isRecord(payload) || !isRecord(payload.requests) || !isRecord(payload.images)) {
+  if (!isRecord(payload)) {
     throw new Error("后端返回的用量格式不符合约定。");
   }
-  const requests = payload.requests;
-  const images = payload.images;
+  const requests = parseDailyUsage(payload.requests);
+  const images = parseDailyUsage(payload.images);
   if (
     typeof payload.date !== "string" ||
     typeof payload.reset_at !== "string" ||
-    typeof requests.limit !== "number" ||
-    typeof requests.used !== "number" ||
-    typeof requests.remaining !== "number" ||
-    typeof images.limit !== "number" ||
-    typeof images.used !== "number" ||
-    typeof images.remaining !== "number" ||
+    !requests || !images ||
     typeof payload.site_exhausted !== "boolean" ||
     typeof payload.active_turn !== "boolean"
   ) {
@@ -85,17 +90,9 @@ function parseUsage(payload: unknown): UsageSnapshot {
   return {
     date: payload.date,
     reset_at: payload.reset_at,
-    requests: {
-      limit: requests.limit,
-      used: requests.used,
-      remaining: requests.remaining,
-    },
+    requests,
     site_exhausted: payload.site_exhausted,
-    images: {
-      limit: images.limit,
-      used: images.used,
-      remaining: images.remaining,
-    },
+    images,
     active_turn: payload.active_turn,
   };
 }
@@ -163,16 +160,16 @@ export function formatResetTime(resetAt: string): string {
 
 export function quotaBlocksRequests(usage: UsageSnapshot | null): boolean {
   return Boolean(
-    usage && (usage.requests.remaining <= 0 || usage.site_exhausted),
+    usage && ((usage.requests.remaining !== null && usage.requests.remaining <= 0) || usage.site_exhausted),
   );
 }
 
 export function quotaBlocksImages(usage: UsageSnapshot | null): boolean {
-  return Boolean(usage && usage.images.remaining <= 0);
+  return Boolean(usage && usage.images.remaining !== null && usage.images.remaining <= 0);
 }
 
 export function quotaReason(usage: UsageSnapshot): string | null {
-  if (usage.requests.remaining <= 0) {
+  if (usage.requests.remaining !== null && usage.requests.remaining <= 0) {
     return `你今天的 ${usage.requests.limit} 次模型请求已用完`;
   }
   if (usage.site_exhausted) {

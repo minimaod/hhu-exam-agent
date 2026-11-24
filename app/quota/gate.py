@@ -51,9 +51,11 @@ class UsageGate:
         *,
         limits: UsageLimits,
         now_fn: Callable[[], datetime] | None = None,
+        unlimited_owner_id: str | None = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._limits = limits
+        self._unlimited_owner_id = unlimited_owner_id
         self._now = now_fn or (lambda: datetime.now(timezone.utc))
 
     # ------------------------------------------------------------------
@@ -106,39 +108,35 @@ class UsageGate:
         """只读预检；真正的封顶仍由 acquire_model_request 的事务决定。"""
 
         now = self._now()
-        day = beijing_day(now)
         connection = self._open()
         try:
-            user_limit = self._user_limit(connection, owner_id, day.isoformat())
-            user_used = self._count(
-                connection, "owner_id = ? AND usage_date = ?", (owner_id, day.isoformat())
-            )
-            site_used = self._count(
-                connection, "usage_date = ?", (day.isoformat(),)
-            )
-            self._raise_if_exceeded(
-                "user" if user_used >= user_limit else None,
-                user_limit,
-                user_used,
-                now,
-            )
-            self._raise_if_exceeded(
-                "site" if site_used >= self._limits.site_requests else None,
-                self._limits.site_requests,
-                site_used,
-                now,
-            )
+            self._check_model_limits(connection, owner_id, beijing_day(now).isoformat(), now)
         except sqlite3.Error as exc:
             raise QuotaStorageError() from exc
         finally:
             connection.close()
 
-    @staticmethod
-    def _raise_if_exceeded(
-        scope: str | None, limit: int, used: int, now: datetime
+    def _check_model_limits(
+        self, connection: sqlite3.Connection, owner_id: str, day: str, now: datetime
     ) -> None:
-        if scope is not None:
-            raise ModelQuotaExceeded(scope, limit, used, next_reset_at(now))
+        if owner_id == self._unlimited_owner_id:
+            return
+        user_limit = self._user_limit(connection, owner_id, day)
+        user_used = self._count(
+            connection, "owner_id = ? AND usage_date = ?", (owner_id, day)
+        )
+        if user_used >= user_limit:
+            raise ModelQuotaExceeded("user", user_limit, user_used, next_reset_at(now))
+        site_limit = self._limits.site_requests
+        site_used = self._site_count(connection, day)
+        if site_used >= site_limit:
+            raise ModelQuotaExceeded("site", site_limit, site_used, next_reset_at(now))
+
+    def _site_count(self, connection: sqlite3.Connection, day: str) -> int:
+        owner_id = self._unlimited_owner_id
+        return self._count(
+            connection, "usage_date = ? AND (? IS NULL OR owner_id <> ?)", (day, owner_id, owner_id)
+        )
 
     @staticmethod
     def _count(
@@ -167,19 +165,7 @@ class UsageGate:
             # 避免用前一天已满的额度拒绝新一天的第一条请求。
             now = self._now()
             day = beijing_day(now).isoformat()
-            user_limit = self._user_limit(connection, owner_id, day)
-            user_used = self._count(
-                connection, "owner_id = ? AND usage_date = ?", (owner_id, day)
-            )
-            site_used = self._count(connection, "usage_date = ?", (day,))
-            self._raise_if_exceeded("user" if user_used >= user_limit else None,
-                                    user_limit, user_used, now)
-            self._raise_if_exceeded(
-                "site" if site_used >= self._limits.site_requests else None,
-                self._limits.site_requests,
-                site_used,
-                now,
-            )
+            self._check_model_limits(connection, owner_id, day, now)
             connection.execute(
                 """
                 INSERT INTO model_usage_events (
@@ -218,15 +204,16 @@ class UsageGate:
 
         now = self._now()
         day = beijing_day(now).isoformat()
-        limit = self._user_image_limit(connection, owner_id, day)
-        row = connection.execute(
-            "SELECT COUNT(*) FROM model_usage_events "
-            "WHERE kind = 'image_upload' AND owner_id = ? AND usage_date = ?",
-            (owner_id, day),
-        ).fetchone()
-        used = int(row[0]) if row is not None else 0
-        if used >= limit:
-            raise ImageQuotaExceeded(limit, used, next_reset_at(now))
+        if owner_id != self._unlimited_owner_id:
+            limit = self._user_image_limit(connection, owner_id, day)
+            row = connection.execute(
+                "SELECT COUNT(*) FROM model_usage_events "
+                "WHERE kind = 'image_upload' AND owner_id = ? AND usage_date = ?",
+                (owner_id, day),
+            ).fetchone()
+            used = int(row[0]) if row is not None else 0
+            if used >= limit:
+                raise ImageQuotaExceeded(limit, used, next_reset_at(now))
         connection.execute(
             """
             INSERT INTO model_usage_events (
@@ -244,12 +231,13 @@ class UsageGate:
         day = beijing_day(now).isoformat()
         connection = self._open()
         try:
-            user_limit = self._user_limit(connection, owner_id, day)
-            image_limit = self._user_image_limit(connection, owner_id, day)
+            unlimited = owner_id == self._unlimited_owner_id
+            user_limit = None if unlimited else self._user_limit(connection, owner_id, day)
+            image_limit = None if unlimited else self._user_image_limit(connection, owner_id, day)
             user_used = self._count(
                 connection, "owner_id = ? AND usage_date = ?", (owner_id, day)
             )
-            site_used = self._count(connection, "usage_date = ?", (day,))
+            site_exhausted = not unlimited and self._site_count(connection, day) >= self._limits.site_requests
             image_row = connection.execute(
                 "SELECT COUNT(*) FROM model_usage_events "
                 "WHERE kind = 'image_upload' AND owner_id = ? AND usage_date = ?",
@@ -270,13 +258,13 @@ class UsageGate:
             "requests": {
                 "limit": user_limit,
                 "used": user_used,
-                "remaining": max(0, user_limit - user_used),
+                "remaining": None if user_limit is None else max(0, user_limit - user_used),
             },
-            "site_exhausted": site_used >= self._limits.site_requests,
+            "site_exhausted": site_exhausted,
             "images": {
                 "limit": image_limit,
                 "used": image_used,
-                "remaining": max(0, image_limit - image_used),
+                "remaining": None if image_limit is None else max(0, image_limit - image_used),
             },
             "active_turn": active is not None,
         }
@@ -311,7 +299,9 @@ class UsageGate:
                 str(row["owner_id"]), {"model_request": 0, "image_upload": 0}
             )
             bucket[str(row["kind"])] = int(row["used"])
-        site_models = sum(item["model_request"] for item in users.values())
+        total_models = sum(item["model_request"] for item in users.values())
+        unlimited_models = users.get(self._unlimited_owner_id or "", {}).get("model_request", 0)
+        site_models = total_models - unlimited_models
         site_images = sum(item["image_upload"] for item in users.values())
         return {
             "date": target,
@@ -322,6 +312,7 @@ class UsageGate:
                     "limit": self._limits.site_requests,
                     "remaining": max(0, self._limits.site_requests - site_models),
                 },
+                "unlimited_model_requests": unlimited_models,
                 "images": site_images,
             },
             "users": [
@@ -329,8 +320,8 @@ class UsageGate:
                     "owner_id": owner_id,
                     "model_requests": item["model_request"],
                     "images": item["image_upload"],
-                    "limit": self._limits.model_requests,
-                    "image_limit": self._limits.images,
+                    "limit": None if owner_id == self._unlimited_owner_id else self._limits.model_requests,
+                    "image_limit": None if owner_id == self._unlimited_owner_id else self._limits.images,
                 }
                 for owner_id, item in sorted(users.items())
             ],
