@@ -54,7 +54,7 @@ test("首次访问停留在封面，点击登录才显示表单", async () => {
 
   expect(screen.getByRole("heading", { name: coverHeading })).toBeTruthy();
   expect(screen.getByRole("link", { name: filingNumber }).getAttribute("href")).toBe("https://beian.miit.gov.cn/");
-  expect(screen.getByRole("link", { name: "隐私与资料说明" }).getAttribute("href")).toBe("/service-info.html");
+  expect(screen.getByRole("link", { name: "隐私说明" }).getAttribute("href")).toBe("/service-info.html");
   expect(screen.getByRole("img", { name: "河海大学校徽" }).getAttribute("src")).toContain("hhu-emblem.png");
   await act(async () => { vi.advanceTimersByTime(10_000); });
   expect(screen.getByRole("heading", { name: coverHeading })).toBeTruthy();
@@ -145,7 +145,7 @@ test("直接打开 /register 跳过封面，且可以进入试卷库", async () 
   fireEvent.click(screen.getByRole("button", { name: "访客进入试卷库" }));
   expect(screen.queryByRole("heading", { name: "用邀请码注册" })).toBeNull();
   expect(screen.getByRole("link", { name: filingNumber })).toBeTruthy();
-  expect(screen.getByRole("link", { name: "隐私与资料说明" }).getAttribute("href")).toBe("/service-info.html");
+  expect(screen.getByRole("link", { name: "隐私说明" }).getAttribute("href")).toBe("/service-info.html");
   expect(screen.getByText("已登记的试卷")).toBeTruthy();
   expect(window.location.pathname).toBe("/");
 });

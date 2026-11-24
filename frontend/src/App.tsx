@@ -114,7 +114,7 @@ function SiteFooterLinks() {
       <a className="site-filing-link" href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer">
         湘ICP备2026055716号-1
       </a>
-      <a className="site-filing-link" href="/service-info.html">隐私与资料说明</a>
+      <a className="site-filing-link" href="/service-info.html">隐私说明</a>
     </div>
   );
 }
