@@ -260,7 +260,7 @@ class MaterialService:
     async def _ensure_pages_parsed(
         self, material_id: str, stored_name: str, start_page: int, end_page: int
     ) -> list[ParsedPage]:
-        cached = self._repo.get_cached_pages(material_id, start_page, end_page)
+        cached = self._repo.get_cached_pages(material_id, start_page, end_page, fresh_pdf_text=True)
         expected = list(range(start_page, end_page + 1))
         if len(cached) != len(expected):
             pdf_path = resolve_material_pdf(self._materials_root, stored_name)

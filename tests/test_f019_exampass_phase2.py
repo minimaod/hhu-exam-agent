@@ -449,6 +449,61 @@ def test_chapter_quiz_batches_cover_large_outline_and_retry_only_the_failed_batc
     assert f"batch=3/5 attempt=1 reason={reason}" in caplog.text
 
 
+@pytest.mark.parametrize("truncated_stage", ["draft", "review"])
+def test_notes_splits_only_truncated_batch_in_original_order(truncated_stage: str) -> None:
+    import asyncio
+    import json
+
+    import httpx
+
+    from app.config import DeepSeekSettings
+    from app.materials.exampass_llm import DeepSeekExamPassGenerator
+
+    chapters = [
+        {"label": "模块", "kcs": [{"id": f"kc.{i}", "source_refs": ["1"]} for i in range(1, 5)]},
+        {"label": "后续模块", "kcs": [{"id": "kc.5", "source_refs": ["1"]}]},
+    ]
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompt = json.loads(request.content)["messages"][1]["content"]
+        stage = "review" if prompt.startswith("本批知识骨架：") else "draft"
+        batch = json.loads(prompt.split("\n", 1)[1].split("\n\n", 1)[0])
+        ids = [entry["id"] for entry in batch["chapters"][0]["kcs"]]
+        calls.append((stage, ids))
+        finish_reason = "length" if stage == truncated_stage and len(ids) > 2 else "stop"
+        html = "".join(f'<h3 data-kc="{kc_id}">{kc_id}</h3><p>正文</p>' for kc_id in ids)
+        return httpx.Response(200, json={
+            "id": "notes-test",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": html},
+                         "finish_reason": finish_reason}],
+        })
+
+    async def generate() -> str:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            generator = DeepSeekExamPassGenerator(
+                DeepSeekSettings("test-key", "https://mock.deepseek.local", "deepseek-chat"),
+                http_async_client=client,
+            )
+            return await generator.generate_notes(
+                display_name="讲义.pdf", start_page=1, end_page=1,
+                skeleton={"chapters": chapters}, pages=[_analyze_page_text(1, "资料正文")],
+            )
+
+    html = asyncio.run(generate())
+    first = ["kc.1", "kc.2", "kc.3", "kc.4"]
+    expected = [("draft", first)]
+    if truncated_stage == "review":
+        expected.append(("review", first))
+    expected.extend((stage, ids) for ids in [first[:2], first[2:], ["kc.5"]] for stage in ["draft", "review"])
+    assert calls == expected
+    assert html.count("data-kc=") == 5
+    assert [html.index(f'data-kc="kc.{i}"') for i in range(1, 6)] == sorted(
+        html.index(f'data-kc="kc.{i}"') for i in range(1, 6)
+    )
+
+
 def test_exampass_multistep_generation_and_checkpoint_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -45,7 +45,7 @@ from app.materials.ocr import (
     OCR_EXCLUDED_PREFIX, OCR_FAILED_VERSION, OCR_PAGE_VERSION,
     ExcludedOcrPage, FailedOcrPage, OcrPage, page_parser_version, page_status,
 )
-from app.materials.pdf_parser import PARSER_VERSION, ParsedPage
+from app.materials.pdf_parser import PARSER_VERSION, PDF_TEXT_CACHE_VERSION, ParsedPage
 
 CONNECT_TIMEOUT_SECONDS = 5.0
 
@@ -309,6 +309,7 @@ class MaterialRepository:
             if row is None:
                 raise MaterialNotFoundError("个人资料不存在或正在删除。")
             for page in pages:
+                version = page_parser_version(page)
                 conn.execute(
                     """
                     INSERT INTO personal_material_pages (
@@ -323,7 +324,7 @@ class MaterialRepository:
                         garbled_ratio = excluded.garbled_ratio,
                         formula_warning = excluded.formula_warning,
                         parser_version = excluded.parser_version
-                    WHERE excluded.parser_version != ? OR personal_material_pages.parser_version = ?
+                    WHERE excluded.parser_version != ? OR personal_material_pages.parser_version IN (?, ?)
                     """,
                     (
                         material_id,
@@ -333,10 +334,11 @@ class MaterialRepository:
                         1 if page.scanned_suspect else 0,
                         page.garbled_ratio,
                         1 if page.formula_warning else 0,
-                        page_parser_version(page),
+                        PDF_TEXT_CACHE_VERSION if version == PARSER_VERSION else version,
                         now,
+                        PDF_TEXT_CACHE_VERSION,
                         PARSER_VERSION,
-                        PARSER_VERSION,
+                        PDF_TEXT_CACHE_VERSION,
                     ),
                 )
 
@@ -373,20 +375,20 @@ class MaterialRepository:
                 WHERE current.material_id = ?
                   AND current.page_no = previous.page_no AND previous.preference = 1
                   AND (current.parser_version = ? OR (
-                      current.parser_version = ?
+                      current.parser_version IN (?, ?)
                       AND (current.scanned_suspect OR current.garbled_ratio > 0.15)
                   ))
                 """,
                 (
                     material_id, self._owner_id, start_page, end_page,
                     OCR_PAGE_VERSION, OCR_EXCLUDED_PREFIX + "%", material_id,
-                    OCR_FAILED_VERSION, PARSER_VERSION,
+                    OCR_FAILED_VERSION, PARSER_VERSION, PDF_TEXT_CACHE_VERSION,
                 ),
             )
             return int(conn.execute("SELECT changes()").fetchone()[0])
 
     def get_cached_pages(
-        self, material_id: str, start_page: int, end_page: int
+        self, material_id: str, start_page: int, end_page: int, *, fresh_pdf_text: bool = False
     ) -> dict[int, ParsedPage]:
         with self._read() as conn:
             rows = conn.execute(
@@ -396,9 +398,10 @@ class MaterialRepository:
                 JOIN personal_materials m ON m.id = p.material_id
                 WHERE p.material_id = ? AND m.owner_id = ? AND m.status = 'active'
                   AND p.page_no BETWEEN ? AND ?
+                  AND (NOT ? OR p.parser_version != ?)
                 ORDER BY p.page_no ASC
                 """,
-                (material_id, self._owner_id, start_page, end_page),
+                (material_id, self._owner_id, start_page, end_page, fresh_pdf_text, PARSER_VERSION),
             ).fetchall()
             pages: dict[int, ParsedPage] = {}
             for r in rows:

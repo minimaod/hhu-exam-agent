@@ -273,6 +273,64 @@ def test_material_full_lifecycle_preview_isolation_and_delete(
         assert client_a.get(f"/api/conversations/{conv_id}").status_code == 404
 
 
+def test_readability_refreshes_legacy_pdf_text_without_overwriting_ocr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.materials import service as mat_service
+    from app.materials.ocr import OCR_PAGE_VERSION
+    from app.materials.pdf_parser import PARSER_VERSION, PDF_TEXT_CACHE_VERSION
+
+    db_path, _, _ = _setup_env(tmp_path, monkeypatch)
+    read_pdfs = []
+    real_parse = mat_service.run_isolated_pdf_parse
+
+    def track_parse(*args, **kwargs):
+        read_pdfs.append((kwargs.get("start_page"), kwargs.get("end_page")))
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(mat_service, "run_isolated_pdf_parse", track_parse)
+    original = "Stokes theorem relates a surface integral to a line integral over the boundary."
+    recognized = "视觉识别的正文，包含公式、边界和解题步骤。"
+    with TestClient(app) as client:
+        _register_and_login(client, db_path, "alice")
+        pdf = _make_simple_pdf([original, "PDF text superseded by OCR."])
+        response = client.post("/api/materials/pdfs", files={"file": ("legacy.pdf", pdf, "application/pdf")},
+                               headers=TEST_CSRF_HEADERS)
+        assert response.status_code == 201
+        material_id = response.json()["id"]
+        readability_url = f"/api/materials/pdfs/{material_id}/readability"
+        params = {"start_page": 1, "end_page": 2}
+        first = client.post(readability_url, json=params, headers=TEST_CSRF_HEADERS)
+        assert first.status_code == 200
+        with sqlite3.connect(db_path) as conn:
+            conn.executemany(
+                """
+                UPDATE personal_material_pages
+                SET extracted_text = ?, char_count = ?, parser_version = ?
+                WHERE material_id = ? AND page_no = ?
+                """,
+                [
+                    ("ᅣҀԉҋਘ", 5, PARSER_VERSION, material_id, 1),
+                    (recognized, len(recognized), OCR_PAGE_VERSION, material_id, 2),
+                ],
+            )
+
+        for _ in range(2):
+            response = client.post(readability_url, json=params, headers=TEST_CSRF_HEADERS)
+            assert response.status_code == 200
+
+        assert read_pdfs.count((1, 2)) == 2
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT extracted_text, parser_version FROM personal_material_pages "
+                "WHERE material_id = ? ORDER BY page_no", (material_id,),
+            ).fetchall()
+        assert [(content.strip(), version) for content, version in rows] == [
+            (original, PDF_TEXT_CACHE_VERSION),
+            (recognized, OCR_PAGE_VERSION),
+        ]
+
+
 def test_guide_failure_recovery_concurrency_and_late_write_rejection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -16,7 +16,8 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from app.materials.errors import (
@@ -26,7 +27,9 @@ from app.materials.errors import (
 )
 from app.materials.models import PageReadability, ReadabilityReport
 
+# 保留正文来源标识。缓存版本单独升级，重读后正文未变的成果仍可复用。
 PARSER_VERSION = "pypdf-v1"
+PDF_TEXT_CACHE_VERSION = "pypdf-v2"
 MAX_PAGE_TEXT_CHARS = 50_000
 MAX_WORKER_STDOUT_BYTES = 12 * 1024 * 1024
 MAX_WORKER_MEMORY_BYTES = 512 * 1024 * 1024
@@ -38,6 +41,7 @@ _MIN_SUFFICIENT_CHARS = 120
 
 _FORMULA_FRAGMENT_RE = re.compile(r"(?:\b[a-zA-Z]\s+){5,}")
 _REPLACEMENT_RUN_RE = re.compile(r"[\ufffd□■]{2,}")
+_HAN_RE = re.compile(r"[\u3400-\u9fff\U00020000-\U000323af]")
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,22 @@ def _analyze_page_text(page_no: int, raw_text: str) -> ParsedPage:
     )
 
 
+def _has_unmapped_identity_font(page) -> bool:
+    resources = page.get("/Resources")
+    fonts = resources.get_object().get("/Font") if resources else None
+    if not fonts:
+        return False
+    for reference in fonts.get_object().values():
+        font = reference.get_object()
+        if (
+            font.get("/Subtype") == "/Type0"
+            and font.get("/Encoding") in ("/Identity-H", "/Identity-V")
+            and not font.get("/ToUnicode")
+        ):
+            return True
+    return False
+
+
 def _extract_in_worker(
     pdf_path: Path,
     *,
@@ -141,22 +161,42 @@ def _extract_in_worker(
     if start_page is not None and end_page is not None:
         s = max(1, start_page)
         e = min(total_pages, end_page)
-        for pno in range(s, e + 1):
-            try:
-                raw = reader.pages[pno - 1].extract_text() or ""
-            except Exception:
-                raw = ""
-            analyzed = _analyze_page_text(pno, raw)
-            pages_out.append(
-                {
-                    "page_no": analyzed.page_no,
-                    "extracted_text": analyzed.extracted_text,
-                    "char_count": analyzed.char_count,
-                    "scanned_suspect": analyzed.scanned_suspect,
-                    "garbled_ratio": analyzed.garbled_ratio,
-                    "formula_warning": analyzed.formula_warning,
-                }
-            )
+        with ExitStack() as stack:
+            alternate_pdf = None
+            for pno in range(s, e + 1):
+                page = reader.pages[pno - 1]
+                try:
+                    raw = page.extract_text() or ""
+                except Exception:
+                    raw = ""
+                analyzed = _analyze_page_text(pno, raw)
+                try:
+                    if _has_unmapped_identity_font(page):
+                        if alternate_pdf is None:
+                            import pymupdf
+
+                            alternate_pdf = stack.enter_context(pymupdf.open(pdf_path))
+                        alternate = _analyze_page_text(pno, alternate_pdf[pno - 1].get_text())
+                        if (
+                            not alternate.scanned_suspect
+                            and alternate.garbled_ratio <= _GARBLED_RATIO_THRESHOLD
+                            and len(_HAN_RE.findall(alternate.extracted_text))
+                            > len(_HAN_RE.findall(analyzed.extracted_text))
+                        ):
+                            analyzed = replace(alternate, formula_warning=True)
+                except Exception:
+                    # 备用解析器不可用时，保留已有的文字提取结果。
+                    pass
+                pages_out.append(
+                    {
+                        "page_no": analyzed.page_no,
+                        "extracted_text": analyzed.extracted_text,
+                        "char_count": analyzed.char_count,
+                        "scanned_suspect": analyzed.scanned_suspect,
+                        "garbled_ratio": analyzed.garbled_ratio,
+                        "formula_warning": analyzed.formula_warning,
+                    }
+                )
     return {"page_count": total_pages, "pages": pages_out}
 
 

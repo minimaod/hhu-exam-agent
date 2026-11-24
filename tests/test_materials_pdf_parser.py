@@ -101,6 +101,52 @@ def test_isolated_pdf_parse_extracts_pages_and_detects_scanned(tmp_path: Path) -
     assert [p.page_no for p in report.affected_pages] == [2]
 
 
+def test_extract_chinese_with_unmapped_identity_font(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import pymupdf
+    import pypdf
+    from pypdf.generic import DictionaryObject, NameObject
+
+    from app.materials.pdf_parser import _extract_in_worker
+
+    chinese = "第一章补充材料介绍扩散方程的推导以及数学公式的适用条件与解题步骤。"
+    garbled = "ᅣҀԉҋਘඔ࿐ᅣҀԉҋਘඔ࿐ᅣҀԉҋਘඔ࿐ᅣҀԉҋਘඔ࿐"
+    latin = "Stokes theorem relates a surface integral and its boundary."
+    font = DictionaryObject({
+        NameObject("/Subtype"): NameObject("/Type0"),
+        NameObject("/Encoding"): NameObject("/Identity-H"),
+    })
+    resources = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})})
+
+    class UnmappedPage(dict):
+        def extract_text(self):
+            return garbled
+
+    source_pages = [
+        UnmappedPage({"/Resources": resources}),
+        SimpleNamespace(get=lambda key: None, extract_text=lambda: latin),
+        UnmappedPage({"/Resources": resources}),
+    ]
+    alternate_pages = [
+        SimpleNamespace(get_text=lambda: chinese),
+        SimpleNamespace(get_text=lambda: pytest.fail("未使用无映射字体的页面不应重新提取")),
+        SimpleNamespace(get_text=lambda: ""),
+    ]
+    monkeypatch.setattr(pypdf, "PdfReader", lambda *a, **kw: SimpleNamespace(
+        is_encrypted=False, pages=source_pages
+    ))
+    monkeypatch.setattr(pymupdf, "open", lambda _path: nullcontext(alternate_pages))
+
+    result = _extract_in_worker(tmp_path / "unmapped.pdf", max_pages=3, start_page=1, end_page=3)
+
+    pages = result["pages"]
+    assert [page["extracted_text"] for page in pages] == [chinese, latin, garbled]
+    assert pages[0]["scanned_suspect"] is False
+    assert pages[0]["formula_warning"] is True
+
+
 def test_isolated_pdf_parse_rejects_too_many_pages(tmp_path: Path) -> None:
     pdf_path = tmp_path / "many.pdf"
     pdf_path.write_bytes(_make_simple_pdf(["page text"] * 5))

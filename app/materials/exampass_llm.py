@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import deque
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -36,6 +37,11 @@ _SKELETON_BATCH_PAGES = 8
 _QUIZ_BATCH_SIZE = 4
 _QUIZ_MAX_KNOWLEDGE_POINTS = 24
 _logger = logging.getLogger(__name__)
+
+
+class _NotesTruncatedError(QueryError):
+    def __init__(self) -> None:
+        super().__init__("MODEL_RESPONSE_INVALID", "笔记达到单次输出上限，请缩小页码范围后重试。")
 
 
 class _QuizOutputError(QueryError):
@@ -344,8 +350,8 @@ class DeepSeekExamPassGenerator:
 
         log_usage(tag, response)
         metadata = getattr(response, "response_metadata", None) or {}
-        if tag == "exampass_notes_review" and metadata.get("finish_reason") == "length":
-            raise QueryError("MODEL_INVALID", INVALID_MESSAGE)
+        if tag in ("exampass_notes", "exampass_notes_review") and metadata.get("finish_reason") == "length":
+            raise _NotesTruncatedError()
         if tag == "exampass_quiz":
             if metadata.get("finish_reason") == "length":
                 raise _QuizOutputError("truncated")
@@ -451,64 +457,91 @@ class DeepSeekExamPassGenerator:
             batches = [skeleton]
 
         html_parts: list[str] = []
-        available = {page.page_no for page in pages}
-        for batch in batches:
-            refs = {
-                page_no
-                for ch in batch.get("chapters", [])
-                for kc in ch.get("kcs", [])
-                for page_no in parse_source_pages(kc.get("source_refs"), end_page)
-            }
-            supplied = [page for page in pages if page.page_no in refs] or pages
-            ctx = _format_material_context(
-                display_name=display_name, start_page=start_page, end_page=end_page,
-                pages=supplied, course_hint=course_hint,
-            )
-            if on_stage is not None:
-                on_stage("notes", "生成章节笔记")
-            user_content = (
-                "请只为下方知识骨架切片中的章节与知识组件生成笔记 HTML 片段（跳过未列出的其他知识点）：\n"
-                + json.dumps(batch, ensure_ascii=False)
-                + "\n\n"
-                + ctx
-            )
-            raw = await self._invoke(
-                tag="exampass_notes",
-                system_prompt=_NOTES_SYSTEM_PROMPT,
-                user_content=user_content,
-                json_mode=False,
-                max_tokens=4500,
-            )
-            draft = sanitize_notes_html(_strip_html_fences(raw))
-            if not draft:
-                raise QueryError("MODEL_INVALID", INVALID_MESSAGE)
-            if on_stage is not None:
-                on_stage("review", "审校")
-            audited = await self._invoke(
-                tag="exampass_notes_review",
-                system_prompt=_NOTES_REVIEW_SYSTEM_PROMPT,
-                user_content=(
-                    "本批知识骨架：\n"
-                    + json.dumps(batch, ensure_ascii=False)
-                    + "\n\n"
-                    + ctx
-                    + "\n\n<untrusted_notes_draft>\n"
-                    + draft
-                    + "\n</untrusted_notes_draft>"
-                ),
-                json_mode=False,
-                max_tokens=6000,
-            )
-            part = sanitize_notes_html(_strip_html_fences(audited))
-            part = _clamp_notes_slide_refs(part, start_page, end_page, available)
-            if not part:
-                raise QueryError("MODEL_INVALID", INVALID_MESSAGE)
+        pending = deque(batches)
+        while pending:
+            batch = pending.popleft()
+            try:
+                part = await self._generate_notes_batch(
+                    batch, display_name, start_page, end_page, pages, course_hint, on_stage
+                )
+            except _NotesTruncatedError:
+                sections = batch.get("chapters") or []
+                if len(sections) != 1 or len(sections[0]["kcs"]) < 2:
+                    raise
+                section = sections[0]
+                points = section["kcs"]
+                middle = len(points) // 2
+                pending.appendleft({**batch, "chapters": [{**section, "kcs": points[middle:]}]})
+                pending.appendleft({**batch, "chapters": [{**section, "kcs": points[:middle]}]})
+                continue
             html_parts.append(part)
 
         cleaned = "\n".join(html_parts).strip()
         if not cleaned:
             raise QueryError("MODEL_INVALID", INVALID_MESSAGE)
         return cleaned
+
+    async def _generate_notes_batch(
+        self,
+        batch: dict[str, Any],
+        display_name: str,
+        start_page: int,
+        end_page: int,
+        pages: list[ParsedPage],
+        course_hint: str | None,
+        on_stage: Callable[[str, str], None] | None,
+    ) -> str:
+        refs = {
+            page_no
+            for ch in batch.get("chapters", [])
+            for kc in ch.get("kcs", [])
+            for page_no in parse_source_pages(kc.get("source_refs"), end_page)
+        }
+        supplied = [page for page in pages if page.page_no in refs] or pages
+        ctx = _format_material_context(
+            display_name=display_name, start_page=start_page, end_page=end_page,
+            pages=supplied, course_hint=course_hint,
+        )
+        if on_stage is not None:
+            on_stage("notes", "生成章节笔记")
+        user_content = (
+            "请只为下方知识骨架切片中的章节与知识组件生成笔记 HTML 片段（跳过未列出的其他知识点）：\n"
+            + json.dumps(batch, ensure_ascii=False)
+            + "\n\n"
+            + ctx
+        )
+        raw = await self._invoke(
+            tag="exampass_notes",
+            system_prompt=_NOTES_SYSTEM_PROMPT,
+            user_content=user_content,
+            json_mode=False,
+            max_tokens=4500,
+        )
+        draft = sanitize_notes_html(_strip_html_fences(raw))
+        if not draft:
+            raise QueryError("MODEL_INVALID", INVALID_MESSAGE)
+        if on_stage is not None:
+            on_stage("review", "审校")
+        audited = await self._invoke(
+            tag="exampass_notes_review",
+            system_prompt=_NOTES_REVIEW_SYSTEM_PROMPT,
+            user_content=(
+                "本批知识骨架：\n"
+                + json.dumps(batch, ensure_ascii=False)
+                + "\n\n"
+                + ctx
+                + "\n\n<untrusted_notes_draft>\n"
+                + draft
+                + "\n</untrusted_notes_draft>"
+            ),
+            json_mode=False,
+            max_tokens=6000,
+        )
+        part = sanitize_notes_html(_strip_html_fences(audited))
+        part = _clamp_notes_slide_refs(part, start_page, end_page, {page.page_no for page in pages})
+        if not part:
+            raise QueryError("MODEL_INVALID", INVALID_MESSAGE)
+        return part
 
     async def generate_questions(
         self,
