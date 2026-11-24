@@ -1,66 +1,48 @@
 # 河海大学考试复习助手
 
-面向河海大学学生的本地 AI 全栈应用：通过自然语言查找真实试卷、学习 Python 真题、获取图文辅导，并保存练习、错题和学习记忆。
+面向河海大学学生的复习工具。可以查找和下载历年试卷，也可以围绕真题、题目截图和自己的 PDF 资料开展复习。
 
-项目地址：[minimaod/hhu-exam-agent](https://github.com/minimaod/hhu-exam-agent)。
+**公网邀请内测已开放。** 访客可直接进入试卷库，按课程和考试类型查找、下载原卷。注册需要一次性邀请码。 [打开复习助手](https://hhu-exam.online/)
 
-**当前为本地原型，尚未部署在线服务。** 截至 2026-11-07，F010 A–D 已完成技术收尾，统一用户体验验收待完成；F010 改动尚未提交和推送。
+## 在线版能做什么
 
-## 能做什么
-
-| 能力 | 当前范围 |
+| 功能 | 使用方式 |
 | --- | --- |
-| 查卷与下载 | 按课程和考试类型查询真实目录，按登记 ID 下载本地 PDF |
-| Python 真题 | 按内容检索、按卷和题型浏览、定位题号、回看来源与按需查看答案 |
-| 图文辅导 | 输入文字、上传或粘贴题图，讲解、追问和纠正题目 |
-| 类似题练习 | 按需生成练习，保存作答、评价、补充与订正 |
-| 错题与会话 | 主动保存错题，恢复历史会话和已保存操作 |
-| 学习记忆 | 跨会话查看学习证据与复习建议，支持纠正和持续移除 |
+| 历年试卷 | 访客可浏览 13 门课程的 162 份试卷，并下载 PDF |
+| 真题检索 | 登录后可检索 1,573 道已审核题目，查看题目出处 |
+| 图文辅导与练习 | 输入题目或上传题图，请助手给提示、讲解或生成类似题，提交作答后查看反馈 |
+| 错题与学习记忆 | 保存错题、回看历史会话，查看和纠正学习记忆 |
+| 个人资料复习 | 上传 PDF，识别扫描页文字，在复习工作台查看笔记、知识图谱和自测 |
 
-例如，在同一会话中先说“我要复习 Python”，再要求“找一道循环选择真题”。选题后可以继续“只给提示”“讲解这道题”“保存这题，再来一道类似题”。
+可以从“我要复习高数”开始。登录后也可以试试“找一道 Python 循环选择真题，先给提示”，找到题目后继续追问或做一道类似题。真题可以回看出处，生成的练习会单独呈现。遇到公式识别或计算结果有疑问时，可以对照原页核对。
 
-目录现有 **13 门课程、162 条记录**，见 [catalog.json](data/papers/catalog.json)。本地 Python 题库有 **1152 道已批准发布题**，另 2 道异常题隔离；其余课程目前以试卷目录与下载为主。AI 生成的类似题不作为原卷真题。
+资料来源和下架联系渠道见站内「资料说明」。试卷目录或题目有误时，可以在 GitHub 提交更正依据。 [提交反馈](https://github.com/minimaod/hhu-exam-agent/issues/new)
 
-## 技术与结构
+## 仓库与在线版
 
-- 前端：React、TypeScript、Vite、Tailwind CSS。
-- 后端：Python 3.12、FastAPI、Pydantic、SQLite。
-- Agent：LangGraph、DeepSeek 原生工具调用。
-- 真题检索：SQLite 事实库、BM25、本地 BGE 向量与 Qdrant、RRF 融合排序。
+GitHub `main` 当前保留 F010 代码基线，包含试卷目录、Python 真题检索、图文辅导、类似题练习、错题和学习记忆。上面的邀请码注册、个人 PDF OCR 和复习工作台来自更新的线上内测版本。以下本地启动步骤适用于 GitHub `main`。
 
-```mermaid
-flowchart LR
-    UI["React 页面"] <-->|"HTTP / SSE"| API["FastAPI 与会话服务"]
-    API --> Agent["单 Agent：决策与终局回复"]
-    Agent <-->|"调用与真实结果"| Tools["业务工具与授权校验"]
-    Tools --> Data["试卷 / 题库 / 学习库"]
-    Agent <--> Model["DeepSeek API"]
-```
+## 技术架构
 
-模型选择下一步，程序校验目标、版本与操作条件并执行业务。终局正文由同一调度器生成，仍可能额外调用一次模型。浏览器不持有模型密钥，也不直接访问数据库或磁盘。Qdrant 使用本地存储模式，无需另启服务器。
+- 前端使用 React、TypeScript、Vite 和 Tailwind CSS，接收 SSE 流式回复。
+- 后端使用 Python、FastAPI 和 SQLite，负责试卷下载、会话和学习数据。
+- 会话使用 LangGraph 调度，DeepSeek 根据用户请求选择工具，后端校验参数和操作权限，再执行查询或保存。
+- 题库使用 SQLite 保存题目和来源，结合 BM25、本地 BGE 向量和 Qdrant 检索，通过 RRF 融合排序。Qdrant 使用本地存储。
+
+一次真题请求从网页进入 FastAPI。Agent 选择检索工具，工具从题库读取已登记的题目和出处，后端再把回复和题目卡片流式发给网页。
 
 ## 本地运行
 
-环境：Python 3.12、Node.js 24、uv、pnpm。依赖分别由 [uv.lock](uv.lock) 和 [pnpm-lock.yaml](frontend/pnpm-lock.yaml) 锁定。
+准备 Python 3.12、Node.js 24、uv 和 pnpm。把 [.env.example](.env.example) 复制为根目录的 `.env`，在其中配置 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL`。密钥保存在本地后端配置中。
 
-先将 [.env.example](.env.example) 复制为项目根目录的 `.env`，填写自己的配置：
-
-```dotenv
-DEEPSEEK_API_KEY=your-api-key-here
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-flash
-```
-
-模型名以本地配置为准。环境变量优先，修改配置后重启后端；真实密钥不要放入前端或提交到仓库。
-
-在项目根目录启动后端：
+在项目根目录启动后端。
 
 ```powershell
 uv sync
 uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-另开终端启动前端：
+另开一个终端，从项目根目录启动前端。
 
 ```powershell
 cd frontend
@@ -68,37 +50,19 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-打开 [本地页面](http://127.0.0.1:5173)；接口说明见 [OpenAPI](http://127.0.0.1:8000/docs)。Vite 将 `/api` 转发到后端 8000 端口，这只是开发配置。
+Vite 会将 `/api` 请求转发到本地后端。 [本地页面](http://127.0.0.1:5173) · [OpenAPI 文档](http://127.0.0.1:8000/docs)
 
-### 数据准备
+### 本地数据
 
-| 运行范围 | 所需资料 |
+| 使用场景 | 数据要求 |
 | --- | --- |
-| 查询目录 | 仓库自带的 `data/papers/catalog.json` |
-| 下载原卷 | 按目录 `file_path` 准备对应 PDF；缺文件时返回 404 |
-| 图文辅导与练习 | 有效模型配置，以及用户提供的题目材料 |
-| Python 真题 | 已构建并审核发布的题库、索引、模型缓存和匹配的来源 PDF |
+| 查询试卷目录 | 仓库自带 [试卷目录](data/papers/catalog.json) |
+| 下载试卷 | 按目录中的 `file_path` 准备对应 PDF |
+| 检索 Python 真题并回看出处 | 另行准备已审核题库、检索索引、模型缓存和对应的原卷 PDF |
+| 图文辅导及练习 | 配置可用的模型，并输入题目或上传题图 |
 
-**克隆源码不会获得 PDF 或本地题库，只补 PDF 也不会自动生成已审核题目。** 题库工具位于 [tools/question_bank](tools/question_bank)，准备流程为抽取、校订审核、构建校验和发布。
+本地学习库默认为 `data/local/study.sqlite3`，附件位于 `data/local/attachments`。可用 `HHU_STUDY_DB` 和 `HHU_QB_ROOT` 指向独立的学习库和题库。题库的抽取、审核、构建和发布脚本位于 [tools/question_bank](tools/question_bank)。
 
-学习库默认为 `data/local/study.sqlite3`，图片在 `data/local/attachments`，题库在 `data/local/question-bank`。可通过进程环境变量 `HHU_STUDY_DB`、`HHU_QB_ROOT` 指向独立数据。学习库当前为 v6，兼容旧库逐级迁移；升级前备份数据库与附件。不要用删除整个 `data/local` 的方式重置学习记录。
+### 开发检查
 
-## 验证与当前限制
-
-2026-11-07 收尾记录：后端完整回归 **993 passed**、离线外连 0；前端类型检查与构建通过；48 例新接口契约对照 **93/96**。新契约成绩与旧冻结脚本诊断分别计分，不能互相替代。本次文档整理未重跑这些测试。
-
-- 相对学年筛选仍有已知失败；服务器取消链、前端刷新回执仍缺完整证据。
-- 实模 S2 部分通过，未取得目标题 ID；S4 缺陷经专项复验关闭，不代表所有自然表达均已验证。
-- 当前没有多用户登录与隔离、复习日历、每日计划或公开部署。
-- 完整测试依赖本地 PDF、题库及冻结评测资料；涉及题库时使用独立副本，避免 Qdrant 目录锁冲突。
-- 已有实模评测预算用尽，不直接重跑实模脚本；新增调用需单独确定范围与费用。
-
-常规检查：项目根目录执行 `uv run pytest tests -q`；前端目录执行 `pnpm test`、`pnpm typecheck`、`pnpm build`。缺少本地资料时不能期待完整回归通过。
-
-## 资料贡献与参考
-
-补充资料前先核对 [目录](data/papers/catalog.json) 中的课程版本、学年、学期和卷别。可通过 [Issue](https://github.com/minimaod/hhu-exam-agent/issues/new) 提供资料来源、更正依据或补充信息，维护者核对后确认交接方式；不确定的信息标为待确认。
-
-源码仓库不包含 PDF、个人学习数据、真实密钥及内部学习文档。目录记录不代表文件已公开提供。
-
-参考项目：[ecommerce-query-agent](https://github.com/minimaod/ecommerce-query-agent)（前后端分层、SSE 与 Agent 组织）、[deepsearch-agents](https://github.com/didilili/deepsearch-agents)（Python 与工作流组织）。实际引用代码应保留对应来源及许可证。
+在根目录运行 `uv run pytest tests -q`。在 `frontend` 目录运行 `pnpm test`、`pnpm typecheck` 和 `pnpm build`。完整题库回归需要本地试卷、题库和评测资料。
