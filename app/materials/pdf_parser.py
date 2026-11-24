@@ -32,7 +32,8 @@ PARSER_VERSION = "pypdf-v1"
 PDF_TEXT_CACHE_VERSION = "pypdf-v2"
 MAX_PAGE_TEXT_CHARS = 50_000
 MAX_WORKER_STDOUT_BYTES = 12 * 1024 * 1024
-MAX_WORKER_MEMORY_BYTES = 512 * 1024 * 1024
+# Linux 备用解析器还会加载本地库，计入同一进程的地址空间上限。
+MAX_WORKER_MEMORY_BYTES = 640 * 1024 * 1024
 MAX_CONCURRENT_PARSES = 2
 _PARSE_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_PARSES)
 _SCANNED_CHAR_THRESHOLD = 25
@@ -222,6 +223,10 @@ def run_isolated_pdf_parse(
     ]
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    # 子进程逐页解析，无需本地依赖额外预留并行线程和分配区。
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    env["MALLOC_ARENA_MAX"] = "2"
 
     with _PARSE_SEMAPHORE:
         try:
